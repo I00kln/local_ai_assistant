@@ -10,7 +10,7 @@ def validate_api_key(provider: str, api_key: str) -> Tuple[bool, str]:
     验证 API 密钥格式
     
     Args:
-        provider: 提供商 (openai, gemini)
+        provider: 提供商 (openai, gemini, glm)
         api_key: API 密钥
     
     Returns:
@@ -19,7 +19,9 @@ def validate_api_key(provider: str, api_key: str) -> Tuple[bool, str]:
     if not api_key:
         return False, "API 密钥为空"
     
-    if provider.lower() == "openai":
+    provider_lower = provider.lower()
+    
+    if provider_lower == "openai":
         if not api_key.startswith("sk-"):
             return False, "OpenAI API 密钥应以 'sk-' 开头"
         if len(api_key) < 20:
@@ -27,11 +29,17 @@ def validate_api_key(provider: str, api_key: str) -> Tuple[bool, str]:
         if not re.match(r'^sk-[A-Za-z0-9_-]+$', api_key):
             return False, "OpenAI API 密钥格式无效"
     
-    elif provider.lower() == "gemini":
+    elif provider_lower == "gemini":
         if len(api_key) < 20:
             return False, "Gemini API 密钥长度不足"
         if not re.match(r'^[A-Za-z0-9_-]+$', api_key):
             return False, "Gemini API 密钥格式无效"
+    
+    elif provider_lower == "glm":
+        if len(api_key) < 20:
+            return False, "GLM API 密钥长度不足"
+        if not re.match(r'^[A-Za-z0-9._-]+$', api_key):
+            return False, "GLM API 密钥格式无效"
     
     return True, ""
 
@@ -180,10 +188,15 @@ class CloudClientFactory:
             print(f"[安全] API 密钥验证失败: {error_msg}")
             return None
         
-        if provider.lower() == "openai":
+        provider_lower = provider.lower()
+        
+        if provider_lower == "openai":
             return OpenAIClient(api_key, model or "gpt-4o-mini", base_url)
-        elif provider.lower() == "gemini":
+        elif provider_lower == "gemini":
             return GeminiClient(api_key, model or "gemini-2.5-flash")
+        elif provider_lower == "glm":
+            from glm_client import create_glm_client
+            return create_glm_client(api_key, model or "glm-4-flash", base_url)
         else:
             print(f"不支持的云端AI提供商: {provider}")
             return None
@@ -252,25 +265,23 @@ class HybridClient:
     def process(
         self, 
         user_input: str, 
-        memory_context: str, 
-        local_response: str,
+        compressed_memory: str,
         metadata: Dict = None
     ) -> str:
         """
         处理流程：
-        1. 本地LLM已返回压缩结果
+        1. 本地LLM已压缩记忆
         2. 敏感信息脱敏（如启用）
-        3. 将用户输入 + 本地结果发送到云端
+        3. 将用户原文 + 压缩记忆发送到云端
         4. 返回云端结果
         
         Args:
             user_input: 用户原始输入
-            memory_context: 记忆上下文
-            local_response: 本地LLM响应
+            compressed_memory: 本地压缩后的记忆
             metadata: 元数据（包含来源、时间戳等）
         """
         if not self.cloud_client or not self.cloud_client.is_available():
-            return local_response
+            return ""
         
         messages = [
             {"role": "system", "content": self.cloud_system_prompt}
@@ -284,17 +295,13 @@ class HybridClient:
             if meta_info:
                 context_parts.append(f"【上下文元数据】\n{meta_info}")
         
-        if memory_context:
-            masked_context, detected = self._mask_sensitive(memory_context)
-            context_parts.append(f"【历史上下文】\n{masked_context}")
+        if compressed_memory:
+            masked_memory, detected = self._mask_sensitive(compressed_memory)
+            context_parts.append(f"【历史上下文】\n{masked_memory}")
             total_detected.update(detected)
         
         masked_input, detected = self._mask_sensitive(user_input)
         context_parts.append(f"【当前问题】\n{masked_input}")
-        total_detected.update(detected)
-        
-        masked_response, detected = self._mask_sensitive(local_response)
-        context_parts.append(f"【本地参考】\n{masked_response}")
         total_detected.update(detected)
         
         if total_detected and config.privacy.log_sensitive_detection:
@@ -305,10 +312,7 @@ class HybridClient:
         
         cloud_response = self.cloud_client.chat(messages)
         
-        if cloud_response:
-            return cloud_response
-        else:
-            return local_response
+        return cloud_response if cloud_response else ""
     
     def _format_metadata(self, metadata: Dict) -> str:
         """

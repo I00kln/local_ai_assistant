@@ -188,19 +188,35 @@ class Config:
         self.high_density = HighDensityConfig()
         self.context = ContextConfig()
         
-        self.system_prompt: str = """你是一个文本摘要助手。
+        # 本地压缩模式使用的提示词（仅压缩检索记忆，不包含用户原文）
+        self.system_prompt: str = """你是一个记忆压缩助手。
 
 【核心任务】
-压缩内容，保留核心信息和关键细节，去除修饰和冗余。确保未参与对话的第三方阅读后能理解事情的全貌和前因后果。禁止省略细节中的因果关系。
+压缩下方提供的【相关内容】，保留核心信息和关键细节，去除修饰和冗余。确保未参与对话的第三方阅读后能理解事情的全貌和前因后果。
 
-【记忆使用规则】
-1. 下方提供的【相关内容】包含之前的对话内容，结合原文进行压缩,不要写成一句话概括。
-2. 如果相关内容与原文完全无关，可以忽略那部分。若无原文,则直接对相关内容进行压缩。
-3. 不要提及"根据相关内容"或"原文"等表述；不要作为问题回答，只返回压缩结果。
+【压缩规则】
+1. 保留所有专有名词、人名、地名、数值、日期等关键信息
+2. 保留因果关系和关键决策过程
+3. 去除重复内容和修饰性语言
+4. 压缩后长度约为原文的 30%-50%
+5. 不要添加任何原文没有的内容
 
-【回答要求补充】
-1. 当你进行总结时，遵循'无损压缩'原则。摘要长度需为[原文+相关内容]的 25%-40%,不超过3000token,且必须包含原文中出现的所有专有名词和数值。不得使用'等'、'之类'、'以及其他'等概括性虚词来省略具体内容。
-3. 如果相关内容全部与原文无关，仅做文本精简，不改变原意，不补充任何原文没有的内容"""
+【输出要求】
+直接返回压缩结果，不要添加任何解释或说明。"""
+
+        # 仅本地模式使用的提示词（本地LLM直接回答用户问题）
+        self.local_assistant_prompt: str = """你是一个 helpful AI 助手。
+
+【任务说明】
+1. 用户会提供【相关内容】和【原文】
+2. 【相关内容】包含之前对话的检索记忆，可能与当前问题相关
+3. 你需要结合【相关内容】（如果相关）回答用户的【原文】问题
+
+【回答要求】
+1. 提供完整、详细、有帮助的回答
+2. 如果【相关内容】与问题相关，可以参考其中的信息
+3. 如果【相关内容】与问题无关，直接基于你的知识回答
+4. 保持自然、友好的对话风格"""
         
         self._load_from_env()
     
@@ -239,10 +255,11 @@ class Config:
         """加载云端AI配置"""
         openai_key = os.environ.get("OPENAI_API_KEY", "")
         gemini_key = os.environ.get("GEMINI_API_KEY", "")
-        cloud_provider = os.environ.get("CLOUD_PROVIDER", "gemini")
+        glm_key = os.environ.get("GLM_API_KEY", "")
+        cloud_provider = os.environ.get("CLOUD_PROVIDER", "gemini").lower()
         cloud_enabled = os.environ.get("CLOUD_ENABLED", "false").lower() == "true"
         
-        if openai_key and cloud_provider == "openai":
+        if cloud_provider == "openai":
             self.cloud = CloudConfig(
                 enabled=cloud_enabled,
                 provider="openai",
@@ -252,7 +269,9 @@ class Config:
                 max_context=int(os.environ.get("CLOUD_MAX_CONTEXT", "100000")),
                 max_retrieve_results=int(os.environ.get("CLOUD_MAX_RETRIEVE_RESULTS", "20"))
             )
-        elif gemini_key and cloud_provider == "gemini":
+            if not openai_key:
+                print("[配置] 警告: CLOUD_PROVIDER=openai 但 OPENAI_API_KEY 为空")
+        elif cloud_provider == "gemini":
             self.cloud = CloudConfig(
                 enabled=cloud_enabled,
                 provider="gemini",
@@ -262,6 +281,22 @@ class Config:
                 max_context=int(os.environ.get("CLOUD_MAX_CONTEXT", "100000")),
                 max_retrieve_results=int(os.environ.get("CLOUD_MAX_RETRIEVE_RESULTS", "20"))
             )
+            if not gemini_key:
+                print("[配置] 警告: CLOUD_PROVIDER=gemini 但 GEMINI_API_KEY 为空")
+        elif cloud_provider == "glm":
+            self.cloud = CloudConfig(
+                enabled=cloud_enabled,
+                provider="glm",
+                api_key=glm_key,
+                model=os.environ.get("GLM_MODEL", "glm-4-flash"),
+                base_url=os.environ.get("GLM_BASE_URL"),
+                max_context=int(os.environ.get("CLOUD_MAX_CONTEXT", "128000")),
+                max_retrieve_results=int(os.environ.get("CLOUD_MAX_RETRIEVE_RESULTS", "20"))
+            )
+            if not glm_key:
+                print("[配置] 警告: CLOUD_PROVIDER=glm 但 GLM_API_KEY 为空")
+        else:
+            print(f"[配置] 警告: 未知的 CLOUD_PROVIDER: {cloud_provider}")
     
     def _load_async_config(self):
         """加载异步处理器配置"""
@@ -401,6 +436,22 @@ class Config:
     @property
     def local_l3_threshold(self) -> float:
         return self.retrieval.local_l3_threshold
+    
+    @property
+    def source_weight_l1(self) -> float:
+        return self.retrieval.source_weight_l1
+    
+    @property
+    def source_weight_l2(self) -> float:
+        return self.retrieval.source_weight_l2
+    
+    @property
+    def source_weight_l3(self) -> float:
+        return self.retrieval.source_weight_l3
+    
+    @property
+    def diversity_threshold(self) -> float:
+        return self.retrieval.diversity_threshold
     
     @property
     def high_density_patterns(self) -> str:

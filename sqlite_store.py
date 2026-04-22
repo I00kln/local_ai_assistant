@@ -62,8 +62,8 @@ class SQLiteStore:
     def __init__(self, db_path: str = "memory.db"):
         self.db_path = db_path
         self.lock = threading.RLock()
-        self._connection_pool = {}
-        self._connection_times = {}
+        self._connection = None
+        self._connection_lock = threading.Lock()
         self._last_cleanup = datetime.now()
         self._integrity_checked = False
         self._init_database()
@@ -140,96 +140,48 @@ class SQLiteStore:
     @contextmanager
     def _get_connection(self):
         """
-        获取数据库连接（上下文管理器）
+        获取数据库连接（单一长连接模式）
         
-        优化：
-        - 开启WAL模式（提高并发性能）
-        - 设置超时（避免Database is locked）
-        - 使用线程本地连接（减少连接开销）
-        - 最大连接数限制
-        - 连接超时清理
-        - 连接失败时自动重建
+        使用 check_same_thread=False 的单一长连接：
+        - WAL 模式下 SQLite 原生支持并发读写
+        - 避免跨线程关闭连接的危险操作
+        - 使用锁保护并发访问
+        
+        线程安全：
+        - 使用 _connection_lock 保护连接获取
+        - 自动重连机制
         """
-        thread_id = threading.get_ident()
-        current_time = datetime.now()
-        
-        if (current_time - self._last_cleanup).total_seconds() > 300:
-            self._cleanup_connections()
-            self._last_cleanup = current_time
-        
-        conn = None
-        need_create = True
-        
-        if thread_id in self._connection_pool:
-            conn = self._connection_pool[thread_id]
-            try:
-                conn.execute("SELECT 1")
-                self._connection_times[thread_id] = current_time
-                need_create = False
-            except sqlite3.Error:
-                if thread_id in self._connection_pool:
-                    del self._connection_pool[thread_id]
-                if thread_id in self._connection_times:
-                    del self._connection_times[thread_id]
-                conn = None
-        
-        if need_create:
-            if len(self._connection_pool) >= self.MAX_POOL_SIZE:
-                self._cleanup_connections()
+        with self._connection_lock:
+            current_time = datetime.now()
             
-            conn = sqlite3.connect(
+            if self._connection is not None:
+                try:
+                    self._connection.execute("SELECT 1")
+                    yield self._connection
+                    return
+                except sqlite3.Error:
+                    self._connection = None
+            
+            self._connection = sqlite3.connect(
                 self.db_path,
                 timeout=30.0,
                 check_same_thread=False
             )
-            conn.row_factory = sqlite3.Row
+            self._connection.row_factory = sqlite3.Row
             
-            conn.execute("PRAGMA journal_mode=WAL")
-            conn.execute("PRAGMA synchronous=NORMAL")
-            conn.execute("PRAGMA cache_size=-64000")
-            conn.execute("PRAGMA busy_timeout=30000")
+            self._connection.execute("PRAGMA journal_mode=WAL")
+            self._connection.execute("PRAGMA synchronous=NORMAL")
+            self._connection.execute("PRAGMA cache_size=-64000")
+            self._connection.execute("PRAGMA busy_timeout=30000")
             
-            self._connection_pool[thread_id] = conn
-            self._connection_times[thread_id] = current_time
-        
-        try:
-            yield conn
-        except sqlite3.Error as e:
             try:
-                conn.rollback()
-            except:
-                pass
-            raise
-    
-    def _cleanup_connections(self):
-        """清理空闲连接和超时连接"""
-        current_time = datetime.now()
-        current_thread = threading.get_ident()
-        to_remove = []
-        
-        for thread_id, conn_time in list(self._connection_times.items()):
-            if thread_id == current_thread:
-                continue
-            
-            if (current_time - conn_time).total_seconds() > self.CONNECTION_TIMEOUT:
-                to_remove.append(thread_id)
-        
-        if len(self._connection_pool) > self.MAX_POOL_SIZE:
-            for thread_id in list(self._connection_pool.keys()):
-                if thread_id != current_thread and thread_id not in to_remove:
-                    to_remove.append(thread_id)
-                if len(self._connection_pool) - len(to_remove) <= self.MAX_POOL_SIZE:
-                    break
-        
-        for thread_id in to_remove:
-            if thread_id in self._connection_pool:
+                yield self._connection
+            except sqlite3.Error as e:
                 try:
-                    self._connection_pool[thread_id].close()
+                    self._connection.rollback()
                 except:
                     pass
-                del self._connection_pool[thread_id]
-            if thread_id in self._connection_times:
-                del self._connection_times[thread_id]
+                raise
     
     def _init_database(self):
         """
@@ -318,8 +270,7 @@ class SQLiteStore:
                 shutil.move(self.db_path, corrupt_path)
                 print(f"[备份] 损坏数据库已保存为: {corrupt_path}")
             
-            self._connection_pool.clear()
-            self._connection_times.clear()
+            self._connection = None
             
             with self._get_connection() as conn:
                 cursor = conn.cursor()
@@ -973,6 +924,32 @@ class SQLiteStore:
             """, (limit,))
             return [self._row_to_record(row) for row in cursor.fetchall()]
     
+    def get_records_by_vector_status(self, is_vectorized: int, limit: int = 50) -> List[MemoryRecord]:
+        """
+        根据向量化状态获取记录
+        
+        Args:
+            is_vectorized: 向量化状态
+                - 0: 未向量化(L3)
+                - 1: 已向量化(L2)
+                - 2: 向量化失败
+                - 3: 迁移中
+            limit: 返回数量限制
+        
+        Returns:
+            符合条件的记录列表
+        """
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT * FROM memories 
+                WHERE is_vectorized = ?
+                AND is_archived = 0
+                ORDER BY created_time DESC
+                LIMIT ?
+            """, (is_vectorized, limit))
+            return [self._row_to_record(row) for row in cursor.fetchall()]
+    
     def get_pending_compressions(self, limit: int = 20) -> List[MemoryRecord]:
         """获取待压缩的记录"""
         with self._get_connection() as conn:
@@ -1332,17 +1309,18 @@ class SQLiteStore:
     
     def close(self):
         """
-        关闭所有数据库连接
+        关闭数据库连接
         
         用于会话结束或测试清理
         """
         with self.lock:
-            for thread_id, conn in list(self._connection_pool.items()):
-                try:
-                    conn.close()
-                except Exception:
-                    pass
-            self._connection_pool.clear()
+            with self._connection_lock:
+                if self._connection is not None:
+                    try:
+                        self._connection.close()
+                    except Exception:
+                        pass
+                    self._connection = None
 
 
 # 全局实例

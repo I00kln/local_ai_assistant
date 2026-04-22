@@ -88,10 +88,9 @@ class MemoryManager:
             assistant_response: 助理回复
             metadata: 元数据
         
-        注意：溢出通过事件总线通知 AsyncProcessor 处理，避免直接依赖
+        注意：L1仅作为内存缓存，溢出时直接丢弃
+        持久化工作已由 AsyncProcessor 保证
         """
-        overflow = None
-        
         with self.lock:
             self.conversation_history.append({
                 "user": user_input,
@@ -101,16 +100,7 @@ class MemoryManager:
             })
             
             if len(self.conversation_history) > self.max_l1_size:
-                overflow = self.conversation_history[:-self.max_l1_size]
                 self.conversation_history = self.conversation_history[-self.max_l1_size:]
-        
-        if overflow:
-            self._event_bus.publish(
-                EventType.L1_OVERFLOW,
-                {"conversations": overflow},
-                source="MemoryManager"
-            )
-            self._log.debug("L1_OVERFLOW_PUBLISHED", count=len(overflow))
     
     def search(self, query: str, top_k: int = None, include_l3: bool = True, threshold: float = None, include_l1: bool = True) -> List[MemorySearchResult]:
         """

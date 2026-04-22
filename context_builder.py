@@ -314,17 +314,9 @@ class ContextBuilder:
         return filtered
     
     def _estimate_tokens(self, text: str) -> int:
-        """
-        估算文本的 token 数量
-        中文约 1.5-2 tokens/字符，英文约 0.25 tokens/字符
-        """
-        if not text:
-            return 0
-        
-        chinese_chars = sum(1 for c in text if '\u4e00' <= c <= '\u9fff')
-        other_chars = len(text) - chinese_chars
-        
-        return int(chinese_chars * 2 + other_chars * 0.5)
+        """估算文本的 token 数量"""
+        from token_utils import estimate_tokens
+        return estimate_tokens(text)
     
     def _calculate_available_tokens(
         self, 
@@ -563,6 +555,10 @@ class ContextBuilder:
         - memory_context: 记忆上下文
         - processed_user_input: 处理后的用户输入
         - skip_user_input: 是否跳过用户原文
+        
+        Token限制：
+        - 本地模式：总token不超过 max_context (默认8192)
+        - 云端模式：无硬性限制
         """
         memory_texts = [m.get("text", "") for m in memories if m.get("text")]
         
@@ -573,6 +569,12 @@ class ContextBuilder:
         max_memory_tokens, max_user_tokens, skip_user = self._calculate_available_tokens(
             memory_texts, current_query
         )
+        
+        if mode == "local":
+            hard_limit = self.max_context - self.system_reserve - self.max_output - 200
+            user_tokens = self._estimate_tokens(current_query)
+            max_memory_tokens = min(max_memory_tokens, hard_limit - user_tokens)
+            max_memory_tokens = max(max_memory_tokens, 200)
         
         memory_context, memory_used = self._compress_memories(
             memory_texts, max_memory_tokens

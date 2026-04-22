@@ -263,7 +263,9 @@ class MemoryArchiver:
                     with sqlite_store._get_connection() as conn:
                         cursor = conn.cursor()
                         cursor.execute("""
-                            DELETE FROM memories 
+                            UPDATE memories 
+                            SET is_archived = 1,
+                                vector_id = NULL
                             WHERE id IN ({})
                         """.format(",".join(str(c["id"]) for c in candidates[:archived_count])))
                         conn.commit()

@@ -94,18 +94,19 @@ class LLMCompressionStrategy(CompressionStrategy):
         
         try:
             llm_timeout = getattr(self._mem_config.async_processor, 'llm_timeout', 30)
-            import signal
             
-            def timeout_handler(signum, frame):
-                raise TimeoutError("LLM connection check timeout")
+            from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
             
-            old_handler = signal.signal(signal.SIGALRM, timeout_handler)
-            signal.alarm(llm_timeout)
-            try:
-                available = self._llm_client.check_connection()
-            finally:
-                signal.alarm(0)
-                signal.signal(signal.SIGALRM, old_handler)
+            def check_connection():
+                return self._llm_client.check_connection()
+            
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(check_connection)
+                try:
+                    available = future.result(timeout=llm_timeout)
+                except FuturesTimeoutError:
+                    self._record_failure("Connection check timeout")
+                    return False
             
             if available:
                 self._available = True
@@ -373,7 +374,7 @@ class AsyncMemoryProcessor:
         ])
         self._compressor_warning_shown = False
         
-        self._event_bus.subscribe(EventType.L1_OVERFLOW, self._handle_l1_overflow)
+        self._event_bus.subscribe(EventType.MEMORY_WRITTEN, self._handle_memory_written)
     
     def _get_queue_config(self):
         """获取队列配置"""
@@ -383,20 +384,9 @@ class AsyncMemoryProcessor:
             from config import AsyncProcessorConfig
             return AsyncProcessorConfig()
     
-    def _handle_l1_overflow(self, event):
-        """
-        处理 L1 溢出事件
-        
-        将溢出的对话加入处理队列
-        """
-        conversations = event.data.get("conversations", [])
-        for conv in conversations:
-            self.add_conversation(
-                conv["user"],
-                conv["assistant"],
-                conv.get("metadata", {})
-            )
-        self._log.info("L1_OVERFLOW_HANDLED", count=len(conversations))
+    def _handle_memory_written(self, event):
+        """处理记忆写入事件"""
+        pass
         
     def start(self):
         """启动后台处理线程"""
@@ -410,7 +400,26 @@ class AsyncMemoryProcessor:
         recovery_thread = threading.Thread(target=self._startup_recovery, daemon=True)
         recovery_thread.start()
         
+        compression_thread = threading.Thread(target=self._compression_loop, daemon=True)
+        compression_thread.start()
+        
         self._log.info("ASYNC_PROCESSOR_STARTED")
+    
+    def _compression_loop(self):
+        """
+        独立的压缩处理循环
+        
+        将压缩和遗忘等重型操作从主处理循环中分离，
+        避免阻塞队列处理
+        """
+        while self.running:
+            try:
+                time.sleep(self._mem_config.async_processor.compressor_check_interval)
+                if not self.running:
+                    break
+                self._check_memory_flow()
+            except Exception as e:
+                self._log.error("COMPRESSION_LOOP_ERROR", error=str(e))
     
     def _startup_recovery(self):
         """
@@ -420,6 +429,7 @@ class AsyncMemoryProcessor:
         解决：
         1. ChromaDB写入成功但SQLite更新失败导致的数据不一致
         2. L2→L3迁移中断导致的孤立记录（is_vectorized=2）
+        3. L2→L3迁移崩溃导致的迁移中记录（is_vectorized=3）
         
         防重复机制：
         - 添加向量前先搜索是否已存在相同文本（相似度>0.99）
@@ -429,6 +439,21 @@ class AsyncMemoryProcessor:
             return
         
         try:
+            migration_interrupted = self.sqlite.get_records_by_vector_status(is_vectorized=3, limit=50)
+            if migration_interrupted:
+                print(f"[启动补偿] 发现 {len(migration_interrupted)} 条迁移中断记录，开始恢复...")
+                for record in migration_interrupted:
+                    try:
+                        if record.vector_id:
+                            try:
+                                self.vector_store.delete(ids=[record.vector_id])
+                            except Exception:
+                                pass
+                        self.sqlite.update_vector_status(record.id, "", is_vectorized=0)
+                        self._log.info("MIGRATION_INTERRUPTED_RECOVERED", record_id=record.id)
+                    except Exception as e:
+                        self._log.error("MIGRATION_INTERRUPTED_RECOVERY_FAILED", record_id=record.id, error=str(e))
+            
             unvectorized = self.sqlite.get_unvectorized(limit=50)
             if not unvectorized:
                 return
@@ -477,6 +502,8 @@ class AsyncMemoryProcessor:
                 print(f"[启动补偿] 清理了 {orphan_vectors} 个孤立向量")
             
             self._sync_timestamps()
+            
+            self._retry_failed_vectorizations()
                 
         except Exception as e:
             print(f"[启动补偿] 检查失败: {e}")
@@ -581,7 +608,32 @@ class AsyncMemoryProcessor:
           - drop_oldest: 丢弃最旧的记录
           - reject: 拒绝新记录
         - 记录丢弃统计，用于监控
+        
+        过滤机制：
+        - 入口处提前进行nonsense过滤
+        - 确保过滤覆盖所有路径
         """
+        if config.nonsense_filter_enabled:
+            filter_result = get_nonsense_filter().filter(user_input, assistant_response)
+            
+            from metrics import get_metrics_collector
+            metrics = get_metrics_collector()
+            
+            if filter_result.storage_type == "discard":
+                self._log.debug("NONSENSE_FILTERED_DISCARD", 
+                              reason=filter_result.reason,
+                              confidence=filter_result.confidence)
+                metrics.record_filter_result("discard")
+                return
+            
+            metadata = metadata or {}
+            metadata["nonsense_filter_result"] = filter_result.storage_type
+            
+            if filter_result.storage_type == "sqlite_only":
+                metrics.record_filter_result("sqlite_only")
+                self._log.debug("NONSENSE_FILTERED_SQLITE_ONLY",
+                              reason=filter_result.reason)
+        
         conv_data = {
             "timestamp": datetime.now().isoformat(),
             "user": user_input,
@@ -635,7 +687,6 @@ class AsyncMemoryProcessor:
                     self._idle_count += 1
                     self._check_and_flush()
                     self._check_and_dedup()
-                    self._check_memory_flow()
                     continue
                 
             except Exception as e:
@@ -649,10 +700,13 @@ class AsyncMemoryProcessor:
         - full: 存入SQLite + ChromaDB（有价值记忆）
         - sqlite_only: 仅存SQLite（保持对话完整性，不污染向量空间）
         - discard: 完全丢弃（纯噪音）
+        
+        注意：nonsense过滤已在add_conversation入口处完成
         """
         user_input = conv['user']
         assistant_response = conv['assistant']
         source = conv.get('metadata', {}).get('source', 'local')
+        conv_metadata = conv.get('metadata', {})
         
         conversation_memory = f"用户: {user_input}\n助理: {assistant_response}"
         metadata = {
@@ -661,24 +715,10 @@ class AsyncMemoryProcessor:
             "timestamp": conv["timestamp"]
         }
         
-        if config.nonsense_filter_enabled:
-            filter_result = get_nonsense_filter().filter(user_input, assistant_response)
-            
-            from metrics import get_metrics_collector
-            metrics = get_metrics_collector()
-            
-            if filter_result.storage_type == "discard":
-                print(f"[废话过滤] 丢弃: {filter_result.reason} (置信度: {filter_result.confidence:.2f})")
-                metrics.record_filter_result("discard")
-                return
-            
-            if filter_result.storage_type == "sqlite_only":
-                print(f"[废话过滤] 仅存SQLite: {filter_result.reason}")
-                metrics.record_filter_result("sqlite_only")
-                self._store_to_sqlite_only(conversation_memory, metadata)
-                return
-            
-            metrics.record_filter_result("normal")
+        nonsense_result = conv_metadata.get("nonsense_filter_result", "normal")
+        if nonsense_result == "sqlite_only":
+            self._store_to_sqlite_only(conversation_memory, metadata)
+            return
         
         should_flush = False
         with self._buffer_lock:
@@ -732,14 +772,15 @@ class AsyncMemoryProcessor:
         - 使用批量存在性检查
         - 使用批量插入（add_batch）
         - 使用批量状态更新
+        - ID预生成实现幂等性
         
         失败恢复：
         - 启动时通过 _startup_recovery 重试未向量化的记录
         - 使用文本哈希防止重复写入
+        - 预生成vector_id确保重试幂等性
         
         线程安全：
         - 使用 _buffer_lock 保护 batch_buffer 的读取和清空
-        - 使用事务协调器保护双写操作
         """
         with self._buffer_lock:
             if not self.batch_buffer:
@@ -753,7 +794,9 @@ class AsyncMemoryProcessor:
         if not texts:
             return
         
+        import uuid
         sqlite_ids = []
+        vector_ids = []
         texts_to_vectorize = []
         metadatas_to_vectorize = []
         
@@ -776,42 +819,49 @@ class AsyncMemoryProcessor:
                     if record and record.is_vectorized == 1:
                         self._log.debug("SKIP_DUPLICATE", text_preview=text[:50])
                         continue
-                    sqlite_ids.append((existing_id, text_hash))
+                    
+                    pre_generated_id = record.vector_id if record and record.vector_id else str(uuid.uuid4())
+                    if not record or not record.vector_id:
+                        self.sqlite.update_vector_status(existing_id, pre_generated_id, is_vectorized=0)
+                    
+                    sqlite_ids.append(existing_id)
+                    vector_ids.append(pre_generated_id)
                     texts_to_vectorize.append(text)
                     metadatas_to_vectorize.append(meta)
                 else:
+                    pre_generated_id = str(uuid.uuid4())
                     from sqlite_store import MemoryRecord
                     record = MemoryRecord(
                         text=text,
                         source=meta.get("source", "local"),
                         metadata=meta,
-                        is_vectorized=0
+                        is_vectorized=0,
+                        vector_id=pre_generated_id
                     )
                     new_records.append(record)
                     new_record_hashes.append(text_hash)
             
             if new_records:
                 new_ids = self.sqlite.add_batch_with_hash(new_records, new_record_hashes)
-                for new_id, text_hash, text, meta in zip(new_ids, new_record_hashes, texts[len(sqlite_ids):], metadatas[len(sqlite_ids):]):
-                    sqlite_ids.append((new_id, text_hash))
-                    texts_to_vectorize.append(text)
-                    metadatas_to_vectorize.append(meta)
+                for new_id, record in zip(new_ids, new_records):
+                    sqlite_ids.append(new_id)
+                    vector_ids.append(record.vector_id)
+                    texts_to_vectorize.append(record.text)
+                    metadatas_to_vectorize.append(record.metadata)
         else:
+            vector_ids = [str(uuid.uuid4()) for _ in texts]
             texts_to_vectorize = texts
             metadatas_to_vectorize = metadatas
         
         if not texts_to_vectorize:
             return
         
-        vector_ids = []
         try:
-            self._tx_coordinator.begin_migration()
+            result_ids = self.vector_store.add(texts_to_vectorize, metadatas_to_vectorize, ids=vector_ids)
             
-            vector_ids = self.vector_store.add(texts_to_vectorize, metadatas_to_vectorize)
-            
-            if self.sqlite and sqlite_ids and vector_ids:
+            if self.sqlite and sqlite_ids and result_ids:
                 self.sqlite.batch_update_vector_status(
-                    [(sid, vid) for (sid, _), vid in zip(sqlite_ids, vector_ids)],
+                    [(sid, vid) for sid, vid in zip(sqlite_ids, result_ids)],
                     is_vectorized=1
                 )
             
@@ -827,20 +877,9 @@ class AsyncMemoryProcessor:
         except Exception as e:
             self._log.error("CHROMADB_WRITE_FAILED", error=str(e))
             
-            if vector_ids:
-                try:
-                    self.vector_store.delete(ids=vector_ids)
-                    self._log.info("ROLLBACK_VECTORS", count=len(vector_ids))
-                except Exception as del_e:
-                    self._log.error("ROLLBACK_FAILED", error=str(del_e))
-            
             if self.sqlite and sqlite_ids:
-                self.sqlite.batch_update_vector_status(
-                    [(sid, "") for sid, _ in sqlite_ids],
-                    is_vectorized=-1
-                )
-        finally:
-            self._tx_coordinator.end_migration()
+                for sid in sqlite_ids:
+                    self.sqlite.update_vector_status(sid, "", is_vectorized=-1)
     
     def _retry_failed_vectorizations(self):
         """重试向量化失败的记录"""
@@ -1027,6 +1066,12 @@ class AsyncMemoryProcessor:
         并发安全：
         - 使用事务协调器的迁移锁保护整个迁移过程
         - 检索操作会等待迁移完成
+        
+        状态定义：
+        - is_vectorized=0: 未向量化(L3)
+        - is_vectorized=1: 已向量化(L2)
+        - is_vectorized=2: 向量化失败
+        - is_vectorized=3: 迁移中（原子性保证）
         """
         if not self.sqlite:
             return 0
@@ -1047,19 +1092,37 @@ class AsyncMemoryProcessor:
                 if not record.vector_id:
                     continue
                 
-                if record.metadata and record.metadata.get("promoted_to_l2"):
-                    promoted_time_str = record.metadata.get("promoted_time")
-                    if promoted_time_str:
-                        try:
-                            promoted_time = datetime.fromisoformat(promoted_time_str)
-                            cooldown_end = promoted_time + timedelta(hours=cooldown_hours)
-                            if datetime.now() < cooldown_end:
-                                continue
-                        except Exception:
-                            pass
+                if record.metadata:
+                    if record.metadata.get("promoted_to_l2"):
+                        promoted_time_str = record.metadata.get("promoted_time")
+                        if promoted_time_str:
+                            try:
+                                promoted_time = datetime.fromisoformat(promoted_time_str)
+                                cooldown_end = promoted_time + timedelta(hours=cooldown_hours)
+                                if datetime.now() < cooldown_end:
+                                    self._log.debug("L2_TO_L3_COOLDOWN_PROMOTED", 
+                                                  record_id=record.id,
+                                                  remaining_hours=(cooldown_end - datetime.now()).total_seconds() / 3600)
+                                    continue
+                            except Exception:
+                                pass
+                    
+                    if record.metadata.get("moved_from_l3"):
+                        moved_from_l3_time_str = record.metadata.get("moved_from_l3_time")
+                        if moved_from_l3_time_str:
+                            try:
+                                moved_from_l3_time = datetime.fromisoformat(moved_from_l3_time_str)
+                                cooldown_end = moved_from_l3_time + timedelta(hours=cooldown_hours * 2)
+                                if datetime.now() < cooldown_end:
+                                    self._log.debug("L2_TO_L3_COOLDOWN_MOVED_FROM_L3",
+                                                  record_id=record.id,
+                                                  remaining_hours=(cooldown_end - datetime.now()).total_seconds() / 3600)
+                                    continue
+                            except Exception:
+                                pass
                 
                 try:
-                    self.sqlite.update_vector_status(record.id, record.vector_id, is_vectorized=2)
+                    self.sqlite.update_vector_status(record.id, record.vector_id, is_vectorized=3)
                     
                     self.vector_store.delete(ids=[record.vector_id])
                     
@@ -1075,13 +1138,32 @@ class AsyncMemoryProcessor:
                         if "promoted_time" in record.metadata:
                             del record.metadata["promoted_time"]
                     
+                    if "moved_from_l3" in record.metadata:
+                        del record.metadata["moved_from_l3"]
+                        if "moved_from_l3_time" in record.metadata:
+                            del record.metadata["moved_from_l3_time"]
+                    
                     self.sqlite.add(record)
                     
                     moved_count += 1
                     
                 except Exception as e:
                     self._log.error("L2_TO_L3_MOVE_FAILED", record_id=record.id, error=str(e))
-                    self.sqlite.update_vector_status(record.id, record.vector_id, is_vectorized=1)
+                    
+                    try:
+                        current_record = self.sqlite.get(record.id)
+                        if current_record and current_record.is_vectorized == 3:
+                            if current_record.vector_id:
+                                try:
+                                    self.vector_store.delete(ids=[current_record.vector_id])
+                                except Exception:
+                                    pass
+                            self.sqlite.update_vector_status(record.id, "", is_vectorized=0)
+                            self._log.info("L2_TO_L3_ROLLBACK", record_id=record.id)
+                        else:
+                            self.sqlite.update_vector_status(record.id, record.vector_id, is_vectorized=1)
+                    except Exception as rollback_e:
+                        self._log.error("L2_TO_L3_ROLLBACK_FAILED", record_id=record.id, error=str(rollback_e))
             
             return moved_count
             
@@ -1179,6 +1261,20 @@ class AsyncMemoryProcessor:
                         record.metadata["compressed"] = True
                         record.metadata["compressed_time"] = datetime.now().isoformat()
                         record.metadata["compression_strategy"] = strategy_name
+                        
+                        if record.vector_id:
+                            try:
+                                self.vector_store.delete(ids=[record.vector_id])
+                                self._log.info("INVALIDATED_L2_AFTER_COMPRESSION", 
+                                             record_id=record.id,
+                                             vector_id=record.vector_id)
+                            except Exception as del_e:
+                                self._log.warning("FAILED_TO_INVALIDATE_L2", 
+                                                record_id=record.id,
+                                                error=str(del_e))
+                            record.vector_id = ""
+                            record.is_vectorized = 0
+                        
                         self.sqlite.add(record)
                         compressed_count += 1
                         metrics.record_compression(True, compress_duration)
@@ -1265,10 +1361,13 @@ class AsyncMemoryProcessor:
                             record.metadata = {}
                         record.metadata["promoted_to_l2"] = True
                         record.metadata["promoted_time"] = datetime.now().isoformat()
+                        record.metadata["moved_from_l3"] = True
+                        record.metadata["moved_from_l3_time"] = datetime.now().isoformat()
                         
                         if "moved_from_l2" in record.metadata:
                             del record.metadata["moved_from_l2"]
-                            del record.metadata["moved_time"]
+                            if "moved_time" in record.metadata:
+                                del record.metadata["moved_time"]
                         
                         if record.compressed_text:
                             record.metadata["promoted_from_l3"] = True

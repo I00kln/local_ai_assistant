@@ -114,11 +114,9 @@ class NonsenseFilter:
         self.nonsense_db_path = nonsense_db_path
         self.dimension = config.embedding_dimension
         
-        # 延迟加载：模型相关属性初始化为None
-        self._tokenizer = None
-        self._session = None
+        # 使用共享的 EmbeddingService
+        self._embedding_service = None
         self._model_lock = threading.Lock()
-        self._model_loaded = False
         
         # 加载废话库文本（不预计算向量）
         self.nonsense_texts: List[str] = []
@@ -144,68 +142,31 @@ class NonsenseFilter:
         }
     
     def _ensure_model_loaded(self):
-        """确保模型已加载（延迟加载）"""
-        if self._model_loaded:
+        """确保 EmbeddingService 已初始化"""
+        if self._embedding_service is not None:
             return
         
         with self._model_lock:
-            if self._model_loaded:
+            if self._embedding_service is not None:
                 return
             
-            try:
-                import onnxruntime as ort
-                from tokenizers import Tokenizer
-                
-                model_path = config.onnx_model_path
-                self._tokenizer = Tokenizer.from_file(os.path.join(model_path, "tokenizer.json"))
-                self._tokenizer.enable_padding()
-                self._tokenizer.enable_truncation(max_length=512)
-                
-                self._session = ort.InferenceSession(
-                    os.path.join(model_path, "model.onnx"),
-                    providers=['CPUExecutionProvider']
-                )
-                self._model_loaded = True
-                print("废话过滤器：ONNX模型延迟加载完成")
-            except Exception as e:
-                print(f"废话过滤器加载嵌入模型失败: {e}")
-                self._tokenizer = None
-                self._session = None
-                self._model_loaded = True  # 标记为已加载（失败状态）
+            from embedding_service import get_embedding_service
+            self._embedding_service = get_embedding_service()
     
     @property
     def tokenizer(self):
         self._ensure_model_loaded()
-        return self._tokenizer
+        return self._embedding_service._tokenizer
     
     @property
     def session(self):
         self._ensure_model_loaded()
-        return self._session
+        return self._embedding_service._session
     
     def _get_embedding(self, text: str) -> np.ndarray:
         """获取文本的嵌入向量"""
-        if not self.session or not self.tokenizer:
-            return np.zeros(self.dimension)
-        
-        text_with_prefix = f"为这个句子生成表示：{text}"
-        encoded = self.tokenizer.encode(text_with_prefix)
-        
-        input_ids = np.array([encoded.ids], dtype=np.int64)
-        attention_mask = np.array([encoded.attention_mask], dtype=np.int64)
-        
-        inputs_onnx = {
-            "input_ids": input_ids,
-            "attention_mask": attention_mask
-        }
-        
-        outputs = self.session.run(None, inputs_onnx)
-        last_hidden_state = outputs[0]
-        embedding = last_hidden_state[:, 0, :]
-        
-        # L2归一化
-        norm = np.linalg.norm(embedding, axis=1, keepdims=True)
-        return embedding / np.maximum(norm, 1e-12)
+        self._ensure_model_loaded()
+        return self._embedding_service.embed_single(text, use_prefix=True)
     
     def _load_nonsense_library(self):
         """加载废话库（仅加载文本，不计算向量）"""
@@ -235,7 +196,7 @@ class NonsenseFilter:
                 self._ensure_model_loaded()
                 
                 # 如果模型加载失败，跳过向量计算
-                if not self._session:
+                if not self._embedding_service.is_available:
                     return
                 
                 # 计算向量
@@ -243,7 +204,7 @@ class NonsenseFilter:
                 for text in self.nonsense_texts:
                     try:
                         vec = self._get_embedding(text)
-                        vectors.append(vec[0])
+                        vectors.append(vec)
                     except Exception:
                         pass
                 

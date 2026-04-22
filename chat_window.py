@@ -3,7 +3,7 @@ import tkinter as tk
 from tkinter import scrolledtext, ttk
 import threading
 from datetime import datetime
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple
 
 from config import config
 from models import UIState
@@ -226,28 +226,31 @@ class ChatWindow:
     
     def _init_cloud_client(self):
         """初始化云端客户端"""
-        if not config.cloud.api_key or config.cloud.api_key == "your-api-key-here":
-            self._safe_after(0, lambda: self._append_message(
-                "system", "未配置云端API密钥，云端AI不可用"
+        provider = config.cloud.provider
+        api_key = config.cloud.api_key
+        model = config.cloud.model
+        base_url = config.cloud.base_url
+        
+        if not api_key or api_key == "your-api-key-here":
+            self._safe_after(0, lambda p=provider: self._append_message(
+                "system", f"云端AI({p})未配置API密钥，请在 .env 中设置 {p.upper()}_API_KEY"
             ))
+            self._safe_after(0, lambda: self.cloud_btn.config(state=tk.NORMAL))
             return
         
         try:
             from cloud_client import CloudClientFactory, HybridClient
             
             cloud_client = CloudClientFactory.create(
-                provider=config.cloud.provider,
-                api_key=config.cloud.api_key,
-                model=config.cloud.model,
-                base_url=config.cloud.base_url
+                provider=provider,
+                api_key=api_key,
+                model=model,
+                base_url=base_url
             )
             
             if cloud_client and cloud_client.is_available():
                 self.hybrid_client = HybridClient(self.llm, cloud_client)
                 self._safe_after(0, lambda: self.cloud_btn.config(state=tk.NORMAL))
-                
-                provider = config.cloud.provider
-                model = config.cloud.model
                 
                 if config.cloud.enabled:
                     self._safe_after(0, lambda: self.cloud_var.set(True))
@@ -258,9 +261,15 @@ class ChatWindow:
                     self._safe_after(0, lambda p=provider, m=model: self._append_message(
                         "system", f"云端AI可用: {p} ({m})，可手动启用"
                     ))
+            else:
+                self._safe_after(0, lambda p=provider: self._append_message(
+                    "system", f"云端AI({p})客户端初始化失败"
+                ))
+                self._safe_after(0, lambda: self.cloud_btn.config(state=tk.NORMAL))
         except Exception as e:
             err_msg = str(e)
             self._safe_after(0, lambda msg=err_msg: self._append_message("system", f"云端AI初始化失败: {msg}"))
+            self._safe_after(0, lambda: self.cloud_btn.config(state=tk.NORMAL))
     
     def _enable_ui(self):
         """启用 UI 控件"""
@@ -400,6 +409,152 @@ class ChatWindow:
             "avg_similarity": sum(m.get("similarity", 0) for m in memories) / len(memories) if memories else 0
         }
     
+    def _estimate_tokens(self, text: str) -> int:
+        """估算文本的token数量"""
+        from token_utils import estimate_tokens
+        return estimate_tokens(text)
+    
+    def _check_and_truncate_for_local_llm(
+        self, 
+        system_prompt: str, 
+        memory_context: str, 
+        user_input: str,
+        max_tokens: int = None
+    ) -> Tuple[str, str]:
+        """
+        检查并截断内容以适应本地LLM的token限制
+        
+        Args:
+            system_prompt: 系统提示词
+            memory_context: 记忆上下文
+            user_input: 用户输入
+            max_tokens: 最大token数（默认从config读取）
+        
+        Returns:
+            (截断后的记忆上下文, 截断后的用户输入)
+        """
+        if max_tokens is None:
+            max_tokens = config.local.max_context
+        
+        system_tokens = self._estimate_tokens(system_prompt)
+        user_tokens = self._estimate_tokens(user_input)
+        format_overhead = 50
+        
+        available_for_memory = max_tokens - system_tokens - user_tokens - config.local.max_output_tokens - format_overhead
+        available_for_memory = max(available_for_memory, 200)
+        
+        memory_tokens = self._estimate_tokens(memory_context)
+        
+        if memory_tokens <= available_for_memory:
+            return memory_context, user_input
+        
+        ratio = available_for_memory / memory_tokens
+        target_chars = int(len(memory_context) * ratio * 0.9)
+        
+        truncated_memory = memory_context[:target_chars]
+        
+        last_period = max(
+            truncated_memory.rfind('。'),
+            truncated_memory.rfind('.'),
+            truncated_memory.rfind('\n')
+        )
+        
+        if last_period > target_chars * 0.7:
+            truncated_memory = truncated_memory[:last_period + 1]
+        
+        truncated_memory += "\n...[内容已截断以适应token限制]"
+        
+        return truncated_memory, user_input
+    
+    def _build_compression_messages(
+        self, 
+        memory_context: str
+    ) -> List[Dict[str, str]]:
+        """
+        构建记忆压缩消息（仅压缩记忆，不包含用户原文）
+        
+        Args:
+            memory_context: 记忆上下文
+        
+        Returns:
+            消息列表
+        """
+        system_prompt = config.system_prompt
+        
+        messages = [
+            {"role": "system", "content": system_prompt}
+        ]
+        
+        max_tokens = config.local.max_context
+        system_tokens = self._estimate_tokens(system_prompt)
+        format_overhead = 50
+        
+        available_for_memory = max_tokens - system_tokens - config.local.max_output_tokens - format_overhead
+        available_for_memory = max(available_for_memory, 200)
+        
+        memory_tokens = self._estimate_tokens(memory_context)
+        
+        if memory_tokens <= available_for_memory:
+            truncated_memory = memory_context
+        else:
+            ratio = available_for_memory / memory_tokens
+            target_chars = int(len(memory_context) * ratio * 0.9)
+            
+            truncated_memory = memory_context[:target_chars]
+            
+            last_period = max(
+                truncated_memory.rfind('。'),
+                truncated_memory.rfind('.'),
+                truncated_memory.rfind('\n')
+            )
+            
+            if last_period > target_chars * 0.7:
+                truncated_memory = truncated_memory[:last_period + 1]
+            
+            truncated_memory += "\n...[内容已截断]"
+        
+        user_message = f"【相关内容】\n{truncated_memory}"
+        messages.append({"role": "user", "content": user_message})
+        return messages
+    
+    def _build_local_llm_messages(
+        self, 
+        memory_context: str, 
+        user_input: str,
+        apply_token_limit: bool = True
+    ) -> List[Dict[str, str]]:
+        """
+        构建本地LLM消息（仅本地模式，包含用户输入）
+        
+        Args:
+            memory_context: 记忆上下文
+            user_input: 用户输入
+            apply_token_limit: 是否应用token限制
+        
+        Returns:
+            消息列表
+        """
+        system_prompt = config.local_assistant_prompt
+        
+        messages = [
+            {"role": "system", "content": system_prompt}
+        ]
+        
+        if apply_token_limit:
+            truncated_memory, truncated_input = self._check_and_truncate_for_local_llm(
+                system_prompt, memory_context, user_input
+            )
+        else:
+            truncated_memory, truncated_input = memory_context, user_input
+        
+        if truncated_memory:
+            user_message = f"【相关内容】\n{truncated_memory}\n\n【原文】\n{truncated_input}"
+        else:
+            user_message = truncated_input
+        
+        messages.append({"role": "user", "content": user_message})
+        return messages
+    
     def _process_message(self, user_input: str, use_local: bool, use_cloud: bool, show_memory: bool = True, show_local: bool = True):
         """处理用户消息（后台线程）"""
         if self._closing:
@@ -416,10 +571,24 @@ class ChatWindow:
             retrieval_metadata = self._build_retrieval_metadata(retrieved_memories, memory_context)
             
             if show_memory and retrieved_memories:
-                memory_info = "\n".join([
-                    f"  [{m.get('similarity', 0):.2f}][{m.get('source', '?')}] {m.get('text', '')[:50]}..."
-                    for m in retrieved_memories[:5]
-                ])
+                try:
+                    from sensitive_filter import get_sensitive_filter
+                    sensitive_filter = get_sensitive_filter()
+                    
+                    memory_lines = []
+                    for m in retrieved_memories[:5]:
+                        text = m.get('text', '')
+                        masked_text, _ = sensitive_filter.mask(text)
+                        memory_lines.append(
+                            f"  [{m.get('similarity', 0):.2f}][{m.get('source', '?')}] {masked_text[:50]}..."
+                        )
+                    memory_info = "\n".join(memory_lines)
+                except Exception:
+                    memory_info = "\n".join([
+                        f"  [{m.get('similarity', 0):.2f}][{m.get('source', '?')}] {m.get('text', '')[:50]}..."
+                        for m in retrieved_memories[:5]
+                    ])
+                
                 self._safe_after(0, lambda info=memory_info: self._append_message(
                     "memory", f"检索到的记忆:\n{info}"
                 ))
@@ -456,28 +625,18 @@ class ChatWindow:
                 if has_memories:
                     self._safe_after(0, lambda: self.state_manager.set_state(UIState.PROCESSING_LOCAL, "本地压缩中"))
                     
-                    messages = [
-                        {"role": "system", "content": config.system_prompt}
-                    ]
+                    messages = self._build_compression_messages(memory_context)
+                    compressed_memory = self.llm.chat(messages)
                     
-                    if memory_context:
-                        user_message = f"【相关内容】\n{memory_context}\n\n【原文】\n{processed_input}"
-                    else:
-                        user_message = processed_input
+                    if compressed_memory and show_local:
+                        self._safe_after(0, lambda resp=compressed_memory: self._append_message("assistant", f"[压缩记忆]\n{resp[:200]}..."))
                     
-                    messages.append({"role": "user", "content": user_message})
-                    local_response = self.llm.chat(messages)
-                    
-                    if local_response and show_local:
-                        self._safe_after(0, lambda resp=local_response: self._append_message("assistant", resp))
-                    
-                    if local_response:
+                    if compressed_memory:
                         self._safe_after(0, lambda: self.state_manager.set_state(UIState.PROCESSING_CLOUD, "等待云端响应"))
                         
                         cloud_response = self.hybrid_client.process(
                             user_input=user_input,
-                            memory_context=memory_context,
-                            local_response=local_response,
+                            compressed_memory=compressed_memory,
                             metadata=retrieval_metadata
                         )
                         
@@ -486,9 +645,16 @@ class ChatWindow:
                             response_source = "cloud"
                             cloud_success = True
                         else:
-                            final_response = local_response
+                            final_response = "云端响应为空"
                     else:
-                        final_response = local_response
+                        self._safe_after(0, lambda: self.state_manager.set_state(UIState.PROCESSING_CLOUD, "直连云端"))
+                        final_response = self.hybrid_client.direct_chat(user_input)
+                        
+                        if final_response:
+                            response_source = "cloud"
+                            cloud_success = True
+                        else:
+                            self._safe_after(0, lambda: self._append_message("system", "云端响应为空"))
                 else:
                     self._safe_after(0, lambda: self.state_manager.set_state(UIState.PROCESSING_CLOUD, "直连云端"))
                     final_response = self.hybrid_client.direct_chat(user_input)
@@ -502,19 +668,11 @@ class ChatWindow:
             elif use_local:
                 self._safe_after(0, lambda: self.state_manager.set_state(UIState.PROCESSING_LOCAL, "本地处理中"))
                 
-                messages = [
-                    {"role": "system", "content": config.system_prompt}
-                ]
-                
-                if has_memories:
-                    if memory_context:
-                        user_message = f"【相关内容】\n{memory_context}\n\n【原文】\n{processed_input}"
-                    else:
-                        user_message = processed_input
-                else:
-                    user_message = user_input
-                
-                messages.append({"role": "user", "content": user_message})
+                messages = self._build_local_llm_messages(
+                    memory_context if has_memories else "", 
+                    processed_input if has_memories else user_input,
+                    apply_token_limit=True
+                )
                 local_response = self.llm.chat(messages)
                 final_response = local_response
             
@@ -543,14 +701,26 @@ class ChatWindow:
             should_store = False
             if use_cloud and cloud_success:
                 should_store = True
-            elif use_local and not use_cloud and final_response:
-                should_store = True
             
             if should_store:
-                self.async_processor.add_conversation(user_input, final_response, {
+                try:
+                    from sensitive_filter import get_sensitive_filter
+                    sensitive_filter = get_sensitive_filter()
+                    
+                    masked_user_input, user_detected = sensitive_filter.mask(user_input)
+                    masked_response, resp_detected = sensitive_filter.mask(final_response)
+                    
+                    if user_detected or resp_detected:
+                        self._log_sensitive_detection(user_detected, resp_detected)
+                except Exception:
+                    masked_user_input = user_input
+                    masked_response = final_response
+                
+                self.async_processor.add_conversation(masked_user_input, masked_response, {
                     "context_used": len(memory_context) if memory_context else 0,
                     "memories_retrieved": len(retrieved_memories),
-                    "source": "cloud" if cloud_success else "local"
+                    "source": "cloud" if cloud_success else "local",
+                    "sensitive_masked": True
                 })
             
             self._safe_after(0, lambda: self.state_manager.set_state(UIState.IDLE))
@@ -592,6 +762,22 @@ class ChatWindow:
         
         self.chat_display.see(tk.END)
         self.chat_display.config(state=tk.DISABLED)
+    
+    def _log_sensitive_detection(self, user_detected: Dict, resp_detected: Dict):
+        """记录敏感信息检测日志"""
+        if not config.privacy.log_sensitive_detection:
+            return
+        
+        total = {}
+        for k, v in user_detected.items():
+            total[k] = total.get(k, 0) + v
+        for k, v in resp_detected.items():
+            total[k] = total.get(k, 0) + v
+        
+        if total:
+            self._safe_after(0, lambda t=total: self._append_message(
+                "system", f"[安全] 已脱敏敏感信息: {t}"
+            ))
     
     def _clear_conversation(self):
         """清空当前对话历史"""

@@ -10,217 +10,62 @@ from config import config
 
 class ONNXEmbeddingFunction:
     """
-    自定义嵌入函数 - 使用现有的ONNX BGE模型
+    自定义嵌入函数 - 使用共享的 EmbeddingService
     
     ChromaDB要求嵌入函数实现__call__方法
     
     特性：
+    - 使用共享的 EmbeddingService 单例
     - 延迟加载：首次使用时才加载模型
     - 线程安全：使用锁保护初始化
     - 降级模式：模型加载失败时使用随机向量
     """
     
     def __init__(self):
-        self._tokenizer = None
-        self._session = None
-        self._dimension = None
-        self._lock = threading.Lock()
+        self._embedding_service = None
         self.name = "onnx_bge"
-        self._fallback_mode = False
-        self._init_error = None
-        self._embedding_cache = {}
-        self._cache_max_size = 1000
     
     def _ensure_initialized(self):
-        """
-        确保模型已初始化（延迟加载）
-        
-        降级策略：
-        - 模型文件不存在时，使用随机向量降级模式
-        - 记录错误信息，便于后续修复
-        - 系统仍可启动，但向量检索功能受限
-        """
-        if self._session is not None or self._fallback_mode:
+        """确保 EmbeddingService 已初始化"""
+        if self._embedding_service is not None:
             return
         
-        with self._lock:
-            if self._session is not None or self._fallback_mode:
-                return
-            
-            try:
-                import onnxruntime as ort
-                from tokenizers import Tokenizer
-                
-                model_path = config.onnx_model_path
-                
-                tokenizer_path = os.path.join(model_path, "tokenizer.json")
-                model_file_path = os.path.join(model_path, "model.onnx")
-                
-                if not os.path.exists(tokenizer_path):
-                    raise FileNotFoundError(f"Tokenizer 文件不存在: {tokenizer_path}")
-                
-                if not os.path.exists(model_file_path):
-                    raise FileNotFoundError(f"模型文件不存在: {model_file_path}")
-                
-                self._tokenizer = Tokenizer.from_file(tokenizer_path)
-                self._tokenizer.enable_padding()
-                self._tokenizer.enable_truncation(max_length=512)
-                
-                self._session = ort.InferenceSession(
-                    model_file_path,
-                    providers=['CPUExecutionProvider']
-                )
-                
-                self._dimension = config.embedding_dimension
-                print("ONNX嵌入模型延迟加载完成")
-                
-            except FileNotFoundError as e:
-                self._init_error = str(e)
-                print(f"[警告] 嵌入模型文件缺失，启用降级模式: {e}")
-                self._enable_fallback()
-                
-            except ImportError as e:
-                self._init_error = str(e)
-                print(f"[警告] 依赖库缺失，启用降级模式: {e}")
-                self._enable_fallback()
-                
-            except Exception as e:
-                self._init_error = str(e)
-                print(f"[错误] 嵌入模型加载失败，启用降级模式: {e}")
-                self._enable_fallback()
-    
-    def _enable_fallback(self):
-        """
-        启用降级模式
-        
-        使用随机向量替代真实嵌入：
-        - 系统可以启动
-        - 向量检索功能不可用（相似度计算无意义）
-        - 应尽快修复模型文件
-        """
-        self._fallback_mode = True
-        self._dimension = config.embedding_dimension
-        print("[降级] 嵌入模型使用随机向量模式，请尽快修复模型文件")
+        from embedding_service import get_embedding_service
+        self._embedding_service = get_embedding_service()
     
     def is_fallback_mode(self) -> bool:
         """检查是否处于降级模式"""
-        return self._fallback_mode
+        self._ensure_initialized()
+        return self._embedding_service.is_fallback
     
     def get_init_error(self) -> Optional[str]:
         """获取初始化错误信息"""
-        return self._init_error
+        self._ensure_initialized()
+        return self._embedding_service._init_error
     
     @property
     def tokenizer(self):
         self._ensure_initialized()
-        return self._tokenizer
+        return self._embedding_service._tokenizer
     
     @property
     def session(self):
         self._ensure_initialized()
-        return self._session
+        return self._embedding_service._session
     
     @property
     def dimension(self):
         self._ensure_initialized()
-        return self._dimension
+        return self._embedding_service.dimension
     
     def __call__(self, texts: List[str]) -> List[List[float]]:
         """
         将文本列表转换为嵌入向量列表
         
-        缓存策略：
-        - 相同文本复用缓存的嵌入向量
-        - 缓存最大 1000 条
-        - LRU 淘汰策略
-        
-        降级模式：
-        - 使用基于文本哈希的确定性随机向量
-        - 相同文本始终生成相同向量
-        - 向量检索功能受限
+        委托给共享的 EmbeddingService
         """
-        import time
-        import numpy as np
-        from metrics import get_metrics_collector
-        
         self._ensure_initialized()
-        
-        result = []
-        uncached_texts = []
-        uncached_indices = []
-        
-        for i, text in enumerate(texts):
-            cache_key = hash(text)
-            if cache_key in self._embedding_cache:
-                result.append(self._embedding_cache[cache_key])
-            else:
-                result.append(None)
-                uncached_texts.append(text)
-                uncached_indices.append(i)
-        
-        if uncached_texts:
-            start_time = time.perf_counter()
-            
-            if self._fallback_mode:
-                new_embeddings = self._generate_fallback_embeddings(uncached_texts)
-            else:
-                texts_with_prefix = [f"为这个句子生成表示：{t}" for t in uncached_texts]
-                
-                encoded = self._tokenizer.encode_batch(texts_with_prefix)
-                
-                input_ids = np.array([e.ids for e in encoded], dtype=np.int64)
-                attention_mask = np.array([e.attention_mask for e in encoded], dtype=np.int64)
-                
-                inputs_onnx = {
-                    "input_ids": input_ids,
-                    "attention_mask": attention_mask
-                }
-                
-                outputs = self._session.run(None, inputs_onnx)
-                
-                last_hidden_state = outputs[0]
-                embeddings = last_hidden_state[:, 0, :]
-                
-                norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
-                embeddings = embeddings / np.maximum(norms, 1e-12)
-                
-                new_embeddings = embeddings.tolist()
-            
-            duration_ms = (time.perf_counter() - start_time) * 1000
-            get_metrics_collector().record_embedding_latency(duration_ms)
-            
-            for idx, text, embedding in zip(uncached_indices, uncached_texts, new_embeddings):
-                result[idx] = embedding
-                
-                if len(self._embedding_cache) >= self._cache_max_size:
-                    oldest_key = next(iter(self._embedding_cache))
-                    del self._embedding_cache[oldest_key]
-                
-                self._embedding_cache[hash(text)] = embedding
-        
-        return result
-    
-    def _generate_fallback_embeddings(self, texts: List[str]) -> List[List[float]]:
-        """
-        生成降级模式的嵌入向量
-        
-        使用文本哈希生成确定性随机向量：
-        - 相同文本始终生成相同向量
-        - 不同文本生成不同向量
-        - 向量维度与正常模式一致
-        """
-        import numpy as np
-        import hashlib
-        
-        embeddings = []
-        for text in texts:
-            text_hash = hashlib.md5(text.encode()).hexdigest()
-            np.random.seed(int(text_hash[:8], 16))
-            embedding = np.random.randn(self._dimension).astype(np.float32)
-            embedding = embedding / np.linalg.norm(embedding)
-            embeddings.append(embedding.tolist())
-        
-        return embeddings
+        return self._embedding_service.embed(texts, use_cache=True)
 
 
 class VectorStore:
@@ -277,6 +122,10 @@ class VectorStore:
             
             # 创建自定义嵌入函数
             self.embedding_function = ONNXEmbeddingFunction()
+            
+            # 预加载ONNX模型（避免首次使用时延迟）
+            print("[向量存储] 正在预加载ONNX嵌入模型...")
+            self.embedding_function._ensure_initialized()
             
             # 获取或创建集合（带优化的 HNSW 参数）
             self.collection = self.client.get_or_create_collection(
