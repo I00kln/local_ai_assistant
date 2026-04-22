@@ -342,13 +342,19 @@ class VectorStore:
         
         return formatted_results
     
-    def delete(self, ids: List[str] = None, where: Dict = None) -> int:
+    def delete(
+        self, 
+        ids: List[str] = None, 
+        where: Dict = None,
+        sqlite_store = None
+    ) -> int:
         """
         删除文档
         
         Args:
             ids: 文档ID列表
             where: 元数据过滤条件
+            sqlite_store: SQLite存储实例（可选，同步删除SQLite记录）
         
         Returns:
             删除的文档数量
@@ -356,14 +362,20 @@ class VectorStore:
         if ids is None and where is None:
             return 0
         
-        # 获取要删除的文档数量
         if ids:
             count = len(ids)
+            
+            if sqlite_store:
+                for doc_id in ids:
+                    sqlite_store.delete_by_vector_id(doc_id)
         else:
             results = self.collection.get(where=where)
             count = len(results["ids"]) if results["ids"] else 0
+            
+            if sqlite_store and results["ids"]:
+                for doc_id in results["ids"]:
+                    sqlite_store.delete_by_vector_id(doc_id)
         
-        # 执行删除
         self.collection.delete(ids=ids, where=where)
         
         return count
@@ -475,30 +487,6 @@ class VectorStore:
             print(f"去重完成：移除 {len(duplicate_ids)} 条重复记忆")
         
         return len(duplicate_ids)
-    
-    def delete(self, ids: List[str], sqlite_store=None) -> int:
-        """
-        删除文档（同步删除SQLite）
-        
-        Args:
-            ids: 文档ID列表
-            sqlite_store: SQLite存储实例
-        
-        Returns:
-            删除的文档数量
-        """
-        if not ids:
-            return 0
-        
-        # 同步删除SQLite记录
-        if sqlite_store:
-            for doc_id in ids:
-                sqlite_store.delete_by_vector_id(doc_id)
-        
-        # 删除ChromaDB文档
-        self.collection.delete(ids=ids)
-        
-        return len(ids)
     
     def __len__(self) -> int:
         return self.collection.count()

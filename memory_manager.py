@@ -10,6 +10,9 @@ from dataclasses import dataclass
 from config import config
 from vector_store import VectorStore, get_vector_store
 from sqlite_store import SQLiteStore, MemoryRecord, get_sqlite_store
+from event_bus import get_event_bus, EventType
+from memory_transaction import get_transaction_coordinator
+from logger import get_logger
 
 
 @dataclass
@@ -37,13 +40,17 @@ class MemoryManager:
     - 权重管理与遗忘
     
     线程安全：
-    - 使用读写锁协调检索与异步写入
+    - 使用迁移锁协调检索与迁移操作
     - 使用版本号检测并发修改
+    - 检索时等待迁移完成
     """
     
     def __init__(self, vector_store: VectorStore = None, sqlite_store: SQLiteStore = None):
         self.vector_store = vector_store or get_vector_store()
         self.sqlite = sqlite_store or get_sqlite_store()
+        self._event_bus = get_event_bus()
+        self._tx_coordinator = get_transaction_coordinator()
+        self._log = get_logger()
         
         self.lock = threading.RLock()
         self._read_lock = threading.Lock()
@@ -52,9 +59,6 @@ class MemoryManager:
         
         self.conversation_history: List[Dict] = []
         self.max_l1_size = 25
-        
-        self.compressor = None
-        self._init_compressor()
         
         self.stats = {
             "l1_hits": 0,
@@ -65,24 +69,15 @@ class MemoryManager:
             "forgotten": 0,
             "retry_reads": 0
         }
-    
-    def _init_compressor(self):
-        """初始化记忆压缩器"""
-        if not config.compression_enabled:
-            return
         
-        # 延迟初始化，避免循环导入
-        pass
+        self._event_bus.subscribe(EventType.MEMORY_WRITTEN, self._handle_memory_written)
     
-    def _get_compressor(self):
-        """获取压缩器实例"""
-        if self.compressor is None and config.compression_enabled:
-            try:
-                from llm_client import LlamaClient
-                self.compressor = LlamaClient()
-            except Exception as e:
-                print(f"初始化压缩器失败: {e}")
-        return self.compressor
+    def _handle_memory_written(self, event):
+        """处理记忆写入事件（更新版本号）"""
+        with self.lock:
+            self._write_version += 1
+            self._last_sync_time = time.time()
+        self._log.debug("MEMORY_WRITE_NOTIFIED", version=self._write_version)
     
     def add_conversation(self, user_input: str, assistant_response: str, metadata: Dict = None):
         """
@@ -93,7 +88,7 @@ class MemoryManager:
             assistant_response: 助理回复
             metadata: 元数据
         
-        注意：溢出处理在锁外执行，避免阻塞其他线程
+        注意：溢出通过事件总线通知 AsyncProcessor 处理，避免直接依赖
         """
         overflow = None
         
@@ -105,40 +100,24 @@ class MemoryManager:
                 "metadata": metadata or {}
             })
             
-            # 保持L1大小限制
             if len(self.conversation_history) > self.max_l1_size:
                 overflow = self.conversation_history[:-self.max_l1_size]
                 self.conversation_history = self.conversation_history[-self.max_l1_size:]
         
-        # 溢出处理在锁外执行（涉及向量存储，可能耗时）
         if overflow:
-            self._overflow_to_l2(overflow)
-    
-    def _overflow_to_l2(self, conversations: List[Dict]):
-        """将溢出的L1对话存入L2向量库"""
-        if not conversations:
-            return
-        
-        texts = []
-        metadata_list = []
-        
-        for conv in conversations:
-            text = f"用户: {conv['user']}\n助理: {conv['assistant']}"
-            texts.append(text)
-            metadata_list.append({
-                "timestamp": conv["timestamp"],
-                "type": "conversation",
-                "source": conv.get("metadata", {}).get("source", "local")
-            })
-        
-        self.vector_store.add(texts, metadata_list)
-        print(f"L1溢出: {len(texts)} 条对话存入L2向量库")
+            self._event_bus.publish(
+                EventType.L1_OVERFLOW,
+                {"conversations": overflow},
+                source="MemoryManager"
+            )
+            self._log.debug("L1_OVERFLOW_PUBLISHED", count=len(overflow))
     
     def search(self, query: str, top_k: int = None, include_l3: bool = True, threshold: float = None, include_l1: bool = True) -> List[MemorySearchResult]:
         """
         统一搜索接口 - L1→L2→L3
         
         线程安全：
+        - 等待迁移操作完成后再执行检索
         - 使用版本号检测并发修改
         - 检测到修改时自动重试（最多2次）
         
@@ -158,18 +137,25 @@ class MemoryManager:
         if threshold is None:
             threshold = 0.0
         
-        max_retries = 2
-        for attempt in range(max_retries):
-            start_version = self._write_version
-            
-            results = self._do_search(query, top_k, include_l3, threshold, include_l1)
-            
-            if self._write_version == start_version:
-                return results
-            
-            self.stats["retry_reads"] += 1
+        if self._tx_coordinator.is_migration_active():
+            if not self._tx_coordinator.wait_for_migration(timeout=5.0):
+                self._log.warning("MIGRATION_TIMEOUT", message="检索可能在迁移期间看到不一致数据")
         
-        return results
+        try:
+            max_retries = 2
+            for attempt in range(max_retries):
+                start_version = self._write_version
+                
+                results = self._do_search(query, top_k, include_l3, threshold, include_l1)
+                
+                if self._write_version == start_version:
+                    return results
+                
+                self.stats["retry_reads"] += 1
+            
+            return results
+        finally:
+            self._tx_coordinator.release_migration_wait()
     
     def _do_search(self, query: str, top_k: int, include_l3: bool, threshold: float, include_l1: bool) -> List[MemorySearchResult]:
         """实际执行搜索（内部方法）"""
@@ -213,12 +199,6 @@ class MemoryManager:
         filtered_results = [r for r in results if r.similarity >= threshold]
         
         return filtered_results[:top_k]
-    
-    def notify_write(self):
-        """通知写入操作（由 AsyncProcessor 调用）"""
-        with self.lock:
-            self._write_version += 1
-            self._last_sync_time = time.time()
     
     def _detect_time_context(self, query: str) -> Dict[str, Any]:
         """
@@ -433,7 +413,13 @@ class MemoryManager:
         return results
     
     def _search_l3(self, query: str, top_k: int) -> List[MemorySearchResult]:
-        """搜索L3数据库"""
+        """
+        搜索L3数据库
+        
+        对于 sqlite_only 记录（is_vectorized=-1）：
+        - 降低权重（乘以 0.5）
+        - 标记来源为 L3_SQLITE_ONLY
+        """
         results = []
         
         try:
@@ -441,7 +427,7 @@ class MemoryManager:
             query_lower = query.lower()
             query_keywords = set(query_lower.split())
             
-            l3_results = self.sqlite.search_by_keywords(keywords, limit=top_k * 2)
+            l3_results = self.sqlite.search_by_keywords(keywords, limit=top_k * 3)
             
             for record in l3_results:
                 text = record.compressed_text or record.text
@@ -452,15 +438,25 @@ class MemoryManager:
                 if similarity < 0.3:
                     continue
                 
+                is_sqlite_only = (record.is_vectorized == -1)
+                
+                weight = record.weight
+                source = "L3"
+                
+                if is_sqlite_only:
+                    weight *= 0.5
+                    source = "L3_LOW_QUALITY"
+                
                 results.append(MemorySearchResult(
                     text=text,
-                    source="L3",
+                    source=source,
                     similarity=similarity,
-                    weight=record.weight,
+                    weight=weight,
                     metadata={
                         "id": record.id,
                         "access_count": record.access_count,
-                        "timestamp": record.created_time
+                        "timestamp": record.created_time,
+                        "is_sqlite_only": is_sqlite_only
                     }
                 ))
             
@@ -532,8 +528,13 @@ class MemoryManager:
         L3命中时回填到L2向量库
         
         同时增加L3中的权重
+        
+        注意：sqlite_only 记录不会被回填（保持低质量记忆不污染向量空间）
         """
         if result.source != "L3":
+            return
+        
+        if result.metadata.get("is_sqlite_only", False):
             return
         
         record_id = result.metadata.get("id")
@@ -541,7 +542,6 @@ class MemoryManager:
             return
         
         try:
-            # 存入L2向量库
             self.vector_store.add([result.text], [{
                 "timestamp": datetime.now().isoformat(),
                 "type": "backfill",
@@ -549,7 +549,6 @@ class MemoryManager:
                 "original_id": record_id
             }])
             
-            # 增加L3中的权重
             self.sqlite.update_weight(record_id, boost=True)
             
             self.stats["l3_backfills"] += 1
@@ -557,122 +556,6 @@ class MemoryManager:
             
         except Exception as e:
             print(f"L3回填失败: {e}")
-    
-    def compress_memories(self, use_local: bool = True) -> Dict[str, int]:
-        """
-        压缩记忆：L2→L3
-        
-        将向量库中的低频访问记忆压缩后存入数据库
-        
-        Args:
-            use_local: 是否使用本地LLM压缩
-        
-        Returns:
-            压缩统计信息
-        """
-        if not config.compression_enabled:
-            return {"compressed": 0, "skipped": 0}
-        
-        stats = {"compressed": 0, "skipped": 0, "errors": 0}
-        
-        try:
-            # 获取长时间未访问的记忆
-            unaccessed = self.sqlite.get_unaccessed_memories(
-                days=config.memory_decay_days // 2,
-                limit=50
-            )
-            
-            if not unaccessed:
-                return stats
-            
-            compressor = self._get_compressor() if use_local else None
-            
-            for record in unaccessed:
-                try:
-                    # 检查是否需要压缩
-                    if len(record.text) < config.compression_min_length:
-                        # 短文本直接存入L3
-                        self.sqlite.add(record)
-                        stats["skipped"] += 1
-                        continue
-                    
-                    # 使用LLM压缩
-                    if compressor:
-                        compressed_text = self._compress_text(compressor, record.text)
-                    else:
-                        compressed_text = record.text  # 无压缩器则原样存储
-                    
-                    # 存入L3
-                    compressed_record = MemoryRecord(
-                        text=record.text,
-                        compressed_text=compressed_text,
-                        source="compressed",
-                        weight=record.weight,
-                        metadata={"original_source": record.source}
-                    )
-                    self.sqlite.add(compressed_record)
-                    stats["compressed"] += 1
-                    
-                except Exception as e:
-                    print(f"压缩记忆失败: {e}")
-                    stats["errors"] += 1
-            
-            self.stats["compressions"] += stats["compressed"]
-            
-        except Exception as e:
-            print(f"压缩流程失败: {e}")
-        
-        return stats
-    
-    def _compress_text(self, compressor, text: str) -> str:
-        """使用LLM压缩文本"""
-        prompt = f"""请将以下对话记录压缩为简洁的摘要，保留所有关键信息、专有名词和数值。
-
-原始内容：
-{text}
-
-压缩要求：
-1. 保留所有专有名词、人名、地名、数值
-2. 保留因果关系和关键决策
-3. 去除冗余和修饰性内容
-4. 压缩后长度约为原文的30%-50%
-
-压缩结果："""
-
-        try:
-            messages = [
-                {"role": "system", "content": "你是一个记忆压缩专家，擅长保留关键信息的同时大幅压缩文本长度。"},
-                {"role": "user", "content": prompt}
-            ]
-            
-            result = compressor.chat(messages, max_tokens=500)
-            return result.strip() if result else text
-            
-        except Exception as e:
-            print(f"LLM压缩失败: {e}")
-            return text
-    
-    def decay_and_forget(self) -> Dict[str, int]:
-        """
-        执行记忆衰减和遗忘
-        
-        Returns:
-            遗忘统计信息
-        """
-        stats = {"decayed": 0, "forgotten": 0}
-        
-        try:
-            # L3数据库权重衰减
-            result = self.sqlite.decay_weights(config.memory_decay_days)
-            stats["decayed"] = result.get("decayed", 0)
-            stats["forgotten"] = result.get("forgotten", 0)
-            
-            self.stats["forgotten"] += stats["forgotten"]
-            
-        except Exception as e:
-            print(f"记忆衰减失败: {e}")
-        
-        return stats
     
     def get_stats(self) -> Dict[str, Any]:
         """获取统计信息"""

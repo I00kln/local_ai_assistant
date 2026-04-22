@@ -593,7 +593,16 @@ class ChatWindow:
         self._append_message("system", "记忆已手动保存")
     
     def _on_close(self):
-        """窗口关闭时的清理"""
+        """
+        窗口关闭时的清理
+        
+        清理顺序：
+        1. 停止异步处理器
+        2. 保存记忆状态
+        3. 清理 MemoryManager 资源（SQLite 连接池）
+        4. 清理 VectorStore 资源（ONNX 模型会话）
+        5. 销毁窗口
+        """
         self._closing = True
         self._cancel_all_after()
         
@@ -602,6 +611,15 @@ class ChatWindow:
         
         if self.memory:
             self.memory.save()
+            self.memory.cleanup_resources()
+        
+        try:
+            from vector_store import get_vector_store
+            vector_store = get_vector_store()
+            if vector_store:
+                vector_store.close()
+        except Exception as e:
+            print(f"清理 VectorStore 失败: {e}")
         
         try:
             self.window.destroy()

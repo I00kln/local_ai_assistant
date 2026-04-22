@@ -46,20 +46,23 @@ class SQLiteStore:
     - 全文搜索支持
     """
     
-    # 权重衰减配置
-    WEIGHT_DECAY_RATE = 0.95  # 每次衰减5%
-    WEIGHT_BOOST_ON_ACCESS = 1.2  # 访问时增加20%
-    MIN_WEIGHT_THRESHOLD = 0.3  # 低于此权重则遗忘
-    MAX_WEIGHT = 5.0  # 最大权重上限
+    WEIGHT_DECAY_RATE = 0.95
+    WEIGHT_BOOST_ON_ACCESS = 1.2
+    MIN_WEIGHT_THRESHOLD = 0.3
+    MAX_WEIGHT = 5.0
     
-    # 遗忘周期配置
-    FORGET_CHECK_INTERVAL = 3600  # 1小时检查一次
-    FORGET_AGE_DAYS = 30  # 超过30天的记忆开始衰减
+    FORGET_CHECK_INTERVAL = 3600
+    FORGET_AGE_DAYS = 30
+    
+    MAX_POOL_SIZE = 10
+    CONNECTION_TIMEOUT = 3600
     
     def __init__(self, db_path: str = "memory.db"):
         self.db_path = db_path
         self.lock = threading.RLock()
-        self._connection_pool = {}  # 线程本地连接池
+        self._connection_pool = {}
+        self._connection_times = {}
+        self._last_cleanup = datetime.now()
         self._init_database()
     
     @contextmanager
@@ -71,47 +74,55 @@ class SQLiteStore:
         - 开启WAL模式（提高并发性能）
         - 设置超时（避免Database is locked）
         - 使用线程本地连接（减少连接开销）
+        - 最大连接数限制
+        - 连接超时清理
+        - 连接失败时自动重建
         """
-        import threading
-        
         thread_id = threading.get_ident()
+        current_time = datetime.now()
         
-        # 尝试复用线程本地连接
+        if (current_time - self._last_cleanup).total_seconds() > 300:
+            self._cleanup_connections()
+            self._last_cleanup = current_time
+        
+        conn = None
+        need_create = True
+        
         if thread_id in self._connection_pool:
             conn = self._connection_pool[thread_id]
             try:
-                # 测试连接是否有效
                 conn.execute("SELECT 1")
-                yield conn
-                return
+                self._connection_times[thread_id] = current_time
+                need_create = False
             except sqlite3.Error:
-                # 连接无效，移除并重新创建
-                del self._connection_pool[thread_id]
+                if thread_id in self._connection_pool:
+                    del self._connection_pool[thread_id]
+                if thread_id in self._connection_times:
+                    del self._connection_times[thread_id]
+                conn = None
         
-        # 创建新连接
-        conn = sqlite3.connect(
-            self.db_path,
-            timeout=30.0,  # 30秒超时
-            check_same_thread=False  # 允许跨线程（配合锁使用）
-        )
-        conn.row_factory = sqlite3.Row
-        
-        # 开启WAL模式（提高并发读写性能）
-        conn.execute("PRAGMA journal_mode=WAL")
-        # 设置同步模式（平衡性能和数据安全）
-        conn.execute("PRAGMA synchronous=NORMAL")
-        # 设置缓存大小（单位：页，每页约4KB）
-        conn.execute("PRAGMA cache_size=-64000")  # 64MB缓存
-        # 设置忙等待超时
-        conn.execute("PRAGMA busy_timeout=30000")  # 30秒
-        
-        # 存入连接池
-        self._connection_pool[thread_id] = conn
+        if need_create:
+            if len(self._connection_pool) >= self.MAX_POOL_SIZE:
+                self._cleanup_connections()
+            
+            conn = sqlite3.connect(
+                self.db_path,
+                timeout=30.0,
+                check_same_thread=False
+            )
+            conn.row_factory = sqlite3.Row
+            
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
+            conn.execute("PRAGMA cache_size=-64000")
+            conn.execute("PRAGMA busy_timeout=30000")
+            
+            self._connection_pool[thread_id] = conn
+            self._connection_times[thread_id] = current_time
         
         try:
             yield conn
         except sqlite3.Error as e:
-            # 发生错误时回滚
             try:
                 conn.rollback()
             except:
@@ -119,22 +130,34 @@ class SQLiteStore:
             raise
     
     def _cleanup_connections(self):
-        """清理空闲连接（定期调用）"""
-        import threading
-        
+        """清理空闲连接和超时连接"""
+        current_time = datetime.now()
         current_thread = threading.get_ident()
         to_remove = []
         
-        for thread_id, conn in self._connection_pool.items():
-            if thread_id != current_thread:
-                try:
-                    conn.close()
-                except:
-                    pass
+        for thread_id, conn_time in list(self._connection_times.items()):
+            if thread_id == current_thread:
+                continue
+            
+            if (current_time - conn_time).total_seconds() > self.CONNECTION_TIMEOUT:
                 to_remove.append(thread_id)
         
+        if len(self._connection_pool) > self.MAX_POOL_SIZE:
+            for thread_id in list(self._connection_pool.keys()):
+                if thread_id != current_thread and thread_id not in to_remove:
+                    to_remove.append(thread_id)
+                if len(self._connection_pool) - len(to_remove) <= self.MAX_POOL_SIZE:
+                    break
+        
         for thread_id in to_remove:
-            del self._connection_pool[thread_id]
+            if thread_id in self._connection_pool:
+                try:
+                    self._connection_pool[thread_id].close()
+                except:
+                    pass
+                del self._connection_pool[thread_id]
+            if thread_id in self._connection_times:
+                del self._connection_times[thread_id]
     
     def _init_database(self):
         """初始化数据库表结构"""
@@ -209,6 +232,16 @@ class SQLiteStore:
             cursor.execute("""
                 CREATE INDEX IF NOT EXISTS idx_text_hash 
                 ON memories(text_hash)
+            """)
+            
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_decay_candidate 
+                ON memories(is_archived, created_time, weight)
+            """)
+            
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_forget_candidate 
+                ON memories(is_archived, weight, is_vectorized)
             """)
             
             # 触发器：自动同步FTS索引
@@ -414,15 +447,35 @@ class SQLiteStore:
                 
                 conn.commit()
     
-    def decay_weights(self, days_threshold: int = None):
+    def decay_weights(self, days_threshold: int = None, batch_size: int = 1000) -> Dict[str, Any]:
         """
         权重衰减（遗忘机制）
         
         对超过指定天数的记忆进行权重衰减
         注意：带有"important"标签的记忆不会被衰减或删除
+        
+        优化：
+        - 分批处理大量记录，避免长时间锁表
+        - 使用复合索引加速查询
+        - 排除重要记忆（metadata.tags 包含 "important"）
+        
+        Args:
+            days_threshold: 衰减阈值天数
+            batch_size: 每批处理的最大记录数
+        
+        Returns:
+            {
+                "decayed": 衰减数量,
+                "forgotten": 遗忘数量,
+                "vector_ids_to_delete": 需要删除的ChromaDB向量ID列表
+            }
         """
         if days_threshold is None:
             days_threshold = self.FORGET_AGE_DAYS
+        
+        total_decayed = 0
+        total_forgotten = 0
+        all_vector_ids_to_delete = []
         
         with self.lock:
             with self._get_connection() as conn:
@@ -430,33 +483,64 @@ class SQLiteStore:
                 
                 threshold_time = (datetime.now() - timedelta(days=days_threshold)).isoformat()
                 
-                cursor.execute("""
-                    UPDATE memories 
-                    SET weight = weight * ?
-                    WHERE created_time < ?
-                    AND is_archived = 0
-                    AND (metadata IS NULL OR metadata NOT LIKE '%"important"%')
-                    AND (metadata IS NULL OR metadata NOT LIKE '%"重要"%')
-                """, (self.WEIGHT_DECAY_RATE, threshold_time))
+                while True:
+                    cursor.execute("""
+                        UPDATE memories 
+                        SET weight = weight * ?
+                        WHERE id IN (
+                            SELECT id FROM memories 
+                            WHERE created_time < ?
+                            AND is_archived = 0
+                            AND weight > ?
+                            AND (metadata IS NULL OR metadata NOT LIKE '%"important"%')
+                            LIMIT ?
+                        )
+                    """, (self.WEIGHT_DECAY_RATE, threshold_time, 
+                          self.MIN_WEIGHT_THRESHOLD, batch_size))
+                    
+                    batch_decayed = cursor.rowcount
+                    total_decayed += batch_decayed
+                    
+                    if batch_decayed < batch_size:
+                        break
                 
-                decayed_count = cursor.rowcount
+                while True:
+                    cursor.execute("""
+                        SELECT id, vector_id FROM memories 
+                        WHERE weight < ?
+                        AND is_archived = 0
+                        AND is_vectorized = 1
+                        AND vector_id IS NOT NULL
+                        AND vector_id != ''
+                        AND (metadata IS NULL OR metadata NOT LIKE '%"important"%')
+                        LIMIT ?
+                    """, (self.MIN_WEIGHT_THRESHOLD, batch_size))
+                    
+                    rows = cursor.fetchall()
+                    if not rows:
+                        break
+                    
+                    ids_to_delete = [row[0] for row in rows]
+                    vector_ids = [row[1] for row in rows if row[1]]
+                    all_vector_ids_to_delete.extend(vector_ids)
+                    
+                    placeholders = ",".join("?" * len(ids_to_delete))
+                    cursor.execute(f"""
+                        DELETE FROM memories 
+                        WHERE id IN ({placeholders})
+                    """, ids_to_delete)
+                    
+                    total_forgotten += len(ids_to_delete)
                 
-                cursor.execute("""
-                    DELETE FROM memories 
-                    WHERE weight < ?
-                    AND is_archived = 0
-                    AND (metadata IS NULL OR metadata NOT LIKE '%"important"%')
-                    AND (metadata IS NULL OR metadata NOT LIKE '%"重要"%')
-                """, (self.MIN_WEIGHT_THRESHOLD,))
-                
-                forgotten_count = cursor.rowcount
                 conn.commit()
                 
-                print(f"权重衰减完成: {decayed_count} 条记忆衰减, {forgotten_count} 条记忆遗忘")
+                if total_decayed > 0 or total_forgotten > 0:
+                    print(f"权重衰减完成: {total_decayed} 条记忆衰减, {total_forgotten} 条记忆遗忘")
                 
                 return {
-                    "decayed": decayed_count,
-                    "forgotten": forgotten_count
+                    "decayed": total_decayed,
+                    "forgotten": total_forgotten,
+                    "vector_ids_to_delete": all_vector_ids_to_delete
                 }
     
     def get_low_weight_memories(self, threshold: float = None, limit: int = 100) -> List[MemoryRecord]:
@@ -497,6 +581,37 @@ class SQLiteStore:
                 WHERE weight >= ?
                 AND last_access_time > ?
                 AND is_vectorized = 0
+                AND is_archived = 0
+                ORDER BY weight DESC, last_access_time DESC
+                LIMIT ?
+            """, (threshold, recent_time, limit))
+            
+            return [self._row_to_record(row) for row in cursor.fetchall()]
+    
+    def get_upgradeable_sqlite_only(self, threshold: float = None, limit: int = 20) -> List[MemoryRecord]:
+        """
+        获取可升级的 sqlite_only 记录
+        
+        条件：
+        - 权重超过阈值（说明有价值）
+        - 最近有访问（说明仍在使用）
+        - is_vectorized = -1（sqlite_only 标记）
+        
+        这些记录最初被判定为低价值，但后续访问表明有价值，
+        应该升级到向量库以支持语义检索。
+        """
+        if threshold is None:
+            threshold = self.MAX_WEIGHT * 0.5
+        
+        recent_time = (datetime.now() - timedelta(days=7)).isoformat()
+        
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT * FROM memories 
+                WHERE weight >= ?
+                AND last_access_time > ?
+                AND is_vectorized = -1
                 AND is_archived = 0
                 ORDER BY weight DESC, last_access_time DESC
                 LIMIT ?
@@ -667,12 +782,18 @@ class SQLiteStore:
                 conn.commit()
     
     def get_unvectorized(self, limit: int = 50) -> List[MemoryRecord]:
-        """获取未向量化的记录（用于重试）"""
+        """
+        获取未向量化的记录（用于重试）
+        
+        包括：
+        - is_vectorized=0: 未处理
+        - is_vectorized=2: 迁移中断，需要恢复
+        """
         with self._get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("""
                 SELECT * FROM memories 
-                WHERE is_vectorized = 0 
+                WHERE is_vectorized IN (0, 2)
                 AND is_archived = 0
                 ORDER BY created_time DESC
                 LIMIT ?
