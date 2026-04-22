@@ -166,6 +166,7 @@ class MemoryManager:
         1. 扩大召回范围（top_k * 3）
         2. 在内存中结合时间衰减、权重等因素重新打分
         3. 最后截断输出最终的Top-K
+        4. 过滤掉 forgotten 记忆
         """
         results = []
         seen_texts = set()
@@ -179,6 +180,8 @@ class MemoryManager:
             l1_results = self._search_l1(query, recall_limit, threshold)
             for r in l1_results:
                 if r.text not in seen_texts:
+                    if MemoryTagHelper.is_forgotten(r.metadata):
+                        continue
                     seen_texts.add(r.text)
                     r.combined_score = r.similarity * r.weight
                     results.append(r)
@@ -189,6 +192,8 @@ class MemoryManager:
             l2_results = self._search_l2(query, remaining)
             for r in l2_results:
                 if r.text not in seen_texts:
+                    if MemoryTagHelper.is_forgotten(r.metadata):
+                        continue
                     seen_texts.add(r.text)
                     time_decay = self._apply_time_decay(r, time_context)
                     r.combined_score = time_decay * r.weight
@@ -200,13 +205,16 @@ class MemoryManager:
             l3_results = self._search_l3(query, remaining)
             for r in l3_results:
                 if r.text not in seen_texts:
+                    if MemoryTagHelper.is_forgotten(r.metadata):
+                        continue
                     seen_texts.add(r.text)
                     time_decay = self._apply_time_decay(r, time_context)
                     r.combined_score = time_decay * r.weight
                     results.append(r)
             
             for result in l3_results:
-                self._backfill_to_l2(result)
+                if not MemoryTagHelper.is_forgotten(result.metadata):
+                    self._backfill_to_l2(result)
         
         results.sort(key=lambda x: x.combined_score, reverse=True)
         
@@ -599,6 +607,100 @@ class MemoryManager:
             "forgotten": self.stats["forgotten"],
             "l3_details": l3_stats
         }
+    
+    def mark_forgotten(self, record_id: int, reason: str = "user_request") -> bool:
+        """
+        标记记忆为遗忘状态
+        
+        遗忘的记忆：
+        - 不参与检索
+        - 优先被合并/删除
+        - 保留原始数据（可恢复）
+        
+        Args:
+            record_id: 记忆ID
+            reason: 遗忘原因
+        
+        Returns:
+            是否成功
+        """
+        try:
+            record = self.sqlite.get(record_id)
+            if not record:
+                return False
+            
+            record.metadata = MemoryTagHelper.mark_forgotten(record.metadata, reason)
+            self.sqlite.add(record)
+            
+            self.stats["forgotten"] += 1
+            print(f"记忆 {record_id} 已标记为遗忘")
+            
+            return True
+            
+        except Exception as e:
+            print(f"标记遗忘失败: {e}")
+            return False
+    
+    def unmark_forgotten(self, record_id: int) -> bool:
+        """
+        取消遗忘标记（恢复记忆）
+        
+        Args:
+            record_id: 记忆ID
+        
+        Returns:
+            是否成功
+        """
+        try:
+            record = self.sqlite.get(record_id)
+            if not record:
+                return False
+            
+            record.metadata = MemoryTagHelper.unmark_forgotten(record.metadata)
+            self.sqlite.add(record)
+            
+            print(f"记忆 {record_id} 已恢复")
+            
+            return True
+            
+        except Exception as e:
+            print(f"恢复记忆失败: {e}")
+            return False
+    
+    def get_forgotten_memories(self, limit: int = 100) -> List[Dict]:
+        """
+        获取已遗忘的记忆列表
+        
+        用于用户查看和管理已遗忘的记忆
+        
+        Args:
+            limit: 返回数量限制
+        
+        Returns:
+            遗忘记忆列表
+        """
+        try:
+            all_records = self.sqlite.get_recent_memories(limit=limit * 10)
+            forgotten = []
+            
+            for record in all_records:
+                if MemoryTagHelper.is_forgotten(record.metadata):
+                    forgotten.append({
+                        "id": record.id,
+                        "text": record.text[:100] + "..." if len(record.text) > 100 else record.text,
+                        "forgotten_time": record.metadata.get(MemoryTags.FORGOTTEN_TIME),
+                        "reason": record.metadata.get(MemoryTags.FORGOTTEN_REASON),
+                        "created_time": record.created_time
+                    })
+                    
+                    if len(forgotten) >= limit:
+                        break
+            
+            return forgotten
+            
+        except Exception as e:
+            print(f"获取遗忘记忆失败: {e}")
+            return []
     
     def __len__(self) -> int:
         """返回L1内存层的记忆数量"""

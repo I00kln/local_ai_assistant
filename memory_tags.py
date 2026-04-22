@@ -35,6 +35,21 @@ class MemoryTags:
     # 高密度内容标签
     HIGH_DENSITY = "high_density"
     
+    # 遗忘相关标签
+    FORGOTTEN = "forgotten"
+    FORGOTTEN_TIME = "forgotten_time"
+    FORGOTTEN_REASON = "forgotten_reason"
+    ARCHIVED = "archived"
+    ARCHIVED_TIME = "archived_time"
+    
+    # 合并相关标签
+    MERGED = "merged"
+    MERGED_AT = "merged_at"
+    MERGED_COUNT = "merged_count"
+    MERGED_FROM_IDS = "merged_from_ids"
+    NEEDS_RECOMPRESSION = "needs_recompression"
+    NEEDS_REVECTORIZATION = "needs_revectorization"
+    
     # 来源标签
     SOURCE_L1 = "L1"
     SOURCE_L2 = "L2"
@@ -143,6 +158,166 @@ class MemoryTagHelper:
             metadata.get(MemoryTags.IMPORTANT) is True or
             metadata.get(MemoryTags.PRESERVE) is True
         )
+    
+    @staticmethod
+    def get_merge_priority(metadata: dict) -> int:
+        """
+        获取记忆合并优先级
+        
+        优先级规则：
+        - protected: 100 (最高，不参与合并)
+        - forgotten: 0 (最低，可被合并/删除)
+        - important: 80
+        - high_density: 70 (高密度内容不合并)
+        - preserve: 60
+        - compressed: 40
+        - 普通: 20
+        
+        合并时：
+        1. protected/high_density 记忆不参与合并
+        2. forgotten 记忆优先被合并/删除
+        3. 高优先级记忆作为主记录保留
+        4. 同优先级按时间排序
+        
+        Args:
+            metadata: 记忆元数据
+        
+        Returns:
+            优先级数值（越高越优先）
+        """
+        if metadata is None:
+            return 20
+        
+        if metadata.get(MemoryTags.PROTECTED) is True:
+            return 100
+        
+        if metadata.get(MemoryTags.FORGOTTEN) is True:
+            return 0
+        
+        if metadata.get(MemoryTags.IMPORTANT) is True:
+            return 80
+        
+        if metadata.get(MemoryTags.HIGH_DENSITY) is True:
+            return 70
+        
+        if metadata.get(MemoryTags.PRESERVE) is True:
+            return 60
+        
+        if metadata.get(MemoryTags.COMPRESSED) is True:
+            return 40
+        
+        return 20
+    
+    @staticmethod
+    def should_skip_merge(metadata: dict) -> bool:
+        """
+        检查记忆是否应该跳过合并
+        
+        protected 和 high_density 记忆不应该被合并或删除
+        
+        Args:
+            metadata: 记忆元数据
+        
+        Returns:
+            是否跳过合并
+        """
+        if metadata is None:
+            return False
+        
+        if metadata.get(MemoryTags.PROTECTED) is True:
+            return True
+        
+        if metadata.get(MemoryTags.HIGH_DENSITY) is True:
+            return True
+        
+        return False
+    
+    @staticmethod
+    def is_forgotten(metadata: dict) -> bool:
+        """
+        检查是否已被用户标记遗忘
+        
+        Args:
+            metadata: 记忆元数据
+        
+        Returns:
+            是否已遗忘
+        """
+        if metadata is None:
+            return False
+        return metadata.get(MemoryTags.FORGOTTEN) is True
+    
+    @staticmethod
+    def mark_forgotten(metadata: dict, reason: str = "user_request") -> dict:
+        """
+        标记记忆为遗忘状态
+        
+        遗忘的记忆：
+        - 不参与检索
+        - 优先被合并/删除
+        - 保留原始数据（可恢复）
+        
+        Args:
+            metadata: 记忆元数据
+            reason: 遗忘原因
+        
+        Returns:
+            更新后的元数据
+        """
+        if metadata is None:
+            metadata = {}
+        
+        from datetime import datetime
+        metadata[MemoryTags.FORGOTTEN] = True
+        metadata[MemoryTags.FORGOTTEN_TIME] = datetime.now().isoformat()
+        metadata[MemoryTags.FORGOTTEN_REASON] = reason
+        
+        return metadata
+    
+    @staticmethod
+    def unmark_forgotten(metadata: dict) -> dict:
+        """
+        取消遗忘标记（恢复记忆）
+        
+        Args:
+            metadata: 记忆元数据
+        
+        Returns:
+            更新后的元数据
+        """
+        if metadata is None:
+            return {}
+        
+        metadata.pop(MemoryTags.FORGOTTEN, None)
+        metadata.pop(MemoryTags.FORGOTTEN_TIME, None)
+        metadata.pop(MemoryTags.FORGOTTEN_REASON, None)
+        
+        return metadata
+    
+    @staticmethod
+    def mark_high_density(metadata: dict, reason: str = "auto_detected") -> dict:
+        """
+        标记为高密度内容
+        
+        高密度内容：
+        - 不被压缩
+        - 不参与合并
+        - 保持原始内容
+        
+        Args:
+            metadata: 记忆元数据
+            reason: 标记原因
+        
+        Returns:
+            更新后的元数据
+        """
+        if metadata is None:
+            metadata = {}
+        
+        metadata[MemoryTags.HIGH_DENSITY] = True
+        metadata["high_density_reason"] = reason
+        
+        return metadata
     
     @staticmethod
     def is_pending_compression(metadata: dict) -> bool:

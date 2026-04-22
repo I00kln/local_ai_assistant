@@ -17,6 +17,19 @@ from logger import get_logger
 from memory_tags import MemoryTags, MemoryTagHelper
 from memory_merger import get_merger
 
+_tag_classifier = None
+
+def _get_tag_classifier():
+    """延迟获取标签分类器"""
+    global _tag_classifier
+    if _tag_classifier is None:
+        try:
+            from tag_classifier import get_tag_classifier
+            _tag_classifier = get_tag_classifier()
+        except Exception:
+            pass
+    return _tag_classifier
+
 
 class CompressionStrategy(ABC):
     """压缩策略抽象接口"""
@@ -865,10 +878,20 @@ class AsyncMemoryProcessor:
                 else:
                     pre_generated_id = str(uuid.uuid4())
                     from sqlite_store import MemoryRecord
+                    
+                    tagged_meta = dict(meta) if meta else {}
+                    tagger = _get_tag_classifier()
+                    if tagger:
+                        try:
+                            tag = tagger.tag_memory(text)
+                            tagged_meta = tagger.update_metadata_with_tag(tagged_meta, tag)
+                        except Exception as e:
+                            self._log.debug("TAG_RULE_FAILED", error=str(e))
+                    
                     record = MemoryRecord(
                         text=text,
-                        source=meta.get("source", "local"),
-                        metadata=meta,
+                        source=meta.get("source", "local") if meta else "local",
+                        metadata=tagged_meta,
                         is_vectorized=0,
                         vector_id=pre_generated_id
                     )
@@ -1186,17 +1209,21 @@ class AsyncMemoryProcessor:
         检查记忆是否应该跳过压缩
         
         跳过条件：
-        1. 已有压缩文本（compressed_text存在）
+        1. 已有压缩文本（compressed_text存在）且未标记需要重新压缩
         2. metadata中标记为受保护
-        3. metadata中标记为已压缩
+        3. metadata中标记为已压缩且未标记需要重新压缩
         """
-        if record.compressed_text:
+        needs_recompression = False
+        if record.metadata and record.metadata.get("needs_recompression"):
+            needs_recompression = True
+        
+        if record.compressed_text and not needs_recompression:
             return True
         
         if MemoryTagHelper.is_protected(record.metadata):
             return True
         
-        if MemoryTagHelper.is_compressed(record.metadata):
+        if MemoryTagHelper.is_compressed(record.metadata) and not needs_recompression:
             return True
         
         return False
@@ -1265,6 +1292,20 @@ class AsyncMemoryProcessor:
                         record.metadata = MemoryTagHelper.mark_compressed(
                             record.metadata, strategy_name, original_length
                         )
+                        
+                        if record.metadata:
+                            record.metadata.pop("needs_recompression", None)
+                            record.metadata.pop("needs_revectorization", None)
+                        
+                        tagger = _get_tag_classifier()
+                        if tagger:
+                            try:
+                                tag = tagger.tag_for_compression(compressed_text)
+                                record.metadata = tagger.update_metadata_with_tag(
+                                    record.metadata, tag
+                                )
+                            except Exception as tag_e:
+                                self._log.debug("TAG_LLM_FAILED", error=str(tag_e))
                         
                         if record.vector_id:
                             try:
@@ -1563,6 +1604,9 @@ class AsyncMemoryProcessor:
         record.metadata = MemoryTagHelper.mark_preserve(
             record.metadata, "high_density_content"
         )
+        record.metadata = MemoryTagHelper.mark_high_density(
+            record.metadata, "auto_detected"
+        )
         self.sqlite.add(record)
     
     def _mark_pending_compression(self, record: MemoryRecord):
@@ -1624,6 +1668,9 @@ class AsyncMemoryProcessor:
                         record.metadata = MemoryTagHelper.mark_compressed(
                             record.metadata, strategy_name, original_length
                         )
+                        if record.metadata:
+                            record.metadata.pop("needs_recompression", None)
+                            record.metadata.pop("needs_revectorization", None)
                         self.sqlite.add(record)
                         compressed_count += 1
                         

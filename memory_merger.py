@@ -414,15 +414,59 @@ class MemoryMerger:
         合并一组相似记忆
         
         策略：
-        1. 保留最早的创建时间
-        2. 合并权重（取最大值）
-        3. 智能合并文本
-        4. 深度合并元数据
+        1. 检查 protected/high_density 记忆，跳过合并
+        2. 按优先级排序选择主记录
+        3. 合并权重（取最大值）
+        4. 智能合并文本
+        5. 深度合并元数据
+        6. 清除压缩状态（合并后需重新压缩）
+        7. 重新标记 semantic_tag
+        
+        优先级规则：
+        - protected: 100 (不参与合并)
+        - forgotten: 0 (最低，可被合并/删除)
+        - important: 80
+        - high_density: 70 (不参与合并)
+        - preserve: 60
+        - compressed: 40
+        - 普通: 20
         """
         if len(group) == 1:
             return group[0]
         
-        sorted_group = sorted(group, key=lambda x: x.get("created_time", ""))
+        skip_memories = [
+            m for m in group 
+            if MemoryTagHelper.should_skip_merge(m.get("metadata", {}))
+        ]
+        if skip_memories:
+            self._log.info(
+                "MERGE_SKIP_PROTECTED",
+                skip_count=len(skip_memories),
+                group_size=len(group),
+                reasons=[
+                    "protected" if m.get("metadata", {}).get(MemoryTags.PROTECTED) 
+                    else "high_density"
+                    for m in skip_memories
+                ]
+            )
+            return None
+        
+        def get_sort_key(m):
+            priority = MemoryTagHelper.get_merge_priority(m.get("metadata", {}))
+            created_time = m.get("created_time", "9999-99-99T99:99:99")
+            return (-priority, created_time)
+        
+        sorted_group = sorted(group, key=get_sort_key)
+        
+        primary = sorted_group[0]
+        primary_priority = MemoryTagHelper.get_merge_priority(primary.get("metadata", {}))
+        
+        self._log.debug(
+            "MERGE_PRIMARY_SELECTED",
+            primary_id=primary.get("id"),
+            priority=primary_priority,
+            group_size=len(group)
+        )
         
         merged_text = self._smart_merge_texts([m.get("text", "") for m in sorted_group])
         
@@ -436,16 +480,58 @@ class MemoryMerger:
         merged_metadata[MemoryTags.MERGED] = True
         merged_metadata["merged_count"] = len(group)
         merged_metadata["merged_from_ids"] = [m.get("id") for m in sorted_group if m.get("id")]
+        merged_metadata["merged_from_priorities"] = [
+            MemoryTagHelper.get_merge_priority(m.get("metadata", {})) 
+            for m in sorted_group
+        ]
+        
+        compression_keys = [
+            MemoryTags.COMPRESSED,
+            MemoryTags.COMPRESSED_TIME,
+            MemoryTags.COMPRESSED_STRATEGY,
+            MemoryTags.ORIGINAL_LENGTH,
+            MemoryTags.HAS_COMPRESSED_VERSION,
+            MemoryTags.PENDING_COMPRESSION,
+            MemoryTags.PENDING_SINCE,
+            MemoryTags.RETRY_COUNT
+        ]
+        for key in compression_keys:
+            merged_metadata.pop(key, None)
+        
+        merged_metadata["needs_recompression"] = True
+        
+        if primary_priority >= 60:
+            for tag in [MemoryTags.IMPORTANT, MemoryTags.PRESERVE]:
+                if primary.get("metadata", {}).get(tag) is True:
+                    merged_metadata[tag] = True
+                    merged_metadata[f"{tag}_inherited"] = True
+        
+        has_forgotten_member = any(
+            m.get("metadata", {}).get(MemoryTags.FORGOTTEN) is True
+            for m in sorted_group
+        )
+        if has_forgotten_member:
+            merged_metadata["had_forgotten_member"] = True
+        
+        try:
+            from tag_classifier import get_tag_classifier
+            tagger = get_tag_classifier()
+            new_tag = tagger.tag_memory(merged_text)
+            merged_metadata["semantic_tag"] = new_tag.to_dict()
+        except Exception:
+            pass
         
         merged = {
             "text": merged_text,
-            "created_time": sorted_group[0].get("created_time"),
+            "created_time": primary.get("created_time"),
             "weight": max(m.get("weight", 1.0) for m in group),
             "access_count": sum(m.get("access_count", 0) for m in group),
             "metadata": merged_metadata,
             "source": "merged",
-            "original_ids": [m.get("id") for m in group if m.get("id")],
-            "vector_ids_to_delete": []
+            "original_ids": [m.get("id") for m in sorted_group if m.get("id")],
+            "vector_ids_to_delete": [],
+            "compressed_text": None,
+            "primary_priority": primary_priority
         }
         
         for m in sorted_group[1:]:
@@ -463,6 +549,7 @@ class MemoryMerger:
         2. 冲突时保留第一个出现的值
         3. 数组类型合并去重
         4. 记录合并来源
+        5. semantic_tag 使用专门的合并策略
         """
         if not metadata_list:
             return {}
@@ -472,12 +559,24 @@ class MemoryMerger:
         
         merged = {}
         seen_keys = {}
+        semantic_tags_to_merge = []
         
         for i, metadata in enumerate(metadata_list):
             if not isinstance(metadata, dict):
                 continue
             
+            if "semantic_tag" in metadata:
+                try:
+                    from tag_classifier import MemoryTag
+                    tag = MemoryTag.from_dict(metadata["semantic_tag"])
+                    semantic_tags_to_merge.append(tag)
+                except Exception:
+                    pass
+            
             for key, value in metadata.items():
+                if key == "semantic_tag":
+                    continue
+                
                 if key in seen_keys:
                     if isinstance(merged[key], list) and isinstance(value, list):
                         combined = merged[key] + value
@@ -494,6 +593,16 @@ class MemoryMerger:
                         merged[key] = list(set(str(x) for x in value))
                     else:
                         merged[key] = value
+        
+        if semantic_tags_to_merge:
+            try:
+                from tag_classifier import get_tag_classifier
+                tagger = get_tag_classifier()
+                merged_tag = tagger.merge_tags(semantic_tags_to_merge)
+                merged["semantic_tag"] = merged_tag.to_dict()
+            except Exception:
+                if semantic_tags_to_merge:
+                    merged["semantic_tag"] = semantic_tags_to_merge[0].to_dict()
         
         return merged
     
@@ -723,6 +832,27 @@ class MemoryMerger:
                     ])
                     existing.metadata["merged_at"] = datetime.now().isoformat()
                     
+                    primary_priority = merged.get("primary_priority", 20)
+                    existing.metadata["merged_primary_priority"] = primary_priority
+                    
+                    existing.compressed_text = None
+                    
+                    compression_keys = [
+                        MemoryTags.COMPRESSED,
+                        MemoryTags.COMPRESSED_TIME,
+                        MemoryTags.COMPRESSED_STRATEGY,
+                        MemoryTags.ORIGINAL_LENGTH,
+                        MemoryTags.HAS_COMPRESSED_VERSION,
+                        MemoryTags.PENDING_COMPRESSION,
+                        MemoryTags.PENDING_SINCE,
+                        MemoryTags.RETRY_COUNT
+                    ]
+                    for key in compression_keys:
+                        existing.metadata.pop(key, None)
+                    
+                    existing.metadata["needs_revectorization"] = True
+                    existing.metadata["needs_recompression"] = True
+                    
                     existing.is_vectorized = 0
                     existing.vector_id = ""
                     
@@ -732,7 +862,9 @@ class MemoryMerger:
                         "MERGE_UPDATE_PRIMARY",
                         primary_id=primary_id,
                         new_text_length=len(merged["text"]),
-                        needs_revectorization=True
+                        needs_revectorization=True,
+                        needs_recompression=True,
+                        primary_priority=primary_priority
                     )
                 
                 for oid in other_ids:
