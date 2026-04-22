@@ -2,7 +2,8 @@
 import threading
 import time
 import queue
-from typing import List, Dict, Any
+import hashlib
+from typing import List, Dict, Any, Set, Tuple
 from datetime import datetime
 from vector_store import VectorStore, get_vector_store
 from config import config
@@ -21,6 +22,7 @@ class AsyncMemoryProcessor:
     COMPRESSION_INTERVAL = 600  # 压缩检查间隔（秒）
     FORGET_INTERVAL = 3600  # 遗忘检查间隔（秒）
     FLUSH_INTERVAL = 30  # 定时落盘间隔（秒），确保断电时数据丢失不超过batch_size
+    MAX_BUFFER_AGE = 60  # 缓冲区最大存活时间（秒），强制落盘
     
     def __init__(self, vector_store: VectorStore = None):
         self.vector_store = vector_store or get_vector_store()
@@ -34,10 +36,10 @@ class AsyncMemoryProcessor:
         self._last_dedup_time = time.time()
         self._last_compression_time = time.time()
         self._last_forget_time = time.time()
-        self._last_flush_time = time.time()  # 新增：上次落盘时间
+        self._last_flush_time = time.time()
+        self._buffer_first_item_time: Optional[float] = None
         self._idle_count = 0
         
-        # SQLite存储实例
         self.sqlite = None
         if config.sqlite_enabled:
             try:
@@ -45,8 +47,12 @@ class AsyncMemoryProcessor:
             except Exception as e:
                 print(f"SQLite初始化失败: {e}")
         
-        # 压缩器（延迟初始化）
         self.compressor = None
+        self._memory_manager = None
+    
+    def set_memory_manager(self, memory_manager):
+        """设置记忆管理器引用（用于通知写入操作）"""
+        self._memory_manager = memory_manager
         
     def start(self):
         """启动后台处理线程"""
@@ -184,8 +190,7 @@ class AsyncMemoryProcessor:
                     self._idle_count += 1
                     self._check_and_flush()
                     self._check_and_dedup()
-                    self._check_and_compress()  # 新增：压缩检查
-                    self._check_and_forget()  # 新增：遗忘检查
+                    self._check_memory_flow()
                     continue
                 
             except Exception as e:
@@ -211,7 +216,6 @@ class AsyncMemoryProcessor:
             "timestamp": conv["timestamp"]
         }
         
-        # 废话过滤检查
         if config.nonsense_filter_enabled:
             filter_result = get_nonsense_filter().filter(user_input, assistant_response)
             
@@ -224,7 +228,9 @@ class AsyncMemoryProcessor:
                 self._store_to_sqlite_only(conversation_memory, metadata)
                 return
         
-        # 正常存储：SQLite + ChromaDB
+        if len(self.batch_buffer) == 0:
+            self._buffer_first_item_time = time.time()
+        
         self.batch_buffer.append({
             "text": conversation_memory,
             "metadata": metadata
@@ -258,7 +264,15 @@ class AsyncMemoryProcessor:
         """
         将缓冲区数据原子化写入
         
-        流程：SQLite → ChromaDB → 更新状态
+        流程（两阶段提交）：
+        1. 检查幂等性（文本哈希）
+        2. 写入SQLite（标记为待向量化）
+        3. 写入ChromaDB
+        4. 更新SQLite状态
+        
+        失败恢复：
+        - 启动时通过 _startup_recovery 重试未向量化的记录
+        - 使用文本哈希防止重复写入
         """
         if not self.batch_buffer:
             return
@@ -266,37 +280,62 @@ class AsyncMemoryProcessor:
         texts = [item["text"] for item in self.batch_buffer]
         metadatas = [item["metadata"] for item in self.batch_buffer]
         
-        # 步骤1: 先写入SQLite
         sqlite_ids = []
-        if self.sqlite:
-            from sqlite_store import MemoryRecord
-            for text, meta in zip(texts, metadatas):
-                record = MemoryRecord(
-                    text=text,
-                    source=meta.get("source", "local"),
-                    metadata=meta,
-                    is_vectorized=0  # 标记为未向量化
-                )
-                record_id = self.sqlite.add(record)
-                sqlite_ids.append(record_id)
+        texts_to_vectorize = []
+        metadatas_to_vectorize = []
+        hash_list = []
         
-        # 步骤2: 写入ChromaDB
+        if self.sqlite:
+            for text, meta in zip(texts, metadatas):
+                text_hash = self.sqlite.compute_text_hash(text)
+                hash_list.append(text_hash)
+                
+                exists, existing_id = self.sqlite.exists_by_text_hash(text_hash)
+                if exists:
+                    record = self.sqlite.get(existing_id)
+                    if record and record.is_vectorized == 1:
+                        print(f"[幂等检查] 文本已存在且已向量化，跳过: {text[:50]}...")
+                        continue
+                    sqlite_ids.append((existing_id, text_hash))
+                    texts_to_vectorize.append(text)
+                    metadatas_to_vectorize.append(meta)
+                else:
+                    from sqlite_store import MemoryRecord
+                    record = MemoryRecord(
+                        text=text,
+                        source=meta.get("source", "local"),
+                        metadata=meta,
+                        is_vectorized=0
+                    )
+                    record_id = self.sqlite.add_with_hash(record, text_hash)
+                    sqlite_ids.append((record_id, text_hash))
+                    texts_to_vectorize.append(text)
+                    metadatas_to_vectorize.append(meta)
+        else:
+            texts_to_vectorize = texts
+            metadatas_to_vectorize = metadatas
+        
+        if not texts_to_vectorize:
+            self.batch_buffer.clear()
+            return
+        
         try:
-            vector_ids = self.vector_store.add(texts, metadatas)
+            vector_ids = self.vector_store.add(texts_to_vectorize, metadatas_to_vectorize)
             
-            # 步骤3: 更新SQLite的向量化状态
             if self.sqlite and sqlite_ids and vector_ids:
-                for sqlite_id, vector_id in zip(sqlite_ids, vector_ids):
+                for (sqlite_id, text_hash), vector_id in zip(sqlite_ids, vector_ids):
                     self.sqlite.update_vector_status(sqlite_id, vector_id, is_vectorized=1)
             
-            print(f"原子化写入完成: {len(texts)} 条记忆")
-            self._last_flush_time = time.time()  # 更新落盘时间
+            print(f"原子化写入完成: {len(texts_to_vectorize)} 条记忆")
+            self._last_flush_time = time.time()
+            
+            if self._memory_manager:
+                self._memory_manager.notify_write()
             
         except Exception as e:
             print(f"ChromaDB写入失败: {e}")
-            # 标记为向量化失败，后续可重试
             if self.sqlite and sqlite_ids:
-                for sqlite_id in sqlite_ids:
+                for sqlite_id, text_hash in sqlite_ids:
                     self.sqlite.update_vector_status(sqlite_id, "", is_vectorized=-1)
         
         self.batch_buffer.clear()
@@ -332,23 +371,33 @@ class AsyncMemoryProcessor:
         触发条件：
         1. batch_buffer 已满（在 _process_conversation 中处理）
         2. 超过 FLUSH_INTERVAL 时间未落盘
+        3. 缓冲区首条记录超过 MAX_BUFFER_AGE（强制落盘）
         
         确保断电时数据丢失不超过 batch_size
         """
         current_time = time.time()
         
-        # 条件1: 缓冲区有数据且超过定时落盘间隔
         if len(self.batch_buffer) > 0:
             time_since_last_flush = current_time - self._last_flush_time
             
-            if time_since_last_flush >= self.FLUSH_INTERVAL:
+            buffer_age = 0
+            if self._buffer_first_item_time:
+                buffer_age = current_time - self._buffer_first_item_time
+            
+            if buffer_age >= self.MAX_BUFFER_AGE:
+                print(f"[强制落盘] 缓冲区 {len(self.batch_buffer)} 条记录，已存活 {buffer_age:.1f} 秒")
+                self._flush_buffer()
+                self._last_flush_time = current_time
+                self._buffer_first_item_time = None
+            elif time_since_last_flush >= self.FLUSH_INTERVAL:
                 print(f"[定时落盘] 缓冲区 {len(self.batch_buffer)} 条记录，距上次落盘 {time_since_last_flush:.1f} 秒")
                 self._flush_buffer()
                 self._last_flush_time = current_time
+                self._buffer_first_item_time = None
             elif len(self.batch_buffer) >= self.batch_size:
-                # 条件2: 缓冲区已满（虽然这应该在 _process_conversation 中处理）
                 self._flush_buffer()
                 self._last_flush_time = current_time
+                self._buffer_first_item_time = None
     
     def _check_and_dedup(self):
         """空闲时检查并执行去重"""
@@ -372,81 +421,403 @@ class AsyncMemoryProcessor:
         except Exception as e:
             print(f"去重失败: {e}")
     
-    def _check_and_compress(self):
+    def _check_memory_flow(self):
         """
-        空闲时检查并执行记忆压缩
+        空闲时检查并执行记忆流动（统一入口）
         
-        将向量库中的低频访问记忆压缩后存入SQLite
+        记忆流动机制（按顺序执行）：
+        1. L2→L3：不常用、低权重的记忆从向量库移动到SQLite暂存
+        2. L3压缩：对L3中的记忆进行压缩
+        3. L3→L2：高权重、常用的记忆从SQLite回流到向量库
+        4. 待压缩处理：处理之前标记为待压缩的记忆
+        5. 遗忘机制：对L3中权重极低的记忆进行遗忘
+        
+        所有操作共享时间检查，避免重复执行
         """
-        if not config.compression_enabled or not self.sqlite:
+        if not config.sqlite_enabled or not self.sqlite:
             return
         
         current_time = time.time()
         
-        # 空闲阈值检查
         if self._idle_count < 5:
             return
         
-        # 时间间隔检查
         if current_time - self._last_compression_time < self.COMPRESSION_INTERVAL:
             return
         
-        # 记忆数量检查
-        if len(self.vector_store) < 20:
-            return
+        try:
+            print("[后台任务] 开始记忆流动...")
+            
+            moved_to_l3 = self._move_l2_to_l3()
+            
+            compressed = self._compress_l3_memories()
+            
+            moved_to_l2 = self._move_l3_to_l2()
+            
+            self._process_pending_compressions()
+            
+            if self._idle_count >= 10 and current_time - self._last_forget_time >= self.FORGET_INTERVAL:
+                result = self.sqlite.decay_weights(config.memory_decay_days)
+                decayed = result.get("decayed", 0)
+                forgotten = result.get("forgotten", 0)
+                if decayed > 0 or forgotten > 0:
+                    print(f"[后台任务] 衰减: {decayed}, 遗忘: {forgotten}")
+                self._last_forget_time = current_time
+            
+            total_actions = moved_to_l3 + compressed + moved_to_l2
+            if total_actions > 0:
+                print(f"[后台任务] L2→L3: {moved_to_l3}, 压缩: {compressed}, L3→L2: {moved_to_l2}")
+            
+            self._last_compression_time = current_time
+            self._idle_count = 0
+            
+        except Exception as e:
+            print(f"记忆流动失败: {e}")
+    
+    def _move_l2_to_l3(self) -> int:
+        """
+        将L2(向量库)中不常用、低权重的记忆移动到L3(SQLite)
+        
+        条件：
+        - 长时间未访问
+        - 权重较低
+        
+        流程：
+        1. 从SQLite获取已向量化的低权重记忆
+        2. 从ChromaDB删除
+        3. 更新SQLite记录为未向量化状态
+        """
+        if not self.sqlite:
+            return 0
         
         try:
-            print("[后台任务] 开始记忆压缩...")
+            low_weight_records = self.sqlite.get_low_weight_memories(
+                threshold=config.memory_min_weight * 2,
+                limit=20
+            )
             
-            # 获取长时间未访问的记忆（从SQLite获取）
+            moved_count = 0
+            for record in low_weight_records:
+                if not record.vector_id:
+                    continue
+                
+                try:
+                    self.vector_store.delete(ids=[record.vector_id])
+                    
+                    self.sqlite.update_vector_status(record.id, "", is_vectorized=0)
+                    
+                    if not record.metadata:
+                        record.metadata = {}
+                    record.metadata["moved_from_l2"] = True
+                    record.metadata["moved_time"] = datetime.now().isoformat()
+                    self.sqlite.add(record)
+                    
+                    moved_count += 1
+                    
+                except Exception as e:
+                    print(f"L2→L3移动失败: {e}")
+            
+            return moved_count
+            
+        except Exception as e:
+            print(f"L2→L3流动失败: {e}")
+            return 0
+    
+    def _should_skip_compression(self, record: MemoryRecord) -> bool:
+        """
+        检查记忆是否应该跳过压缩
+        
+        跳过条件：
+        1. 已有压缩文本（compressed_text存在）
+        2. metadata中标记为preserve=True（受保护）
+        3. metadata中标记为compressed=True（已压缩）
+        4. metadata中标记为promoted_from_l3=True（从L3回流，已压缩过）
+        """
+        if record.compressed_text:
+            return True
+        
+        if record.metadata:
+            if record.metadata.get("preserve") is True:
+                return True
+            if record.metadata.get("compressed") is True:
+                return True
+            if record.metadata.get("promoted_from_l3") is True:
+                return True
+        
+        return False
+    
+    def _compress_l3_memories(self) -> int:
+        """
+        压缩L3(SQLite)中的记忆
+        
+        条件：
+        - 长时间未访问
+        - 未压缩过
+        - 非高密度内容
+        - 非受保护记忆
+        """
+        if not self.sqlite:
+            return 0
+        
+        try:
             unaccessed = self.sqlite.get_unaccessed_memories(
                 days=config.memory_decay_days // 2,
                 limit=20
             )
             
             if not unaccessed:
-                self._last_compression_time = current_time
-                return
+                return 0
             
-            # 初始化压缩器
-            if self.compressor is None:
-                try:
-                    from llm_client import LlamaClient
-                    self.compressor = LlamaClient()
-                except Exception as e:
-                    print(f"压缩器初始化失败: {e}")
-                    return
+            compressor_available = self._check_compressor_available()
             
             compressed_count = 0
+            preserved_count = 0
+            skipped_count = 0
+            
             for record in unaccessed:
                 try:
-                    # 检查是否需要压缩
+                    if self._should_skip_compression(record):
+                        skipped_count += 1
+                        continue
+                    
+                    if self._is_high_density_content(record.text):
+                        self._mark_preserve(record)
+                        preserved_count += 1
+                        continue
+                    
                     if len(record.text) < config.compression_min_length:
                         continue
                     
-                    # 使用LLM压缩
-                    compressed_text = self._compress_text(record.text)
-                    
-                    if compressed_text and len(compressed_text) < len(record.text) * 0.6:
-                        # 更新SQLite中的压缩文本
-                        record.compressed_text = compressed_text
-                        self.sqlite.add(record)
-                        compressed_count += 1
+                    if compressor_available:
+                        compressed_text = self._compress_text(record.text)
+                        
+                        if compressed_text and len(compressed_text) < len(record.text) * 0.6:
+                            record.compressed_text = compressed_text
+                            if not record.metadata:
+                                record.metadata = {}
+                            record.metadata["compressed"] = True
+                            record.metadata["compressed_time"] = datetime.now().isoformat()
+                            self.sqlite.add(record)
+                            compressed_count += 1
+                    else:
+                        self._mark_pending_compression(record)
                         
                 except Exception as e:
                     print(f"压缩单条记忆失败: {e}")
             
-            if compressed_count > 0:
-                print(f"[后台任务] 压缩完成: {compressed_count} 条记忆")
+            if skipped_count > 0:
+                print(f"[后台任务] 跳过已压缩/受保护: {skipped_count}")
             
-            self._last_compression_time = current_time
-            self._idle_count = 0
+            return compressed_count
             
         except Exception as e:
-            print(f"压缩流程失败: {e}")
+            print(f"L3压缩失败: {e}")
+            return 0
+    
+    def _move_l3_to_l2(self) -> int:
+        """
+        将L3(SQLite)中高权重、常用的记忆回流到L2(向量库)
+        
+        条件：
+        - 权重超过阈值
+        - 最近有访问
+        - 当前未向量化
+        
+        注意：
+        - 如果记忆有compressed_text，标记为已压缩，未来不再压缩
+        - 回流后的记忆若再次存入L3，会跳过压缩流程
+        """
+        if not self.sqlite:
+            return 0
+        
+        try:
+            high_weight_records = self.sqlite.get_high_weight_memories(limit=10)
+            
+            moved_count = 0
+            for record in high_weight_records:
+                try:
+                    text_to_vectorize = record.compressed_text or record.text
+                    
+                    vector_ids = self.vector_store.add(
+                        [text_to_vectorize],
+                        [record.metadata or {}]
+                    )
+                    
+                    if vector_ids:
+                        self.sqlite.update_vector_status(
+                            record.id, 
+                            vector_ids[0], 
+                            is_vectorized=1
+                        )
+                        
+                        if not record.metadata:
+                            record.metadata = {}
+                        record.metadata["promoted_to_l2"] = True
+                        record.metadata["promoted_time"] = datetime.now().isoformat()
+                        
+                        if record.compressed_text:
+                            record.metadata["promoted_from_l3"] = True
+                            record.metadata["compressed"] = True
+                        
+                        self.sqlite.add(record)
+                        
+                        moved_count += 1
+                        
+                except Exception as e:
+                    print(f"L3→L2回流失败: {e}")
+            
+            return moved_count
+            
+        except Exception as e:
+            print(f"L3→L2回流失败: {e}")
+            return 0
+    
+    def _check_compressor_available(self) -> bool:
+        """检查压缩器是否可用"""
+        if self.compressor is None:
+            try:
+                from llm_client import LlamaClient
+                self.compressor = LlamaClient()
+                if not self.compressor.check_connection():
+                    self.compressor = None
+                    return False
+            except Exception as e:
+                print(f"压缩器初始化失败: {e}")
+                return False
+        return self.compressor.check_connection()
+    
+    def _is_high_density_content(self, text: str) -> bool:
+        """检测是否为高信息密度内容"""
+        import re
+        patterns = config.high_density_patterns.split("|")
+        for pattern in patterns:
+            if pattern.strip() in text:
+                return True
+        
+        code_patterns = [
+            r'```[\s\S]*?```',
+            r'``[\s\S]*?``',
+            r'`[^`]+`',
+            r'def\s+\w+\s*\(',
+            r'class\s+\w+',
+            r'function\s+\w+',
+            r'import\s+\w+',
+            r'from\s+\w+\s+import',
+        ]
+        for pattern in code_patterns:
+            if re.search(pattern, text):
+                return True
+        
+        return False
+    
+    def _mark_preserve(self, record: MemoryRecord):
+        """标记记忆为保留（不压缩）"""
+        if not record.metadata:
+            record.metadata = {}
+        record.metadata["preserve"] = True
+        record.metadata["preserve_reason"] = "high_density_content"
+        self.sqlite.add(record)
+    
+    def _mark_pending_compression(self, record: MemoryRecord):
+        """标记记忆为待压缩"""
+        if not record.metadata:
+            record.metadata = {}
+        record.metadata["pending_compression"] = True
+        record.metadata["pending_since"] = datetime.now().isoformat()
+        self.sqlite.add(record)
+    
+    def _process_pending_compressions(self):
+        """
+        处理待压缩的记忆
+        
+        当LLM可用时，对之前标记为待压缩的记忆进行压缩
+        """
+        if not self.sqlite:
+            return
+        
+        compressor_available = self._check_compressor_available()
+        if not compressor_available:
+            return
+        
+        try:
+            pending_records = self.sqlite.get_pending_compressions(limit=10)
+            
+            if not pending_records:
+                return
+            
+            print(f"[后台任务] 处理 {len(pending_records)} 条待压缩记忆...")
+            
+            compressed_count = 0
+            skipped_count = 0
+            for record in pending_records:
+                try:
+                    if self._should_skip_compression(record):
+                        if record.metadata:
+                            record.metadata.pop("pending_compression", None)
+                            record.metadata.pop("pending_since", None)
+                        self.sqlite.add(record)
+                        skipped_count += 1
+                        continue
+                    
+                    if self._is_high_density_content(record.text):
+                        self._mark_preserve(record)
+                        continue
+                    
+                    if len(record.text) < config.compression_min_length:
+                        if record.metadata:
+                            record.metadata.pop("pending_compression", None)
+                            record.metadata.pop("pending_since", None)
+                        self.sqlite.add(record)
+                        continue
+                    
+                    compressed_text = self._compress_text(record.text)
+                    
+                    if compressed_text and len(compressed_text) < len(record.text) * 0.6:
+                        record.compressed_text = compressed_text
+                        if not record.metadata:
+                            record.metadata = {}
+                        record.metadata.pop("pending_compression", None)
+                        record.metadata.pop("pending_since", None)
+                        record.metadata["compressed"] = True
+                        record.metadata["compressed_time"] = datetime.now().isoformat()
+                        self.sqlite.add(record)
+                        compressed_count += 1
+                        
+                except Exception as e:
+                    print(f"处理待压缩记忆失败: {e}")
+            
+            if compressed_count > 0 or skipped_count > 0:
+                print(f"[后台任务] 待压缩处理: {compressed_count} 条, 跳过: {skipped_count} 条")
+                
+        except Exception as e:
+            print(f"处理待压缩记忆失败: {e}")
     
     def _compress_text(self, text: str) -> str:
-        """使用LLM压缩文本"""
+        """
+        使用LLM压缩文本
+        
+        处理策略：
+        1. 短文本（<2000字符）：直接压缩
+        2. 中等文本（2000-6000字符）：直接压缩
+        3. 长文本（>6000字符）：分段压缩后合并
+        4. 超长文本（>10000字符）：尝试云端压缩，失败则标记不压缩
+        """
+        if not text:
+            return text
+        
+        text_len = len(text)
+        max_input_chars = config.local.max_context // 2
+        
+        if text_len > 10000:
+            return self._compress_long_text(text)
+        
+        if text_len > 6000:
+            return self._compress_chunked_text(text)
+        
+        return self._compress_single_text(text)
+    
+    def _compress_single_text(self, text: str) -> str:
+        """压缩单段文本"""
         prompt = f"""请将以下对话记录压缩为简洁的摘要，保留所有关键信息。
 
 原始内容：
@@ -473,41 +844,109 @@ class AsyncMemoryProcessor:
             print(f"LLM压缩失败: {e}")
             return text
     
-    def _check_and_forget(self):
+    def _compress_chunked_text(self, text: str) -> str:
         """
-        空闲时检查并执行记忆遗忘
+        分段压缩长文本
         
-        对SQLite中的记忆进行权重衰减和遗忘
+        将长文本分成多个段落分别压缩，然后合并
         """
-        if not config.sqlite_enabled or not self.sqlite:
-            return
-        
-        current_time = time.time()
-        
-        # 空闲阈值检查
-        if self._idle_count < 10:
-            return
-        
-        # 时间间隔检查
-        if current_time - self._last_forget_time < self.FORGET_INTERVAL:
-            return
-        
         try:
-            print("[后台任务] 开始记忆衰减与遗忘...")
+            chunk_size = 3000
+            chunks = []
             
-            result = self.sqlite.decay_weights(config.memory_decay_days)
+            lines = text.split('\n')
+            current_chunk = []
+            current_len = 0
             
-            decayed = result.get("decayed", 0)
-            forgotten = result.get("forgotten", 0)
+            for line in lines:
+                if current_len + len(line) > chunk_size and current_chunk:
+                    chunks.append('\n'.join(current_chunk))
+                    current_chunk = []
+                    current_len = 0
+                current_chunk.append(line)
+                current_len += len(line)
             
-            if decayed > 0 or forgotten > 0:
-                print(f"[后台任务] 衰减: {decayed} 条, 遗忘: {forgotten} 条")
+            if current_chunk:
+                chunks.append('\n'.join(current_chunk))
             
-            self._last_forget_time = current_time
-            self._idle_count = 0
+            compressed_chunks = []
+            for i, chunk in enumerate(chunks):
+                compressed = self._compress_single_text(chunk)
+                compressed_chunks.append(compressed)
+            
+            merged = '\n'.join(compressed_chunks)
+            
+            if len(merged) < len(text) * 0.7:
+                return self._compress_single_text(merged)
+            
+            return merged
             
         except Exception as e:
-            print(f"遗忘流程失败: {e}")
+            print(f"分段压缩失败: {e}")
+            return text
+    
+    def _compress_long_text(self, text: str) -> str:
+        """
+        处理超长文本
+        
+        策略：
+        1. 尝试云端压缩
+        2. 失败则分段压缩
+        3. 再失败则标记为不压缩
+        """
+        try:
+            if config.cloud.enabled and self._try_cloud_compression(text):
+                return self._cloud_compress_text(text)
+            
+            chunked_result = self._compress_chunked_text(text)
+            if chunked_result and len(chunked_result) < len(text) * 0.8:
+                return chunked_result
+            
+            print(f"超长文本({len(text)}字符)无法压缩，保留原文")
+            return text
+            
+        except Exception as e:
+            print(f"超长文本处理失败: {e}")
+            return text
+    
+    def _try_cloud_compression(self, text: str) -> bool:
+        """检查是否可以使用云端压缩"""
+        if not config.cloud.enabled:
+            return False
+        if not config.cloud.api_key:
+            return False
+        return True
+    
+    def _cloud_compress_text(self, text: str) -> str:
+        """使用云端API压缩文本"""
+        try:
+            from cloud_client import CloudClient
+            cloud = CloudClient()
+            
+            prompt = f"""请将以下内容压缩为简洁的摘要，保留所有关键信息。
+
+原始内容：
+{text}
+
+压缩要求：
+1. 保留所有专有名词、人名、地名、数值
+2. 保留因果关系和关键决策
+3. 去除冗余和修饰性内容
+4. 压缩后长度约为原文的30%-50%
+
+压缩结果："""
+
+            messages = [
+                {"role": "system", "content": "你是一个记忆压缩专家。"},
+                {"role": "user", "content": prompt}
+            ]
+            
+            result = cloud.chat(messages)
+            return result.strip() if result else text
+            
+        except Exception as e:
+            print(f"云端压缩失败: {e}")
+            return text
     
     def get_stats(self) -> Dict[str, Any]:
         """获取处理统计信息"""

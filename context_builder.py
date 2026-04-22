@@ -2,6 +2,7 @@
 # 上下文构建器 - 使用三层记忆管理器
 from typing import List, Dict, Any, Tuple, Optional
 from config import config
+import re
 
 SHORT_QUERY_STOPWORDS = {
     "好", "好的", "嗯", "哦", "是", "对", "行", "可以", "继续",
@@ -24,13 +25,48 @@ class ContextBuilder:
         self.l2_default_threshold = config.similarity_threshold
         self.l2_lower_threshold = config.l2_lower_threshold
     
+    def get_thresholds(self, mode: str = "local") -> Dict[str, float]:
+        """
+        根据模式获取threshold配置
+        
+        Args:
+            mode: "local" (本地压缩) | "cloud_only" (仅云端) | "hybrid" (混合)
+        
+        Returns:
+            {"l1": float, "l2": float, "l3": float}
+        """
+        if mode == "cloud_only":
+            return {
+                "l1": config.cloud_l1_threshold,
+                "l2": config.cloud_l2_threshold,
+                "l3": config.cloud_l3_threshold
+            }
+        else:
+            return {
+                "l1": config.local_l1_threshold,
+                "l2": config.local_l2_threshold,
+                "l3": config.local_l3_threshold
+            }
+    
+    def get_max_retrieve(self, mode: str = "local") -> int:
+        """根据模式获取最大检索数量"""
+        if mode == "cloud_only":
+            return config.cloud.max_retrieve_results
+        return config.max_retrieve_results
+    
     def build_context(
         self, 
         user_input: str, 
-        conversation_history: List[Dict] = None
+        conversation_history: List[Dict] = None,
+        mode: str = "local"
     ) -> Tuple[str, str, List[Dict], bool]:
         """
         构建完整的对话上下文
+        
+        Args:
+            user_input: 用户输入
+            conversation_history: 对话历史
+            mode: "local" (本地压缩) | "cloud_only" (仅云端) | "hybrid" (混合)
         
         返回：
         - memory_context: 格式化后的记忆字符串
@@ -38,12 +74,20 @@ class ContextBuilder:
         - retrieved_memories: 检索到的记忆列表
         - has_memories: 是否检索到有效记忆
         """
-        retrieved = self._multi_level_retrieve(user_input, conversation_history)
+        thresholds = self.get_thresholds(mode)
+        max_retrieve = self.get_max_retrieve(mode)
+        
+        retrieved = self._multi_level_retrieve(
+            user_input, 
+            conversation_history, 
+            thresholds, 
+            max_retrieve
+        )
         
         has_memories = len(retrieved) > 0
         
         memory_context, processed_user_input, _ = self._control_context_length(
-            retrieved, user_input
+            retrieved, user_input, mode
         )
         
         return memory_context, processed_user_input, retrieved, has_memories
@@ -67,7 +111,9 @@ class ContextBuilder:
     def _multi_level_retrieve(
         self, 
         query: str, 
-        conversation_history: List[Dict] = None
+        conversation_history: List[Dict] = None,
+        thresholds: Dict[str, float] = None,
+        max_retrieve: int = None
     ) -> List[Dict]:
         """
         多级记忆检索
@@ -86,30 +132,36 @@ class ContextBuilder:
         if not self._is_valid_query(query):
             return []
         
+        if thresholds is None:
+            thresholds = {"l1": self.l2_default_threshold, "l2": self.l2_default_threshold, "l3": self.l2_lower_threshold}
+        
+        if max_retrieve is None:
+            max_retrieve = config.max_retrieve_results
+        
         results = []
         
-        l1_results = self._search_l1(query, conversation_history)
+        l1_results = self._search_l1(query, conversation_history, thresholds["l1"])
         if l1_results:
             results.extend(l1_results)
         
         l1_count = len(results)
         
         if l1_count < self.l1_min_results:
-            l2_results = self._search_l2(query, self.l2_default_threshold)
+            l2_results = self._search_l2(query, thresholds["l2"])
             
             if len(l2_results) < self.l1_min_results - l1_count:
-                l2_lower = self._search_l2(query, self.l2_lower_threshold)
+                l2_lower = self._search_l2(query, thresholds["l3"])
                 l2_results = self._merge_results(l2_results, l2_lower)
             
             results = self._merge_results(results, l2_results)
         
         if len(results) < self.l1_min_results:
-            l3_results = self._search_l3(query)
+            l3_results = self._search_l3(query, thresholds["l3"])
             results = self._merge_results(results, l3_results)
         
-        return results[:config.max_retrieve_results]
+        return results[:max_retrieve]
     
-    def _search_l1(self, query: str, conversation_history: List[Dict] = None) -> List[Dict]:
+    def _search_l1(self, query: str, conversation_history: List[Dict] = None, threshold: float = 0.9) -> List[Dict]:
         """
         L1: 搜索内存中的最近对话历史
         
@@ -141,7 +193,7 @@ class ContextBuilder:
                 max_possible_score = len(query_keywords) * 3
                 similarity = score / max_possible_score if max_possible_score > 0 else 0
                 
-                if similarity >= self.l2_default_threshold:
+                if similarity >= threshold:
                     results.append({
                         "text": combined_text,
                         "similarity": similarity,
@@ -172,7 +224,7 @@ class ContextBuilder:
             print(f"L2搜索失败: {e}")
             return []
     
-    def _search_l3(self, query: str) -> List[Dict]:
+    def _search_l3(self, query: str, threshold: float = 0.8) -> List[Dict]:
         """
         L3: 搜索SQLite数据库（全文搜索）
         
@@ -182,7 +234,7 @@ class ContextBuilder:
             if not self.memory.sqlite:
                 return []
             
-            results = self.memory.sqlite.search(query, limit=5)
+            results = self.memory.sqlite.search(query, limit=10)
             formatted_results = []
             
             query_keywords = set(query.lower().split())
@@ -195,7 +247,7 @@ class ContextBuilder:
                 keyword_ratio = matched_keywords / len(query_keywords) if query_keywords else 0
                 similarity = keyword_ratio * 0.8
                 
-                if similarity >= self.l2_lower_threshold:
+                if similarity >= threshold:
                     formatted_results.append({
                         "text": text,
                         "similarity": similarity,
@@ -464,10 +516,16 @@ class ContextBuilder:
     def _control_context_length(
         self, 
         memories: List[Dict], 
-        current_query: str
+        current_query: str,
+        mode: str = "local"
     ) -> Tuple[str, str, bool]:
         """
         控制上下文长度
+        
+        Args:
+            memories: 检索到的记忆列表
+            current_query: 当前用户输入
+            mode: "local" (本地压缩) | "cloud_only" (仅云端) | "hybrid" (混合)
         
         返回：
         - memory_context: 记忆上下文
@@ -475,6 +533,10 @@ class ContextBuilder:
         - skip_user_input: 是否跳过用户原文
         """
         memory_texts = [m.get("text", "") for m in memories if m.get("text")]
+        
+        if mode == "cloud_only":
+            memory_context = "\n".join([f"• {m}" for m in memory_texts])
+            return memory_context, current_query, False
         
         max_memory_tokens, max_user_tokens, skip_user = self._calculate_available_tokens(
             memory_texts, current_query

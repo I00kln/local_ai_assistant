@@ -387,8 +387,10 @@ class ChatWindow:
             return
         
         try:
+            mode = "cloud_only" if (use_cloud and not use_local) else "local"
+            
             memory_context, processed_input, retrieved_memories, has_memories = self.context_builder.build_context(
-                user_input, self.conversation_history
+                user_input, self.conversation_history, mode
             )
             
             retrieval_metadata = self._build_retrieval_metadata(retrieved_memories, memory_context)
@@ -396,7 +398,7 @@ class ChatWindow:
             if self.show_memory_enabled.get() and retrieved_memories:
                 memory_info = "\n".join([
                     f"  [{m.get('similarity', 0):.2f}][{m.get('source', '?')}] {m.get('text', '')[:50]}..."
-                    for m in retrieved_memories[:3]
+                    for m in retrieved_memories[:5]
                 ])
                 self._safe_after(0, lambda info=memory_info: self._append_message(
                     "memory", f"检索到的记忆:\n{info}"

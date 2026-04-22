@@ -170,6 +170,11 @@ class SQLiteStore:
             except sqlite3.OperationalError:
                 pass  # 字段已存在
             
+            try:
+                cursor.execute("ALTER TABLE memories ADD COLUMN text_hash TEXT")
+            except sqlite3.OperationalError:
+                pass  # 字段已存在
+            
             # 全文搜索虚拟表（FTS5）
             cursor.execute("""
                 CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
@@ -200,6 +205,10 @@ class SQLiteStore:
             cursor.execute("""
                 CREATE INDEX IF NOT EXISTS idx_is_vectorized 
                 ON memories(is_vectorized)
+            """)
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_text_hash 
+                ON memories(text_hash)
             """)
             
             # 触发器：自动同步FTS索引
@@ -467,6 +476,34 @@ class SQLiteStore:
             
             return [self._row_to_record(row) for row in cursor.fetchall()]
     
+    def get_high_weight_memories(self, threshold: float = None, limit: int = 50) -> List[MemoryRecord]:
+        """
+        获取高权重记忆（准备回流到L2）
+        
+        条件：
+        - 权重超过阈值
+        - 最近有访问
+        - 未向量化（不在L2中）
+        """
+        if threshold is None:
+            threshold = self.MAX_WEIGHT * 0.6
+        
+        recent_time = (datetime.now() - timedelta(days=7)).isoformat()
+        
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT * FROM memories 
+                WHERE weight >= ?
+                AND last_access_time > ?
+                AND is_vectorized = 0
+                AND is_archived = 0
+                ORDER BY weight DESC, last_access_time DESC
+                LIMIT ?
+            """, (threshold, recent_time, limit))
+            
+            return [self._row_to_record(row) for row in cursor.fetchall()]
+    
     def get_unaccessed_memories(self, days: int = 7, limit: int = 100) -> List[MemoryRecord]:
         """获取长时间未访问的记忆"""
         threshold_time = (datetime.now() - timedelta(days=days)).isoformat()
@@ -642,6 +679,19 @@ class SQLiteStore:
             """, (limit,))
             return [self._row_to_record(row) for row in cursor.fetchall()]
     
+    def get_pending_compressions(self, limit: int = 20) -> List[MemoryRecord]:
+        """获取待压缩的记录"""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT * FROM memories 
+                WHERE json_extract(metadata, '$.pending_compression') = 1
+                AND is_archived = 0
+                ORDER BY created_time ASC
+                LIMIT ?
+            """, (limit,))
+            return [self._row_to_record(row) for row in cursor.fetchall()]
+    
     def get_by_vector_id(self, vector_id: str) -> Optional[MemoryRecord]:
         """根据ChromaDB ID获取SQLite记录"""
         with self._get_connection() as conn:
@@ -653,6 +703,68 @@ class SQLiteStore:
             if row:
                 return self._row_to_record(row)
             return None
+    
+    def exists_by_text_hash(self, text_hash: str) -> Tuple[bool, Optional[int]]:
+        """
+        检查文本哈希是否已存在（幂等性检查）
+        
+        Returns:
+            (exists, record_id): 是否存在，存在的记录ID
+        """
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT id FROM memories 
+                WHERE text_hash = ? AND is_archived = 0
+                LIMIT 1
+            """, (text_hash,))
+            row = cursor.fetchone()
+            if row:
+                return True, row[0]
+            return False, None
+    
+    def compute_text_hash(self, text: str) -> str:
+        """计算文本哈希（用于幂等性检查）"""
+        import hashlib
+        return hashlib.sha256(text.encode('utf-8')).hexdigest()[:32]
+    
+    def add_with_hash(self, record: MemoryRecord, text_hash: str = None) -> int:
+        """
+        添加记忆记录（带文本哈希，支持幂等性）
+        
+        Returns:
+            record_id: 记录ID（如果已存在则返回现有ID）
+        """
+        if text_hash is None:
+            text_hash = self.compute_text_hash(record.text)
+        
+        exists, existing_id = self.exists_by_text_hash(text_hash)
+        if exists:
+            return existing_id
+        
+        with self.lock:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    INSERT INTO memories 
+                    (text, compressed_text, source, weight, access_count, 
+                     last_access_time, created_time, metadata, vector_id, is_vectorized, text_hash)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    record.text,
+                    record.compressed_text,
+                    record.source,
+                    record.weight,
+                    record.access_count,
+                    record.last_access_time,
+                    record.created_time,
+                    json.dumps(record.metadata, ensure_ascii=False),
+                    record.vector_id,
+                    record.is_vectorized,
+                    text_hash
+                ))
+                conn.commit()
+                return cursor.lastrowid
     
     def delete_by_vector_id(self, vector_id: str) -> bool:
         """根据ChromaDB ID删除SQLite记录（同步删除）"""

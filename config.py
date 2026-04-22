@@ -20,6 +20,8 @@ class CloudConfig:
     api_key: str = ""
     model: str = "gemini-2.5-flash"
     base_url: Optional[str] = None
+    max_context: int = 100000
+    max_retrieve_results: int = 20
 
 @dataclass
 class Config:
@@ -34,6 +36,20 @@ class Config:
     similarity_threshold: float = 0.90
     l1_min_results: int = 2
     l2_lower_threshold: float = 0.80
+    
+    # 云端专用检索配置（用户可调整）
+    cloud_l1_threshold: float = 0.85
+    cloud_l2_threshold: float = 0.75
+    cloud_l3_threshold: float = 0.70
+    
+    # 本地压缩专用检索配置
+    local_l1_threshold: float = 0.90
+    local_l2_threshold: float = 0.80
+    local_l3_threshold: float = 0.75
+    
+    # 高信息密度内容保护
+    high_density_patterns: str = "流程图|时序图|架构图|状态机|数据流|ER图|类图|部署图|网络拓扑|API接口|数据库设计|系统设计|技术方案"
+    high_density_preserve_ratio: float = 1.0
     
     # ONNX 嵌入模型配置
     onnx_model_path: str = "models/bge_onnx_model"
@@ -78,8 +94,8 @@ class Config:
 
 【记忆使用规则】
 1. 下方提供的【相关内容】包含之前的对话内容，结合原文进行压缩,不要写成一句话概括。
-2. 如果部分相关内容与原文完全无关，可以忽略那部分。若无原文,则直接对相关内容进行压缩。
-3. 不要提及"根据相关内容"或"原文"等表述。
+2. 如果相关内容与原文完全无关，可以忽略那部分。若无原文,则直接对相关内容进行压缩。
+3. 不要提及"根据相关内容"或"原文"等表述；不要作为问题回答，只返回压缩结果。
 
 【回答要求补充】
 1. 当你进行总结时，遵循'无损压缩'原则。摘要长度需为[原文+相关内容]的 25%-40%,不超过3000token,且必须包含原文中出现的所有专有名词和数值。不得使用'等'、'之类'、'以及其他'等概括性虚词来省略具体内容。
@@ -103,6 +119,21 @@ class Config:
         self.similarity_threshold = float(os.environ.get("SIMILARITY_THRESHOLD", "0.90"))
         self.l1_min_results = int(os.environ.get("L1_MIN_RESULTS", "2"))
         self.l2_lower_threshold = float(os.environ.get("L2_LOWER_THRESHOLD", "0.80"))
+        
+        # 加载云端专用检索配置
+        self.cloud_l1_threshold = float(os.environ.get("CLOUD_L1_THRESHOLD", "0.85"))
+        self.cloud_l2_threshold = float(os.environ.get("CLOUD_L2_THRESHOLD", "0.75"))
+        self.cloud_l3_threshold = float(os.environ.get("CLOUD_L3_THRESHOLD", "0.70"))
+        
+        # 加载本地压缩专用检索配置
+        self.local_l1_threshold = float(os.environ.get("LOCAL_L1_THRESHOLD", "0.90"))
+        self.local_l2_threshold = float(os.environ.get("LOCAL_L2_THRESHOLD", "0.80"))
+        self.local_l3_threshold = float(os.environ.get("LOCAL_L3_THRESHOLD", "0.75"))
+        
+        # 加载高信息密度内容保护配置
+        self.high_density_patterns = os.environ.get("HIGH_DENSITY_PATTERNS", 
+            "流程图|时序图|架构图|状态机|数据流|ER图|类图|部署图|网络拓扑|API接口|数据库设计|系统设计|技术方案")
+        self.high_density_preserve_ratio = float(os.environ.get("HIGH_DENSITY_PRESERVE_RATIO", "1.0"))
         
         # 加载模型配置
         self.onnx_model_path = os.environ.get("ONNX_MODEL_PATH", "models/bge_onnx_model")
@@ -152,6 +183,8 @@ class Config:
         gemini_key = os.environ.get("GEMINI_API_KEY", "")
         cloud_provider = os.environ.get("CLOUD_PROVIDER", "gemini")
         cloud_enabled = os.environ.get("CLOUD_ENABLED", "false").lower() == "true"
+        cloud_max_context = int(os.environ.get("CLOUD_MAX_CONTEXT", "100000"))
+        cloud_max_retrieve = int(os.environ.get("CLOUD_MAX_RETRIEVE_RESULTS", "20"))
         
         if openai_key and cloud_provider == "openai":
             self.cloud = CloudConfig(
@@ -159,7 +192,9 @@ class Config:
                 provider="openai",
                 api_key=openai_key,
                 model=os.environ.get("OPENAI_MODEL", "gpt-4o-mini"),
-                base_url=os.environ.get("OPENAI_BASE_URL")
+                base_url=os.environ.get("OPENAI_BASE_URL"),
+                max_context=cloud_max_context,
+                max_retrieve_results=cloud_max_retrieve
             )
         elif gemini_key and cloud_provider == "gemini":
             self.cloud = CloudConfig(
@@ -167,7 +202,9 @@ class Config:
                 provider="gemini",
                 api_key=gemini_key,
                 model=os.environ.get("GEMINI_MODEL", "gemini-2.5-flash"),
-                base_url=os.environ.get("GEMINI_BASE_URL")
+                base_url=os.environ.get("GEMINI_BASE_URL"),
+                max_context=cloud_max_context,
+                max_retrieve_results=cloud_max_retrieve
             )
 
 # 全局配置实例

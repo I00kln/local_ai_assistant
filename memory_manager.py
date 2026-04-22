@@ -35,30 +35,35 @@ class MemoryManager:
     - 自动回填（L3命中→L2）
     - 定期压缩（L2→L3）
     - 权重管理与遗忘
+    
+    线程安全：
+    - 使用读写锁协调检索与异步写入
+    - 使用版本号检测并发修改
     """
     
     def __init__(self, vector_store: VectorStore = None, sqlite_store: SQLiteStore = None):
-        self.vector_store = vector_store or get_vector_store()  # L2 向量库
-        self.sqlite = sqlite_store or get_sqlite_store()  # L3 数据库
+        self.vector_store = vector_store or get_vector_store()
+        self.sqlite = sqlite_store or get_sqlite_store()
         
         self.lock = threading.RLock()
+        self._read_lock = threading.Lock()
+        self._write_version = 0
+        self._last_sync_time = time.time()
         
-        # L1 内存层（当前对话历史，由外部管理）
         self.conversation_history: List[Dict] = []
-        self.max_l1_size = 25  # L1最大保留对话数
+        self.max_l1_size = 25
         
-        # 压缩器
         self.compressor = None
         self._init_compressor()
         
-        # 统计信息
         self.stats = {
             "l1_hits": 0,
             "l2_hits": 0,
             "l3_hits": 0,
             "l3_backfills": 0,
             "compressions": 0,
-            "forgotten": 0
+            "forgotten": 0,
+            "retry_reads": 0
         }
     
     def _init_compressor(self):
@@ -133,6 +138,10 @@ class MemoryManager:
         """
         统一搜索接口 - L1→L2→L3
         
+        线程安全：
+        - 使用版本号检测并发修改
+        - 检测到修改时自动重试（最多2次）
+        
         Args:
             query: 搜索查询
             top_k: 返回结果数量
@@ -149,6 +158,21 @@ class MemoryManager:
         if threshold is None:
             threshold = 0.0
         
+        max_retries = 2
+        for attempt in range(max_retries):
+            start_version = self._write_version
+            
+            results = self._do_search(query, top_k, include_l3, threshold, include_l1)
+            
+            if self._write_version == start_version:
+                return results
+            
+            self.stats["retry_reads"] += 1
+        
+        return results
+    
+    def _do_search(self, query: str, top_k: int, include_l3: bool, threshold: float, include_l1: bool) -> List[MemorySearchResult]:
+        """实际执行搜索（内部方法）"""
         results = []
         seen_texts = set()
         
@@ -189,6 +213,12 @@ class MemoryManager:
         filtered_results = [r for r in results if r.similarity >= threshold]
         
         return filtered_results[:top_k]
+    
+    def notify_write(self):
+        """通知写入操作（由 AsyncProcessor 调用）"""
+        with self.lock:
+            self._write_version += 1
+            self._last_sync_time = time.time()
     
     def _detect_time_context(self, query: str) -> Dict[str, Any]:
         """
@@ -281,26 +311,61 @@ class MemoryManager:
             return result.similarity
     
     def _search_l1(self, query: str, top_k: int, threshold: float = 0.0) -> List[MemorySearchResult]:
-        """搜索L1内存层"""
+        """
+        搜索L1内存层
+        
+        评分策略：
+        1. 关键词覆盖率（基础分）
+        2. 词权重（长词权重更高）
+        3. 位置权重（用户输入权重高于助理回复）
+        4. 时间衰减（最近的对话权重更高）
+        """
         results = []
         query_lower = query.lower()
         query_keywords = set(query_lower.split())
+        
+        if not query_keywords:
+            return results
+        
+        keyword_weights = {}
+        for kw in query_keywords:
+            if len(kw) > 4:
+                keyword_weights[kw] = 3.0
+            elif len(kw) > 2:
+                keyword_weights[kw] = 2.0
+            else:
+                keyword_weights[kw] = 1.0
         
         for conv in reversed(self.conversation_history):
             user_text = conv.get("user", "").lower()
             assistant_text = conv.get("assistant", "").lower()
             
-            score = 0
-            for kw in query_keywords:
+            score = 0.0
+            matched_keywords = 0
+            
+            for kw, kw_weight in keyword_weights.items():
                 if kw in user_text:
-                    score += 2
+                    score += kw_weight * 2.0
+                    matched_keywords += 1
                 if kw in assistant_text:
-                    score += 1
+                    score += kw_weight * 1.0
+                    matched_keywords += 1
             
             if score > 0:
                 combined_text = f"用户: {conv['user']}\n助理: {conv['assistant']}"
-                max_possible_score = len(query_keywords) * 3
-                similarity = score / max_possible_score if max_possible_score > 0 else 0
+                
+                max_possible_score = sum(keyword_weights.values()) * 3
+                base_similarity = score / max_possible_score if max_possible_score > 0 else 0
+                
+                coverage = matched_keywords / (len(query_keywords) * 2)
+                
+                time_decay = self._calculate_time_decay(conv.get("timestamp", ""))
+                
+                similarity = (
+                    base_similarity * 0.5 +
+                    coverage * 0.3 +
+                    time_decay * 0.2
+                )
                 
                 if similarity >= threshold:
                     results.append(MemorySearchResult(
@@ -313,6 +378,39 @@ class MemoryManager:
         
         results.sort(key=lambda x: x.similarity, reverse=True)
         return results[:top_k]
+    
+    def _calculate_time_decay(self, timestamp: str) -> float:
+        """
+        计算时间衰减因子
+        
+        最近1小时内: 1.0
+        1-6小时: 0.8
+        6-24小时: 0.6
+        1-7天: 0.4
+        7天以上: 0.2
+        """
+        if not timestamp:
+            return 0.5
+        
+        try:
+            conv_time = datetime.fromisoformat(timestamp)
+            now = datetime.now()
+            delta = now - conv_time
+            
+            hours = delta.total_seconds() / 3600
+            
+            if hours < 1:
+                return 1.0
+            elif hours < 6:
+                return 0.8
+            elif hours < 24:
+                return 0.6
+            elif hours < 168:
+                return 0.4
+            else:
+                return 0.2
+        except (ValueError, TypeError):
+            return 0.5
     
     def _search_l2(self, query: str, top_k: int) -> List[MemorySearchResult]:
         """搜索L2向量库"""
@@ -339,18 +437,25 @@ class MemoryManager:
         results = []
         
         try:
-            # 提取关键词
             keywords = query.split()
-            l3_results = self.sqlite.search_by_keywords(keywords, limit=top_k)
+            query_lower = query.lower()
+            query_keywords = set(query_lower.split())
+            
+            l3_results = self.sqlite.search_by_keywords(keywords, limit=top_k * 2)
             
             for record in l3_results:
-                # 使用压缩后的文本（如果有）
                 text = record.compressed_text or record.text
+                text_lower = text.lower()
+                
+                similarity = self._calculate_text_similarity(query_lower, text_lower, query_keywords)
+                
+                if similarity < 0.3:
+                    continue
                 
                 results.append(MemorySearchResult(
                     text=text,
                     source="L3",
-                    similarity=0.7,  # 数据库搜索没有相似度，给个默认值
+                    similarity=similarity,
                     weight=record.weight,
                     metadata={
                         "id": record.id,
@@ -358,10 +463,69 @@ class MemoryManager:
                         "timestamp": record.created_time
                     }
                 ))
+            
+            results.sort(key=lambda x: x.similarity * x.weight, reverse=True)
+            
         except Exception as e:
             print(f"L3搜索失败: {e}")
         
-        return results
+        return results[:top_k]
+    
+    def _calculate_text_similarity(self, query: str, text: str, query_keywords: set = None) -> float:
+        """
+        计算文本相似度（基于关键词匹配）
+        
+        综合考虑：
+        1. 关键词覆盖率
+        2. 关键词位置权重
+        3. 文本长度归一化
+        4. IDF权重（简化版）
+        """
+        if not query or not text:
+            return 0.0
+        
+        if query_keywords is None:
+            query_keywords = set(query.split())
+        
+        if not query_keywords:
+            return 0.0
+        
+        matched_keywords = 0
+        position_score = 0.0
+        idf_score = 0.0
+        
+        for kw in query_keywords:
+            if kw in text:
+                matched_keywords += 1
+                
+                pos = text.find(kw)
+                if pos < 100:
+                    position_score += 1.0
+                elif pos < 300:
+                    position_score += 0.7
+                else:
+                    position_score += 0.5
+                
+                if len(kw) > 3:
+                    idf_score += 1.5
+                else:
+                    idf_score += 1.0
+        
+        coverage = matched_keywords / len(query_keywords)
+        
+        max_position_score = len(query_keywords)
+        normalized_position = position_score / max_position_score if max_position_score > 0 else 0
+        
+        max_idf_score = len(query_keywords) * 1.5
+        normalized_idf = idf_score / max_idf_score if max_idf_score > 0 else 0
+        
+        similarity = (
+            coverage * 0.5 +
+            normalized_position * 0.3 +
+            normalized_idf * 0.2
+        )
+        
+        return min(similarity, 1.0)
     
     def _backfill_to_l2(self, result: MemorySearchResult):
         """
