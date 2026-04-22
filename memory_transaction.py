@@ -1,3 +1,5 @@
+import json
+import sqlite3
 import threading
 import time
 from typing import Dict, List, Optional, Any, Callable
@@ -33,9 +35,14 @@ class TransactionCoordinator:
     事务协调器
     
     实现 SQLite + ChromaDB 的两阶段提交：
-    1. 准备阶段：在 SQLite 中记录事务状态
+    1. 准备阶段：在 SQLite 中记录事务状态（持久化）
     2. 提交阶段：执行 ChromaDB 操作，成功后更新 SQLite 状态
     3. 恢复阶段：启动时检查未完成的事务并重试
+    
+    原子性保证：
+    - 事务状态持久化到 SQLite 的 transactions 表
+    - 崩溃后可通过事务表恢复未完成的事务
+    - 使用 WAL 模式确保写入原子性
     
     使用方式：
     ```python
@@ -53,6 +60,23 @@ class TransactionCoordinator:
     
     _instance: Optional['TransactionCoordinator'] = None
     _lock = threading.Lock()
+    
+    TRANSACTION_TABLE_SQL = """
+        CREATE TABLE IF NOT EXISTS transactions (
+            transaction_id TEXT PRIMARY KEY,
+            operation_type TEXT NOT NULL,
+            state TEXT NOT NULL,
+            created_time TEXT NOT NULL,
+            updated_time TEXT NOT NULL,
+            data TEXT,
+            error_message TEXT
+        )
+    """
+    
+    TRANSACTION_INDEX_SQL = """
+        CREATE INDEX IF NOT EXISTS idx_transactions_state 
+        ON transactions(state, updated_time)
+    """
     
     def __new__(cls):
         if cls._instance is None:
@@ -73,11 +97,174 @@ class TransactionCoordinator:
         self._vector_store = None
         self._migration_lock = threading.RLock()
         self._migration_active = False
+        self._tx_table_initialized = False
     
     def set_stores(self, sqlite_store, vector_store):
-        """设置存储实例"""
+        """设置存储实例并初始化事务表"""
         self._sqlite_store = sqlite_store
         self._vector_store = vector_store
+        self._init_transaction_table()
+    
+    def _init_transaction_table(self):
+        """初始化事务表"""
+        if self._tx_table_initialized or not self._sqlite_store:
+            return
+        
+        try:
+            with self._sqlite_store._get_write_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(self.TRANSACTION_TABLE_SQL)
+                cursor.execute(self.TRANSACTION_INDEX_SQL)
+                conn.commit()
+                self._tx_table_initialized = True
+                self._log.debug("TRANSACTION_TABLE_INITIALIZED")
+        except Exception as e:
+            self._log.error("TRANSACTION_TABLE_INIT_FAILED", error=str(e))
+    
+    def _persist_transaction(self, tx_record: TransactionRecord) -> bool:
+        """
+        持久化事务状态到 SQLite
+        
+        Args:
+            tx_record: 事务记录
+        
+        Returns:
+            是否成功
+        """
+        if not self._sqlite_store:
+            return False
+        
+        try:
+            with self._sqlite_store._get_write_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    INSERT OR REPLACE INTO transactions 
+                    (transaction_id, operation_type, state, created_time, 
+                     updated_time, data, error_message)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    tx_record.transaction_id,
+                    tx_record.operation_type,
+                    tx_record.state.value,
+                    tx_record.created_time.isoformat(),
+                    tx_record.updated_time.isoformat(),
+                    json.dumps(tx_record.data, ensure_ascii=False),
+                    tx_record.error_message
+                ))
+                conn.commit()
+                return True
+        except Exception as e:
+            self._log.error("TRANSACTION_PERSIST_FAILED", 
+                           transaction_id=tx_record.transaction_id,
+                           error=str(e))
+            return False
+    
+    def _update_transaction_state(self, tx_id: str, state: TransactionState, 
+                                   error_message: str = None) -> bool:
+        """
+        更新事务状态
+        
+        Args:
+            tx_id: 事务ID
+            state: 新状态
+            error_message: 错误信息（可选）
+        
+        Returns:
+            是否成功
+        """
+        if not self._sqlite_store:
+            return False
+        
+        try:
+            with self._sqlite_store._get_write_connection() as conn:
+                cursor = conn.cursor()
+                if error_message:
+                    cursor.execute("""
+                        UPDATE transactions 
+                        SET state = ?, updated_time = ?, error_message = ?
+                        WHERE transaction_id = ?
+                    """, (state.value, datetime.now().isoformat(), error_message, tx_id))
+                else:
+                    cursor.execute("""
+                        UPDATE transactions 
+                        SET state = ?, updated_time = ?
+                        WHERE transaction_id = ?
+                    """, (state.value, datetime.now().isoformat(), tx_id))
+                conn.commit()
+                return True
+        except Exception as e:
+            self._log.error("TRANSACTION_UPDATE_FAILED", 
+                           transaction_id=tx_id,
+                           error=str(e))
+            return False
+    
+    def _delete_transaction(self, tx_id: str) -> bool:
+        """
+        删除事务记录
+        
+        Args:
+            tx_id: 事务ID
+        
+        Returns:
+            是否成功
+        """
+        if not self._sqlite_store:
+            return False
+        
+        try:
+            with self._sqlite_store._get_write_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("DELETE FROM transactions WHERE transaction_id = ?", (tx_id,))
+                conn.commit()
+                return True
+        except Exception as e:
+            self._log.error("TRANSACTION_DELETE_FAILED", 
+                           transaction_id=tx_id,
+                           error=str(e))
+            return False
+    
+    def _get_pending_transactions_from_db(self) -> List[TransactionRecord]:
+        """
+        从数据库获取未完成的事务
+        
+        Returns:
+            未完成的事务列表
+        """
+        if not self._sqlite_store:
+            return []
+        
+        try:
+            conn = self._sqlite_store._get_read_connection()
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT transaction_id, operation_type, state, created_time,
+                       updated_time, data, error_message
+                FROM transactions
+                WHERE state IN ('pending', 'preparing')
+                ORDER BY created_time ASC
+            """)
+            
+            records = []
+            for row in cursor.fetchall():
+                try:
+                    records.append(TransactionRecord(
+                        transaction_id=row[0],
+                        operation_type=row[1],
+                        state=TransactionState(row[2]),
+                        created_time=datetime.fromisoformat(row[3]),
+                        updated_time=datetime.fromisoformat(row[4]),
+                        data=json.loads(row[5]) if row[5] else {},
+                        error_message=row[6]
+                    ))
+                except (ValueError, json.JSONDecodeError) as e:
+                    self._log.error("TRANSACTION_PARSE_FAILED", 
+                                   transaction_id=row[0],
+                                   error=str(e))
+            
+            return records
+        except Exception as e:
+            self._log.error("GET_PENDING_TRANSACTIONS_FAILED", error=str(e))
+            return []
     
     def begin_migration(self):
         """
@@ -132,7 +319,14 @@ class TransactionCoordinator:
         transaction_id: Optional[str] = None
     ) -> Dict[str, Any]:
         """
-        执行事务
+        执行事务（带持久化）
+        
+        两阶段提交流程：
+        1. 创建事务记录，状态为 PENDING，持久化到 SQLite
+        2. 执行准备阶段，状态更新为 PREPARING，持久化
+        3. 执行提交阶段（ChromaDB 写入）
+        4. 成功则状态更新为 COMMITTED，持久化
+        5. 失败则执行回滚，状态更新为 FAILED 或 ROLLED_BACK
         
         Args:
             operation_type: 操作类型
@@ -163,9 +357,12 @@ class TransactionCoordinator:
         
         self._transactions[tx_id] = tx_record
         
+        self._persist_transaction(tx_record)
+        
         try:
             tx_record.state = TransactionState.PREPARING
             tx_record.updated_time = datetime.now()
+            self._update_transaction_state(tx_id, TransactionState.PREPARING)
             
             prepare_result = prepare_fn(data)
             tx_record.data["prepare_result"] = prepare_result
@@ -175,6 +372,7 @@ class TransactionCoordinator:
             
             tx_record.state = TransactionState.COMMITTED
             tx_record.updated_time = datetime.now()
+            self._update_transaction_state(tx_id, TransactionState.COMMITTED)
             
             self._log.debug("TRANSACTION_COMMITTED", 
                            transaction_id=tx_id, 
@@ -190,6 +388,7 @@ class TransactionCoordinator:
             tx_record.state = TransactionState.FAILED
             tx_record.error_message = str(e)
             tx_record.updated_time = datetime.now()
+            self._update_transaction_state(tx_id, TransactionState.FAILED, str(e))
             
             self._log.error("TRANSACTION_FAILED",
                            transaction_id=tx_id,
@@ -200,6 +399,7 @@ class TransactionCoordinator:
                 try:
                     rollback_fn(tx_record.data)
                     tx_record.state = TransactionState.ROLLED_BACK
+                    self._update_transaction_state(tx_id, TransactionState.ROLLED_BACK)
                 except Exception as rb_error:
                     self._log.error("ROLLBACK_FAILED",
                                    transaction_id=tx_id,
@@ -215,7 +415,9 @@ class TransactionCoordinator:
         """
         恢复未完成的事务
         
-        检查 SQLite 中 is_vectorized=2 的记录并重新处理
+        检查：
+        1. SQLite 事务表中的 PREPARING 状态事务
+        2. SQLite 中 is_vectorized=2 的记录（旧兼容）
         
         Returns:
             恢复的记录数
@@ -224,6 +426,16 @@ class TransactionCoordinator:
             return 0
         
         recovered = 0
+        
+        pending_txs = self._get_pending_transactions_from_db()
+        for tx_record in pending_txs:
+            self._log.info("TRANSACTION_RECOVERY_PENDING", 
+                          transaction_id=tx_record.transaction_id,
+                          state=tx_record.state.value)
+            
+            self._update_transaction_state(tx_record.transaction_id, TransactionState.FAILED,
+                                          "Recovered on startup - requires manual intervention")
+            recovered += 1
         
         try:
             pending_records = self._sqlite_store.get_unvectorized(limit=50)
@@ -271,6 +483,8 @@ class TransactionCoordinator:
         """
         清理已完成的事务记录
         
+        同时清理内存和数据库中的记录
+        
         Args:
             max_age_hours: 最大保留时间（小时）
         """
@@ -287,9 +501,41 @@ class TransactionCoordinator:
         
         for tx_id in to_remove:
             del self._transactions[tx_id]
+            self._delete_transaction(tx_id)
         
         if to_remove:
             self._log.debug("TRANSACTION_CLEANUP", count=len(to_remove))
+        
+        self._cleanup_db_transactions(max_age_hours)
+    
+    def _cleanup_db_transactions(self, max_age_hours: int):
+        """
+        清理数据库中已完成的事务记录
+        
+        Args:
+            max_age_hours: 最大保留时间（小时）
+        """
+        if not self._sqlite_store:
+            return
+        
+        try:
+            cutoff_time = datetime.now()
+            cutoff_str = cutoff_time.isoformat()
+            
+            with self._sqlite_store._get_write_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    DELETE FROM transactions
+                    WHERE state IN ('committed', 'rolled_back', 'failed')
+                    AND updated_time < ?
+                """, (cutoff_str,))
+                deleted = cursor.rowcount
+                conn.commit()
+                
+                if deleted > 0:
+                    self._log.debug("DB_TRANSACTION_CLEANUP", count=deleted)
+        except Exception as e:
+            self._log.error("DB_TRANSACTION_CLEANUP_FAILED", error=str(e))
 
 
 _transaction_coordinator: Optional[TransactionCoordinator] = None

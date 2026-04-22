@@ -67,6 +67,7 @@ class SQLiteStore:
     def __init__(self, db_path: str = "memory.db"):
         self.db_path = db_path
         self._write_lock = threading.Lock()
+        self.lock = self._write_lock
         self._local = threading.local()
         self._last_cleanup = datetime.now()
         self._integrity_checked = False

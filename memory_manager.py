@@ -126,6 +126,10 @@ class MemoryManager:
         
         start_time = time.perf_counter()
         
+        if self._tx_coordinator.is_migration_active():
+            self._tx_coordinator.wait_for_migration(timeout=5.0)
+            self._tx_coordinator.release_migration_wait()
+        
         if top_k is None:
             top_k = config.max_retrieve_results
         
