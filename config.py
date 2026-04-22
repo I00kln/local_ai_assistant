@@ -38,6 +38,11 @@ class AsyncProcessorConfig:
     max_pending_compressions: int = 50
     compressor_check_interval: int = 300
     compressor_failure_threshold: int = 5
+    max_queue_size: int = 1000
+    queue_full_action: str = "drop_oldest"
+    llm_timeout: int = 30
+    circuit_breaker_threshold: int = 5
+    circuit_breaker_reset_timeout: int = 60
 
 
 @dataclass
@@ -88,12 +93,16 @@ class RetrievalConfig:
     similarity_threshold: float = 0.90
     l1_min_results: int = 2
     l2_lower_threshold: float = 0.80
-    cloud_l1_threshold: float = 0.85
+    cloud_l1_threshold: float = 0.70
     cloud_l2_threshold: float = 0.75
     cloud_l3_threshold: float = 0.70
-    local_l1_threshold: float = 0.90
+    local_l1_threshold: float = 0.75
     local_l2_threshold: float = 0.80
     local_l3_threshold: float = 0.75
+    source_weight_l1: float = 1.2
+    source_weight_l2: float = 1.0
+    source_weight_l3: float = 0.8
+    diversity_threshold: float = 0.95
 
 
 @dataclass

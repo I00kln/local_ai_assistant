@@ -239,6 +239,102 @@ class HealthChecker:
             } for name, health in results.items()},
             "checked_at": datetime.now().isoformat()
         }
+    
+    def get_metrics(self) -> Dict[str, Any]:
+        """
+        获取运行时指标
+        
+        整合：
+        - 组件健康状态
+        - 记忆数量统计
+        - 队列状态
+        - 性能指标（来自 metrics.py）
+        """
+        from metrics import get_metrics_collector
+        
+        results = self.check_all()
+        
+        memory_counts = {"l1": 0, "l2": 0, "l3": 0}
+        queue_stats = {}
+        
+        if "memory_manager" in results:
+            details = results["memory_manager"].details
+            memory_counts["l1"] = details.get("l1_count", 0)
+            memory_counts["l2"] = details.get("l2_count", 0)
+        
+        if "sqlite_store" in results:
+            details = results["sqlite_store"].details
+            memory_counts["l3"] = details.get("total_records", 0)
+        
+        if "async_processor" in results:
+            details = results["async_processor"].details
+            queue_stats = {
+                "queue_size": details.get("queue_size", 0),
+                "buffer_size": details.get("buffer_size", 0),
+                "running": details.get("running", False),
+            }
+        
+        if "vector_store" in results:
+            details = results["vector_store"].details
+            memory_counts["l2"] = details.get("document_count", memory_counts["l2"])
+        
+        metrics_collector = get_metrics_collector()
+        performance_metrics = metrics_collector.get_metrics()
+        
+        return {
+            "memory": memory_counts,
+            "queue": queue_stats,
+            "health": {
+                "overall": self._get_overall_status(results),
+                "components": {name: h.status.value for name, h in results.items()},
+            },
+            "performance": performance_metrics,
+            "checked_at": datetime.now().isoformat(),
+        }
+    
+    def _get_overall_status(self, results: Dict[str, ComponentHealth]) -> str:
+        """获取整体健康状态"""
+        unhealthy = sum(1 for h in results.values() if h.status == HealthStatus.UNHEALTHY)
+        degraded = sum(1 for h in results.values() if h.status == HealthStatus.DEGRADED)
+        
+        if unhealthy > 0:
+            return "unhealthy"
+        elif degraded > 0:
+            return "degraded"
+        else:
+            return "healthy"
+    
+    def get_metrics_summary(self) -> str:
+        """获取指标摘要文本"""
+        from metrics import get_metrics_collector
+        
+        metrics = self.get_metrics()
+        collector = get_metrics_collector()
+        
+        lines = [
+            "=== 系统状态监控 ===",
+            "",
+            "【记忆统计】",
+            f"  L1 内存层: {metrics['memory']['l1']} 条",
+            f"  L2 向量库: {metrics['memory']['l2']} 条",
+            f"  L3 数据库: {metrics['memory']['l3']} 条",
+            "",
+            "【队列状态】",
+            f"  待处理: {metrics['queue'].get('queue_size', 0)} 条",
+            f"  缓冲区: {metrics['queue'].get('buffer_size', 0)} 条",
+            f"  运行中: {'是' if metrics['queue'].get('running', False) else '否'}",
+            "",
+            "【健康状态】",
+            f"  整体: {metrics['health']['overall']}",
+        ]
+        
+        for name, status in metrics['health']['components'].items():
+            lines.append(f"  {name}: {status}")
+        
+        lines.append("")
+        lines.append(collector.get_summary())
+        
+        return "\n".join(lines)
 
 
 _health_checker: Optional[HealthChecker] = None

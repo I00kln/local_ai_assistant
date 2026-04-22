@@ -85,6 +85,70 @@ class StructuredLogger:
     def critical(self, event: str, **kwargs):
         """严重错误级别日志"""
         self.logger.critical(self._format_message(event, **kwargs))
+    
+    def set_level(self, level: str):
+        """
+        动态调整日志级别
+        
+        Args:
+            level: 日志级别名称 (DEBUG, INFO, WARNING, ERROR, CRITICAL)
+        """
+        level_map = {
+            "DEBUG": logging.DEBUG,
+            "INFO": logging.INFO,
+            "WARNING": logging.WARNING,
+            "ERROR": logging.ERROR,
+            "CRITICAL": logging.CRITICAL,
+        }
+        
+        new_level = level_map.get(level.upper())
+        if new_level is None:
+            self.logger.warning(f"无效的日志级别: {level}")
+            return
+        
+        self.logger.setLevel(new_level)
+        
+        for handler in self.logger.handlers:
+            if isinstance(handler, logging.StreamHandler) and not isinstance(handler, logging.FileHandler):
+                handler.setLevel(new_level)
+        
+        self.info("LOG_LEVEL_CHANGED", new_level=level.upper())
+    
+    def get_level(self) -> str:
+        """获取当前日志级别"""
+        level_map = {
+            logging.DEBUG: "DEBUG",
+            logging.INFO: "INFO",
+            logging.WARNING: "WARNING",
+            logging.ERROR: "ERROR",
+            logging.CRITICAL: "CRITICAL",
+        }
+        return level_map.get(self.logger.level, "UNKNOWN")
+    
+    def set_console_level(self, level: str):
+        """
+        单独设置控制台日志级别
+        
+        Args:
+            level: 日志级别名称
+        """
+        level_map = {
+            "DEBUG": logging.DEBUG,
+            "INFO": logging.INFO,
+            "WARNING": logging.WARNING,
+            "ERROR": logging.ERROR,
+            "CRITICAL": logging.CRITICAL,
+        }
+        
+        new_level = level_map.get(level.upper())
+        if new_level is None:
+            return
+        
+        for handler in self.logger.handlers:
+            if isinstance(handler, logging.StreamHandler) and not isinstance(handler, logging.FileHandler):
+                handler.setLevel(new_level)
+        
+        self.info("CONSOLE_LOG_LEVEL_CHANGED", new_level=level.upper())
 
 
 _logger: Optional[StructuredLogger] = None

@@ -4,6 +4,7 @@ import os
 import sqlite3
 import json
 import threading
+import time
 from datetime import datetime, timedelta
 from typing import List, Dict, Any, Optional, Tuple
 from dataclasses import dataclass, asdict
@@ -56,6 +57,7 @@ class SQLiteStore:
     
     MAX_POOL_SIZE = 10
     CONNECTION_TIMEOUT = 3600
+    BACKUP_SUFFIX = ".backup"
     
     def __init__(self, db_path: str = "memory.db"):
         self.db_path = db_path
@@ -63,7 +65,77 @@ class SQLiteStore:
         self._connection_pool = {}
         self._connection_times = {}
         self._last_cleanup = datetime.now()
+        self._integrity_checked = False
         self._init_database()
+    
+    def _check_integrity(self) -> bool:
+        """
+        检查数据库完整性
+        
+        Returns:
+            True: 数据库完整
+            False: 数据库损坏
+        """
+        try:
+            conn = sqlite3.connect(self.db_path, timeout=5.0)
+            cursor = conn.cursor()
+            result = cursor.execute("PRAGMA integrity_check").fetchone()
+            conn.close()
+            
+            if result and result[0] == "ok":
+                return True
+            else:
+                print(f"[警告] 数据库完整性检查失败: {result}")
+                return False
+        except sqlite3.DatabaseError as e:
+            print(f"[错误] 数据库损坏: {e}")
+            return False
+        except Exception as e:
+            print(f"[错误] 完整性检查异常: {e}")
+            return True
+    
+    def _try_recover_from_backup(self) -> bool:
+        """
+        尝试从备份恢复数据库
+        
+        Returns:
+            True: 恢复成功
+            False: 无备份或恢复失败
+        """
+        import shutil
+        import os
+        
+        backup_path = self.db_path + self.BACKUP_SUFFIX
+        
+        if not os.path.exists(backup_path):
+            print(f"[警告] 无备份文件: {backup_path}")
+            return False
+        
+        try:
+            if os.path.exists(self.db_path):
+                corrupt_backup = self.db_path + ".corrupt"
+                shutil.move(self.db_path, corrupt_backup)
+                print(f"[备份] 损坏数据库已保存为: {corrupt_backup}")
+            
+            shutil.copy(backup_path, self.db_path)
+            print(f"[恢复] 从备份恢复成功: {backup_path}")
+            return True
+            
+        except Exception as e:
+            print(f"[错误] 从备份恢复失败: {e}")
+            return False
+    
+    def _create_backup(self):
+        """创建数据库备份"""
+        import shutil
+        import os
+        
+        try:
+            if os.path.exists(self.db_path):
+                backup_path = self.db_path + self.BACKUP_SUFFIX
+                shutil.copy(self.db_path, backup_path)
+        except Exception as e:
+            print(f"[警告] 创建备份失败: {e}")
     
     @contextmanager
     def _get_connection(self):
@@ -160,43 +232,121 @@ class SQLiteStore:
                 del self._connection_times[thread_id]
     
     def _init_database(self):
-        """初始化数据库表结构"""
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
+        """
+        初始化数据库表结构
+        
+        包含完整性检查和自动恢复：
+        1. 检查数据库文件是否存在
+        2. 检查数据库完整性
+        3. 损坏时尝试从备份恢复
+        4. 创建表结构
+        5. 创建备份
+        """
+        import os
+        
+        if os.path.exists(self.db_path) and not self._integrity_checked:
+            self._integrity_checked = True
             
-            # 主记忆表
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS memories (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    text TEXT NOT NULL,
-                    compressed_text TEXT,
-                    source TEXT DEFAULT 'user',
-                    weight REAL DEFAULT 1.0,
-                    access_count INTEGER DEFAULT 0,
-                    last_access_time TEXT,
-                    created_time TEXT,
-                    metadata TEXT,
-                    is_archived INTEGER DEFAULT 0,
-                    vector_id TEXT,
-                    is_vectorized INTEGER DEFAULT 0
-                )
-            """)
+            if not self._check_integrity():
+                print("[警告] 数据库损坏，尝试从备份恢复...")
+                
+                if self._try_recover_from_backup():
+                    if not self._check_integrity():
+                        print("[严重] 备份恢复后仍损坏，将重建数据库")
+                        self._rebuild_database()
+                else:
+                    print("[严重] 无可用备份，将重建数据库")
+                    self._rebuild_database()
+        
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS memories (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        text TEXT NOT NULL,
+                        compressed_text TEXT,
+                        source TEXT DEFAULT 'user',
+                        weight REAL DEFAULT 1.0,
+                        access_count INTEGER DEFAULT 0,
+                        last_access_time TEXT,
+                        created_time TEXT,
+                        metadata TEXT,
+                        is_archived INTEGER DEFAULT 0,
+                        vector_id TEXT,
+                        is_vectorized INTEGER DEFAULT 0
+                    )
+                """)
+                
+                try:
+                    cursor.execute("ALTER TABLE memories ADD COLUMN vector_id TEXT")
+                except sqlite3.OperationalError:
+                    pass
+                
+                try:
+                    cursor.execute("ALTER TABLE memories ADD COLUMN is_vectorized INTEGER DEFAULT 0")
+                except sqlite3.OperationalError:
+                    pass
+                
+                try:
+                    cursor.execute("ALTER TABLE memories ADD COLUMN text_hash TEXT")
+                except sqlite3.OperationalError:
+                    pass
+                
+                conn.commit()
+                
+                if os.path.exists(self.db_path):
+                    self._create_backup()
+                    
+        except sqlite3.DatabaseError as e:
+            print(f"[严重] 数据库初始化失败: {e}")
+            self._rebuild_database()
+    
+    def _rebuild_database(self):
+        """
+        重建数据库
+        
+        当数据库损坏且无法恢复时，删除并重建
+        """
+        import os
+        import shutil
+        
+        try:
+            if os.path.exists(self.db_path):
+                corrupt_path = self.db_path + ".corrupt." + str(int(time.time()))
+                shutil.move(self.db_path, corrupt_path)
+                print(f"[备份] 损坏数据库已保存为: {corrupt_path}")
             
-            # 数据库迁移：添加新字段（如果不存在）
-            try:
-                cursor.execute("ALTER TABLE memories ADD COLUMN vector_id TEXT")
-            except sqlite3.OperationalError:
-                pass  # 字段已存在
+            self._connection_pool.clear()
+            self._connection_times.clear()
             
-            try:
-                cursor.execute("ALTER TABLE memories ADD COLUMN is_vectorized INTEGER DEFAULT 0")
-            except sqlite3.OperationalError:
-                pass  # 字段已存在
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS memories (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        text TEXT NOT NULL,
+                        compressed_text TEXT,
+                        source TEXT DEFAULT 'user',
+                        weight REAL DEFAULT 1.0,
+                        access_count INTEGER DEFAULT 0,
+                        last_access_time TEXT,
+                        created_time TEXT,
+                        metadata TEXT,
+                        is_archived INTEGER DEFAULT 0,
+                        vector_id TEXT,
+                        is_vectorized INTEGER DEFAULT 0,
+                        text_hash TEXT
+                    )
+                """)
+                conn.commit()
             
-            try:
-                cursor.execute("ALTER TABLE memories ADD COLUMN text_hash TEXT")
-            except sqlite3.OperationalError:
-                pass  # 字段已存在
+            print("[完成] 数据库重建成功")
+            
+        except Exception as e:
+            print(f"[严重] 数据库重建失败: {e}")
+            raise
             
             # 全文搜索虚拟表（FTS5）
             cursor.execute("""

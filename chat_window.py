@@ -88,6 +88,9 @@ class ChatWindow:
         self.save_btn = ttk.Button(self.control_frame, text="立即保存记忆", command=self._force_save, state=tk.DISABLED)
         self.save_btn.pack(side=tk.LEFT, padx=2)
         
+        self.metrics_btn = ttk.Button(self.control_frame, text="系统监控", command=self._show_metrics, state=tk.DISABLED)
+        self.metrics_btn.pack(side=tk.LEFT, padx=2)
+        
         self.show_memory_enabled = tk.BooleanVar(value=True)
         self.show_memory_check = ttk.Checkbutton(
             self.control_frame, 
@@ -218,8 +221,8 @@ class ChatWindow:
                 self._safe_after(0, lambda msg=err_msg: self._append_message("system", f"初始化失败: {msg}"))
                 self._safe_after(0, lambda: self.state_manager.set_state(UIState.ERROR, "初始化失败"))
         
-        thread = threading.Thread(target=init_components, daemon=True)
-        thread.start()
+        self._init_thread = threading.Thread(target=init_components, daemon=True)
+        self._init_thread.start()
     
     def _init_cloud_client(self):
         """初始化云端客户端"""
@@ -270,6 +273,7 @@ class ChatWindow:
         self.show_local_check.config(state=tk.NORMAL)
         self.local_btn.config(state=tk.NORMAL)
         self.save_btn.config(state=tk.NORMAL)
+        self.metrics_btn.config(state=tk.NORMAL)
         self.nonsense_btn.config(state=tk.NORMAL)
         self.stats_btn.config(state=tk.NORMAL)
         
@@ -592,19 +596,41 @@ class ChatWindow:
             self.memory.save()
         self._append_message("system", "记忆已手动保存")
     
+    def _show_metrics(self):
+        """显示系统监控指标"""
+        try:
+            from health_check import get_health_checker
+            
+            checker = get_health_checker()
+            summary = checker.get_metrics_summary()
+            
+            self._append_message("system", summary)
+            
+        except Exception as e:
+            self._append_message("system", f"获取监控指标失败: {str(e)}")
+    
     def _on_close(self):
         """
         窗口关闭时的清理
         
         清理顺序：
-        1. 停止异步处理器
-        2. 保存记忆状态
-        3. 清理 MemoryManager 资源（SQLite 连接池）
-        4. 清理 VectorStore 资源（ONNX 模型会话）
-        5. 销毁窗口
+        1. 设置关闭标志，阻止新请求
+        2. 取消所有待执行的 UI 回调
+        3. 等待初始化线程完成（最多5秒）
+        4. 停止异步处理器
+        5. 保存记忆状态
+        6. 清理 MemoryManager 资源（SQLite 连接池）
+        7. 清理 VectorStore 资源（ONNX 模型会话）
+        8. 清理 SQLite 资源
+        9. 销毁窗口
         """
         self._closing = True
         self._cancel_all_after()
+        
+        if hasattr(self, '_init_thread') and self._init_thread.is_alive():
+            self._init_thread.join(timeout=5)
+            if self._init_thread.is_alive():
+                print("[警告] 初始化线程未能在5秒内完成")
         
         if self.async_processor:
             self.async_processor.stop()
@@ -620,6 +646,14 @@ class ChatWindow:
                 vector_store.close()
         except Exception as e:
             print(f"清理 VectorStore 失败: {e}")
+        
+        try:
+            from sqlite_store import get_sqlite_store
+            sqlite_store = get_sqlite_store()
+            if sqlite_store:
+                sqlite_store.close()
+        except Exception as e:
+            print(f"清理 SQLite 失败: {e}")
         
         try:
             self.window.destroy()

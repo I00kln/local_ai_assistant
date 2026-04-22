@@ -37,7 +37,7 @@ class CompressionStrategy(ABC):
 
 
 class LLMCompressionStrategy(CompressionStrategy):
-    """LLM 压缩策略"""
+    """LLM 压缩策略 - 带熔断器"""
     
     def __init__(self, mem_config):
         self._mem_config = mem_config
@@ -45,21 +45,40 @@ class LLMCompressionStrategy(CompressionStrategy):
         self._last_check = 0
         self._failure_count = 0
         self._available = False
+        self._log = get_logger()
+        
+        self._circuit_breaker = {
+            "failures": 0,
+            "last_failure": 0,
+            "open_until": 0,
+            "threshold": 5,
+            "reset_timeout": 60
+        }
+        try:
+            async_config = mem_config.async_processor
+            self._circuit_breaker["threshold"] = getattr(async_config, 'circuit_breaker_threshold', 5)
+            self._circuit_breaker["reset_timeout"] = getattr(async_config, 'circuit_breaker_reset_timeout', 60)
+        except Exception:
+            pass
     
     def compress(self, text: str) -> Optional[str]:
         if not self.is_available():
             return None
         try:
-            return self._compress_text(text)
-        except Exception:
-            self._failure_count += 1
-            self._available = False
+            result = self._compress_text(text)
+            self._reset_circuit_breaker()
+            return result
+        except Exception as e:
+            self._record_failure(str(e))
             return None
     
     def is_available(self) -> bool:
         current_time = time.time()
-        check_interval = self._mem_config.async_processor.compressor_check_interval
         
+        if current_time < self._circuit_breaker["open_until"]:
+            return False
+        
+        check_interval = self._mem_config.async_processor.compressor_check_interval
         if current_time - self._last_check < check_interval:
             return self._available
         
@@ -69,16 +88,58 @@ class LLMCompressionStrategy(CompressionStrategy):
             try:
                 from llm_client import LlamaClient
                 self._llm_client = LlamaClient()
-            except Exception:
+            except Exception as e:
+                self._record_failure(str(e))
                 return False
         
-        if self._llm_client.check_connection():
-            self._available = True
-            self._failure_count = 0
-            return True
-        
+        try:
+            llm_timeout = getattr(self._mem_config.async_processor, 'llm_timeout', 30)
+            import signal
+            
+            def timeout_handler(signum, frame):
+                raise TimeoutError("LLM connection check timeout")
+            
+            old_handler = signal.signal(signal.SIGALRM, timeout_handler)
+            signal.alarm(llm_timeout)
+            try:
+                available = self._llm_client.check_connection()
+            finally:
+                signal.alarm(0)
+                signal.signal(signal.SIGALRM, old_handler)
+            
+            if available:
+                self._available = True
+                self._reset_circuit_breaker()
+                return True
+            else:
+                self._record_failure("Connection check returned False")
+                return False
+                
+        except TimeoutError:
+            self._record_failure("Connection check timeout")
+            return False
+        except Exception as e:
+            self._record_failure(str(e))
+            return False
+    
+    def _record_failure(self, error: str):
+        """记录失败，更新熔断器状态"""
+        self._failure_count += 1
         self._available = False
-        return False
+        self._circuit_breaker["failures"] += 1
+        self._circuit_breaker["last_failure"] = time.time()
+        
+        if self._circuit_breaker["failures"] >= self._circuit_breaker["threshold"]:
+            self._circuit_breaker["open_until"] = time.time() + self._circuit_breaker["reset_timeout"]
+            self._log.warning("CIRCUIT_BREAKER_OPENED",
+                              failures=self._circuit_breaker["failures"],
+                              reset_in=self._circuit_breaker["reset_timeout"],
+                              error=error)
+    
+    def _reset_circuit_breaker(self):
+        """重置熔断器"""
+        self._circuit_breaker["failures"] = 0
+        self._circuit_breaker["open_until"] = 0
     
     @property
     def name(self) -> str:
@@ -274,7 +335,12 @@ class AsyncMemoryProcessor:
     
     def __init__(self, vector_store: VectorStore = None):
         self.vector_store = vector_store or get_vector_store()
-        self.pending_queue = queue.Queue()
+        
+        max_queue_size = self._get_queue_config().max_queue_size
+        self.pending_queue = queue.Queue(maxsize=max_queue_size)
+        self._queue_dropped_count = 0
+        self._queue_total_count = 0
+        
         self.running = False
         self.thread = None
         self._log = get_logger()
@@ -308,6 +374,14 @@ class AsyncMemoryProcessor:
         self._compressor_warning_shown = False
         
         self._event_bus.subscribe(EventType.L1_OVERFLOW, self._handle_l1_overflow)
+    
+    def _get_queue_config(self):
+        """获取队列配置"""
+        try:
+            return self._mem_config.async_processor
+        except Exception:
+            from config import AsyncProcessorConfig
+            return AsyncProcessorConfig()
     
     def _handle_l1_overflow(self, event):
         """
@@ -474,14 +548,55 @@ class AsyncMemoryProcessor:
                        buffer_remaining=len(self.batch_buffer))
     
     def add_conversation(self, user_input: str, assistant_response: str, metadata: Dict = None):
-        """添加一轮对话到处理队列"""
+        """
+        添加一轮对话到处理队列
+        
+        背压机制：
+        - 队列满时，根据配置策略处理：
+          - drop_oldest: 丢弃最旧的记录
+          - reject: 拒绝新记录
+        - 记录丢弃统计，用于监控
+        """
         conv_data = {
             "timestamp": datetime.now().isoformat(),
             "user": user_input,
             "assistant": assistant_response,
             "metadata": metadata or {}
         }
-        self.pending_queue.put(conv_data)
+        
+        self._queue_total_count += 1
+        
+        try:
+            self.pending_queue.put_nowait(conv_data)
+        except queue.Full:
+            queue_config = self._get_queue_config()
+            action = getattr(queue_config, 'queue_full_action', 'drop_oldest')
+            
+            if action == "drop_oldest":
+                try:
+                    self.pending_queue.get_nowait()
+                    self._queue_dropped_count += 1
+                    self._log.warning("QUEUE_FULL_DROPPING_OLDEST", 
+                                      dropped_count=self._queue_dropped_count,
+                                      queue_size=self.pending_queue.qsize())
+                    self.pending_queue.put_nowait(conv_data)
+                except queue.Empty:
+                    self.pending_queue.put_nowait(conv_data)
+            else:
+                self._queue_dropped_count += 1
+                self._log.warning("QUEUE_FULL_REJECTED",
+                                  rejected_count=self._queue_dropped_count,
+                                  queue_size=self.pending_queue.qsize())
+    
+    def get_queue_stats(self) -> Dict[str, int]:
+        """获取队列统计信息"""
+        return {
+            "queue_size": self.pending_queue.qsize(),
+            "queue_maxsize": self.pending_queue.maxsize,
+            "total_enqueued": self._queue_total_count,
+            "total_dropped": self._queue_dropped_count,
+            "drop_rate": self._queue_dropped_count / max(1, self._queue_total_count)
+        }
     
     def _process_loop(self):
         """后台处理循环"""
@@ -524,14 +639,21 @@ class AsyncMemoryProcessor:
         if config.nonsense_filter_enabled:
             filter_result = get_nonsense_filter().filter(user_input, assistant_response)
             
+            from metrics import get_metrics_collector
+            metrics = get_metrics_collector()
+            
             if filter_result.storage_type == "discard":
                 print(f"[废话过滤] 丢弃: {filter_result.reason} (置信度: {filter_result.confidence:.2f})")
+                metrics.record_filter_result("discard")
                 return
             
             if filter_result.storage_type == "sqlite_only":
                 print(f"[废话过滤] 仅存SQLite: {filter_result.reason}")
+                metrics.record_filter_result("sqlite_only")
                 self._store_to_sqlite_only(conversation_memory, metadata)
                 return
+            
+            metrics.record_filter_result("normal")
         
         should_flush = False
         with self._buffer_lock:
@@ -953,6 +1075,9 @@ class AsyncMemoryProcessor:
         - 非高密度内容
         - 非受保护记忆
         """
+        import time
+        from metrics import get_metrics_collector
+        
         if not self.sqlite:
             return 0
         
@@ -970,6 +1095,7 @@ class AsyncMemoryProcessor:
             compressed_count = 0
             preserved_count = 0
             skipped_count = 0
+            metrics = get_metrics_collector()
             
             for record in unaccessed:
                 try:
@@ -992,7 +1118,9 @@ class AsyncMemoryProcessor:
                     
                     target_ratio = self._mem_config.compression.target_ratio
                     
+                    compress_start = time.perf_counter()
                     compressed_text, strategy_name = self._compression_chain.compress(record.text)
+                    compress_duration = (time.perf_counter() - compress_start) * 1000
                     
                     if compressed_text and len(compressed_text) < len(record.text) * target_ratio:
                         record.compressed_text = compressed_text
@@ -1003,11 +1131,14 @@ class AsyncMemoryProcessor:
                         record.metadata["compression_strategy"] = strategy_name
                         self.sqlite.add(record)
                         compressed_count += 1
+                        metrics.record_compression(True, compress_duration)
                     else:
                         self._mark_pending_compression(record)
+                        metrics.record_compression(False)
                         
                 except Exception as e:
                     self._log.error("COMPRESSION_SINGLE_FAILED", error=str(e))
+                    metrics.record_compression(False)
             
             if skipped_count > 0:
                 self._log.debug("COMPRESSION_SKIPPED", count=skipped_count)

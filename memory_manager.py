@@ -131,6 +131,11 @@ class MemoryManager:
         Returns:
             搜索结果列表（已去重、已应用时间衰减、已过滤阈值）
         """
+        import time
+        from metrics import get_metrics_collector
+        
+        start_time = time.perf_counter()
+        
         if top_k is None:
             top_k = config.max_retrieve_results
         
@@ -156,6 +161,15 @@ class MemoryManager:
             return results
         finally:
             self._tx_coordinator.release_migration_wait()
+            
+            duration_ms = (time.perf_counter() - start_time) * 1000
+            metrics = get_metrics_collector()
+            metrics.record_retrieval_latency(duration_ms)
+            metrics.record_retrieval_hits(
+                self.stats.get("l1_hits", 0),
+                self.stats.get("l2_hits", 0),
+                self.stats.get("l3_hits", 0)
+            )
     
     def _do_search(self, query: str, top_k: int, include_l3: bool, threshold: float, include_l1: bool) -> List[MemorySearchResult]:
         """实际执行搜索（内部方法）"""
@@ -216,10 +230,12 @@ class MemoryManager:
         query_lower = query.lower()
         
         time_patterns = {
-            "today": (r"今天|今日|today", "recent", 1.5),
+            "today": (r"今天|今日|today", "today", 1.5),
             "yesterday": (r"昨天|昨日|yesterday", "yesterday", 2.0),
-            "week": (r"上周|这周|本周|last week|this week", "week", 1.3),
-            "recent": (r"最近|刚才|刚才|recently|just now", "recent", 1.4),
+            "last_week": (r"上周|last week", "last_week", 1.8),
+            "this_week": (r"这周|本周|this week", "this_week", 1.3),
+            "recent": (r"最近|刚才|recently|just now", "recent", 1.4),
+            "last_month": (r"上个月|上月|last month", "last_month", 1.2),
             "before": (r"之前|以前|before|earlier", "older", 0.8),
         }
         
@@ -237,58 +253,106 @@ class MemoryManager:
             "decay_factor": 1.0
         }
     
-    def _apply_time_decay(self, result: MemorySearchResult, time_context: Dict) -> float:
+    def _calculate_time_decay(self, timestamp: str, time_context: Dict = None) -> float:
         """
-        应用时间衰减因子
+        统一的时间衰减计算
         
-        根据记忆的时间戳和查询的时间上下文调整相似度
+        基础衰减（无时间上下文）：
+        - 最近1小时内: 1.0
+        - 1-6小时: 0.8
+        - 6-24小时: 0.6
+        - 1-7天: 0.4
+        - 7天以上: 0.2
+        
+        结合时间上下文：
+        - "今天"：24小时内加权
+        - "昨天"：24-48小时内加权
+        - "上周"：7-14天内加权
+        - "这周"：7天内加权
         """
-        if not time_context["has_time_ref"]:
-            return result.similarity
-        
-        timestamp_str = result.metadata.get("timestamp", "")
-        if not timestamp_str:
-            return result.similarity
+        if not timestamp:
+            return 0.5
         
         try:
-            from datetime import datetime
-            
-            memory_time = datetime.fromisoformat(timestamp_str)
+            conv_time = datetime.fromisoformat(timestamp)
             now = datetime.now()
-            age_hours = (now - memory_time).total_seconds() / 3600
+            delta = now - conv_time
+            hours = delta.total_seconds() / 3600
             
-            decay = 1.0
-            time_type = time_context["time_type"]
+            base_decay = 1.0
+            if hours < 1:
+                base_decay = 1.0
+            elif hours < 6:
+                base_decay = 0.8
+            elif hours < 24:
+                base_decay = 0.6
+            elif hours < 168:
+                base_decay = 0.4
+            else:
+                base_decay = 0.2
             
-            if time_type == "recent":
-                # 最近：24小时内的记忆加权
-                if age_hours < 24:
-                    decay = 1.5
-                elif age_hours < 48:
-                    decay = 1.2
+            if not time_context or not time_context.get("has_time_ref"):
+                return base_decay
+            
+            time_type = time_context.get("time_type", "any")
+            context_decay = 1.0
+            
+            if time_type == "today":
+                if hours < 24:
+                    context_decay = 1.5
                 else:
-                    decay = 0.7
+                    context_decay = 0.5
             
             elif time_type == "yesterday":
-                # 昨天：24-48小时内的记忆大幅加权
-                if 24 <= age_hours < 48:
-                    decay = 2.0
-                elif age_hours < 24:
-                    decay = 1.0  # 今天的也给一定权重
+                if 24 <= hours < 48:
+                    context_decay = 2.0
+                elif hours < 24:
+                    context_decay = 1.0
                 else:
-                    decay = 0.5
+                    context_decay = 0.4
             
-            elif time_type == "week":
-                # 本周：7天内的记忆加权
-                if age_hours < 168:  # 7天
-                    decay = 1.3
+            elif time_type == "last_week":
+                if 168 <= hours < 336:
+                    context_decay = 1.8
+                elif hours < 168:
+                    context_decay = 1.0
                 else:
-                    decay = 0.6
+                    context_decay = 0.5
             
-            return result.similarity * decay
+            elif time_type == "this_week":
+                if hours < 168:
+                    context_decay = 1.3
+                else:
+                    context_decay = 0.5
             
-        except Exception:
-            return result.similarity
+            elif time_type == "recent":
+                if hours < 24:
+                    context_decay = 1.4
+                elif hours < 72:
+                    context_decay = 1.1
+                else:
+                    context_decay = 0.7
+            
+            elif time_type == "last_month":
+                if 720 <= hours < 1440:
+                    context_decay = 1.2
+                elif hours < 720:
+                    context_decay = 0.9
+                else:
+                    context_decay = 0.6
+            
+            return base_decay * context_decay
+            
+        except (ValueError, TypeError):
+            return 0.5
+    
+    def _apply_time_decay(self, result: MemorySearchResult, time_context: Dict) -> float:
+        """
+        应用时间衰减因子（使用统一的时间衰减函数）
+        """
+        timestamp_str = result.metadata.get("timestamp", "")
+        decay = self._calculate_time_decay(timestamp_str, time_context)
+        return result.similarity * decay
     
     def _search_l1(self, query: str, top_k: int, threshold: float = 0.0) -> List[MemorySearchResult]:
         """
@@ -358,39 +422,6 @@ class MemoryManager:
         
         results.sort(key=lambda x: x.similarity, reverse=True)
         return results[:top_k]
-    
-    def _calculate_time_decay(self, timestamp: str) -> float:
-        """
-        计算时间衰减因子
-        
-        最近1小时内: 1.0
-        1-6小时: 0.8
-        6-24小时: 0.6
-        1-7天: 0.4
-        7天以上: 0.2
-        """
-        if not timestamp:
-            return 0.5
-        
-        try:
-            conv_time = datetime.fromisoformat(timestamp)
-            now = datetime.now()
-            delta = now - conv_time
-            
-            hours = delta.total_seconds() / 3600
-            
-            if hours < 1:
-                return 1.0
-            elif hours < 6:
-                return 0.8
-            elif hours < 24:
-                return 0.6
-            elif hours < 168:
-                return 0.4
-            else:
-                return 0.2
-        except (ValueError, TypeError):
-            return 0.5
     
     def _search_l2(self, query: str, top_k: int) -> List[MemorySearchResult]:
         """搜索L2向量库"""

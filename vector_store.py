@@ -17,6 +17,7 @@ class ONNXEmbeddingFunction:
     特性：
     - 延迟加载：首次使用时才加载模型
     - 线程安全：使用锁保护初始化
+    - 降级模式：模型加载失败时使用随机向量
     """
     
     def __init__(self):
@@ -25,32 +26,87 @@ class ONNXEmbeddingFunction:
         self._dimension = None
         self._lock = threading.Lock()
         self.name = "onnx_bge"
+        self._fallback_mode = False
+        self._init_error = None
     
     def _ensure_initialized(self):
-        """确保模型已初始化（延迟加载）"""
-        if self._session is not None:
+        """
+        确保模型已初始化（延迟加载）
+        
+        降级策略：
+        - 模型文件不存在时，使用随机向量降级模式
+        - 记录错误信息，便于后续修复
+        - 系统仍可启动，但向量检索功能受限
+        """
+        if self._session is not None or self._fallback_mode:
             return
         
         with self._lock:
-            if self._session is not None:
+            if self._session is not None or self._fallback_mode:
                 return
             
-            import onnxruntime as ort
-            from tokenizers import Tokenizer
-            
-            model_path = config.onnx_model_path
-            
-            self._tokenizer = Tokenizer.from_file(os.path.join(model_path, "tokenizer.json"))
-            self._tokenizer.enable_padding()
-            self._tokenizer.enable_truncation(max_length=512)
-            
-            self._session = ort.InferenceSession(
-                os.path.join(model_path, "model.onnx"),
-                providers=['CPUExecutionProvider']
-            )
-            
-            self._dimension = config.embedding_dimension
-            print("ONNX嵌入模型延迟加载完成")
+            try:
+                import onnxruntime as ort
+                from tokenizers import Tokenizer
+                
+                model_path = config.onnx_model_path
+                
+                tokenizer_path = os.path.join(model_path, "tokenizer.json")
+                model_file_path = os.path.join(model_path, "model.onnx")
+                
+                if not os.path.exists(tokenizer_path):
+                    raise FileNotFoundError(f"Tokenizer 文件不存在: {tokenizer_path}")
+                
+                if not os.path.exists(model_file_path):
+                    raise FileNotFoundError(f"模型文件不存在: {model_file_path}")
+                
+                self._tokenizer = Tokenizer.from_file(tokenizer_path)
+                self._tokenizer.enable_padding()
+                self._tokenizer.enable_truncation(max_length=512)
+                
+                self._session = ort.InferenceSession(
+                    model_file_path,
+                    providers=['CPUExecutionProvider']
+                )
+                
+                self._dimension = config.embedding_dimension
+                print("ONNX嵌入模型延迟加载完成")
+                
+            except FileNotFoundError as e:
+                self._init_error = str(e)
+                print(f"[警告] 嵌入模型文件缺失，启用降级模式: {e}")
+                self._enable_fallback()
+                
+            except ImportError as e:
+                self._init_error = str(e)
+                print(f"[警告] 依赖库缺失，启用降级模式: {e}")
+                self._enable_fallback()
+                
+            except Exception as e:
+                self._init_error = str(e)
+                print(f"[错误] 嵌入模型加载失败，启用降级模式: {e}")
+                self._enable_fallback()
+    
+    def _enable_fallback(self):
+        """
+        启用降级模式
+        
+        使用随机向量替代真实嵌入：
+        - 系统可以启动
+        - 向量检索功能不可用（相似度计算无意义）
+        - 应尽快修复模型文件
+        """
+        self._fallback_mode = True
+        self._dimension = config.embedding_dimension
+        print("[降级] 嵌入模型使用随机向量模式，请尽快修复模型文件")
+    
+    def is_fallback_mode(self) -> bool:
+        """检查是否处于降级模式"""
+        return self._fallback_mode
+    
+    def get_init_error(self) -> Optional[str]:
+        """获取初始化错误信息"""
+        return self._init_error
     
     @property
     def tokenizer(self):
@@ -68,37 +124,73 @@ class ONNXEmbeddingFunction:
         return self._dimension
     
     def __call__(self, texts: List[str]) -> List[List[float]]:
-        """将文本列表转换为嵌入向量列表"""
-        import numpy as np
+        """
+        将文本列表转换为嵌入向量列表
         
-        # 确保模型已加载
+        降级模式：
+        - 使用基于文本哈希的确定性随机向量
+        - 相同文本始终生成相同向量
+        - 向量检索功能受限
+        """
+        import time
+        import numpy as np
+        from metrics import get_metrics_collector
+        
         self._ensure_initialized()
         
-        # 添加前缀
-        texts_with_prefix = [f"为这个句子生成表示：{t}" for t in texts]
+        start_time = time.perf_counter()
         
-        # 批量编码
-        encoded = self._tokenizer.encode_batch(texts_with_prefix)
+        if self._fallback_mode:
+            result = self._generate_fallback_embeddings(texts)
+        else:
+            texts_with_prefix = [f"为这个句子生成表示：{t}" for t in texts]
+            
+            encoded = self._tokenizer.encode_batch(texts_with_prefix)
+            
+            input_ids = np.array([e.ids for e in encoded], dtype=np.int64)
+            attention_mask = np.array([e.attention_mask for e in encoded], dtype=np.int64)
+            
+            inputs_onnx = {
+                "input_ids": input_ids,
+                "attention_mask": attention_mask
+            }
+            
+            outputs = self._session.run(None, inputs_onnx)
+            
+            last_hidden_state = outputs[0]
+            embeddings = last_hidden_state[:, 0, :]
+            
+            norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
+            embeddings = embeddings / np.maximum(norms, 1e-12)
+            
+            result = embeddings.tolist()
         
-        input_ids = np.array([e.ids for e in encoded], dtype=np.int64)
-        attention_mask = np.array([e.attention_mask for e in encoded], dtype=np.int64)
+        duration_ms = (time.perf_counter() - start_time) * 1000
+        get_metrics_collector().record_embedding_latency(duration_ms)
         
-        inputs_onnx = {
-            "input_ids": input_ids,
-            "attention_mask": attention_mask
-        }
+        return result
+    
+    def _generate_fallback_embeddings(self, texts: List[str]) -> List[List[float]]:
+        """
+        生成降级模式的嵌入向量
         
-        outputs = self._session.run(None, inputs_onnx)
+        使用文本哈希生成确定性随机向量：
+        - 相同文本始终生成相同向量
+        - 不同文本生成不同向量
+        - 向量维度与正常模式一致
+        """
+        import numpy as np
+        import hashlib
         
-        # 提取CLS Token
-        last_hidden_state = outputs[0]
-        embeddings = last_hidden_state[:, 0, :]
+        embeddings = []
+        for text in texts:
+            text_hash = hashlib.md5(text.encode()).hexdigest()
+            np.random.seed(int(text_hash[:8], 16))
+            embedding = np.random.randn(self._dimension).astype(np.float32)
+            embedding = embedding / np.linalg.norm(embedding)
+            embeddings.append(embedding.tolist())
         
-        # L2归一化
-        norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
-        embeddings = embeddings / np.maximum(norms, 1e-12)
-        
-        return embeddings.tolist()
+        return embeddings
 
 
 class VectorStore:
@@ -173,7 +265,8 @@ class VectorStore:
         self, 
         texts: List[str], 
         metadatas: List[Dict[str, Any]] = None,
-        ids: List[str] = None
+        ids: List[str] = None,
+        sqlite_store = None
     ) -> List[str]:
         """
         添加文档到向量库
@@ -182,16 +275,18 @@ class VectorStore:
             texts: 文本列表
             metadatas: 元数据列表
             ids: 文档ID列表（不提供则自动生成）
+            sqlite_store: SQLite存储实例（用于降级）
         
         Returns:
             文档ID列表
         
-        注意：ONNX推理在锁外执行，避免阻塞其他线程
+        降级策略：
+        - 磁盘满时，降级到 SQLite 存储
+        - 连接失败时，记录错误并返回空列表
         """
         if not texts:
             return []
         
-        # 步骤1: 在锁外执行耗时操作（ONNX推理）
         if ids is None:
             import uuid
             ids = [str(uuid.uuid4()) for _ in texts]
@@ -206,21 +301,65 @@ class VectorStore:
                 if "timestamp" not in meta:
                     meta["timestamp"] = datetime.now().isoformat()
         
-        # ONNX推理（耗时操作，在锁外执行）
-        embeddings = self.embedding_function(texts)
-        
-        # 步骤2: 在锁内执行快速操作（ChromaDB写入）
-        with self.lock:
-            self.collection.add(
-                documents=texts,
-                embeddings=embeddings,
-                metadatas=metadatas,
-                ids=ids
-            )
+        try:
+            embeddings = self.embedding_function(texts)
             
-            print(f"添加 {len(texts)} 条记忆到向量库，当前总数: {self.collection.count()}")
+            with self.lock:
+                self.collection.add(
+                    documents=texts,
+                    embeddings=embeddings,
+                    metadatas=metadatas,
+                    ids=ids
+                )
+                
+                print(f"添加 {len(texts)} 条记忆到向量库，当前总数: {self.collection.count()}")
+                
+                return ids
+                
+        except OSError as e:
+            error_msg = str(e).lower()
+            if "no space left" in error_msg or "disk full" in error_msg or "enospc" in error_msg:
+                print(f"[严重] ChromaDB 磁盘满，降级到 SQLite 存储")
+                
+                if sqlite_store:
+                    try:
+                        from sqlite_store import MemoryRecord
+                        for text, meta in zip(texts, metadatas or []):
+                            record = MemoryRecord(
+                                text=text,
+                                metadata=meta,
+                                is_vectorized=-1
+                            )
+                            sqlite_store.add(record)
+                        print(f"[降级] {len(texts)} 条记忆已存入 SQLite（待后续升级）")
+                        return []
+                    except Exception as sqlite_error:
+                        print(f"[错误] SQLite 降级存储失败: {sqlite_error}")
+                        return []
+                else:
+                    print(f"[错误] 无 SQLite 存储，记忆丢失")
+                    return []
+            raise
             
-            return ids
+        except Exception as e:
+            print(f"[错误] ChromaDB 写入失败: {e}")
+            
+            if sqlite_store:
+                try:
+                    from sqlite_store import MemoryRecord
+                    for text, meta in zip(texts, metadatas or []):
+                        record = MemoryRecord(
+                            text=text,
+                            metadata=meta,
+                            is_vectorized=0
+                        )
+                        sqlite_store.add(record)
+                    print(f"[降级] {len(texts)} 条记忆已存入 SQLite（待重试）")
+                    return []
+                except Exception:
+                    pass
+            
+            return []
     
     def search(
         self, 

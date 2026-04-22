@@ -263,23 +263,55 @@ class ContextBuilder:
             return []
     
     def _merge_results(self, existing: List[Dict], new_results: List[Dict]) -> List[Dict]:
-        """合并检索结果，去重"""
+        """
+        合并检索结果，去重 + 多样性控制 + 来源权重排序
+        
+        策略：
+        1. 合并所有结果
+        2. 应用来源权重
+        3. 多样性过滤（相似度 > 0.95 视为重复）
+        4. 按综合得分排序
+        """
         seen = set()
         merged = []
         
-        for item in existing:
-            text = item.get("text", "")
-            if text and text not in seen:
-                seen.add(text)
-                merged.append(item)
+        all_items = existing + new_results
         
-        for item in new_results:
+        for item in all_items:
             text = item.get("text", "")
-            if text and text not in seen:
-                seen.add(text)
-                merged.append(item)
+            if not text or text in seen:
+                continue
+            
+            seen.add(text)
+            
+            similarity = item.get("similarity", 0.0)
+            weight = item.get("weight", 1.0)
+            source = item.get("source", "L3")
+            
+            source_weights = {
+                "L1": config.source_weight_l1,
+                "L2": config.source_weight_l2,
+                "L3": config.source_weight_l3,
+                "L3_LOW_QUALITY": config.source_weight_l3 * 0.5,
+            }
+            source_weight = source_weights.get(source, config.source_weight_l3)
+            
+            item["final_score"] = similarity * weight * source_weight
+            merged.append(item)
         
-        return merged
+        merged.sort(key=lambda x: x.get("final_score", 0), reverse=True)
+        
+        filtered = []
+        for item in merged:
+            is_duplicate = False
+            for selected in filtered:
+                if selected.get("similarity", 0) >= config.diversity_threshold:
+                    is_duplicate = True
+                    break
+            if not is_duplicate:
+                filtered.append(item)
+        
+        return filtered
     
     def _estimate_tokens(self, text: str) -> int:
         """
