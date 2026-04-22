@@ -40,8 +40,19 @@ class NonsenseFilter:
     PROTECTED_PATTERNS = [
         r"不[，,]?\s*是",           # 纠错："不，是100"
         r"不对[，,]?\s*",           # 纠错："不对，应该是..."
-        r"更正[：:]",              # 更正："更正：..."
-        r"纠正[一下]?",            # 纠正
+        r"不对\s*\d+",              # 纠错："不对200"
+        r"更正[：:，,]?\s*",        # 更正："更正：..."
+        r"更正一下[是为]?\s*",      # 更正："更正一下是"
+        r"纠正[一下]?\s*[是为]?\s*", # 纠正
+        r"其实是[是为]?\s*",        # 更正："其实是"
+        r"记错[了]?\s*[是为]?\s*",  # 更正："记错了是"
+        r"应该是[是为]?\s*",        # 更正："应该是"
+        r"搞错[了]?\s*[是为]?\s*",  # 更正："搞错了是"
+        r"弄错[了]?\s*[是为]?\s*",  # 更正："弄错了是"
+        r"说错[了]?\s*[是为]?\s*",  # 更正："说错了是"
+        r"写错[了]?\s*[是为]?\s*",  # 更正："写错了是"
+        r"刚才[是为]?\s*",          # 更正："刚才是"
+        r"之前[是为]?\s*",          # 更正："之前是"
         r"\d+(?:\.\d+)?(?:元|美元|块|万|千|百|亿|%|％|度|kg|ml|GB|MB|TB|cm|mm|m|km)",  # 有意义的数字（价格、百分比、单位）
         r"\d{4}[-/年]\d{1,2}[-/月]\d{1,2}",  # 日期格式
         r"\d{1,2}:\d{2}",          # 时间格式
@@ -513,27 +524,34 @@ class NonsenseFilter:
         
         # 短文本进入深度检查
         if len(combined_text) < self.length_threshold * 2:
-            # 第二层：信息密度
+            effective_threshold = self.density_threshold
+            
+            if len(combined_text) < 15:
+                effective_threshold = 0.08
+            
+            if re.search(r'\d+', combined_text):
+                effective_threshold *= 0.6
+            
             density = self._calculate_information_density(combined_text)
-            if density < self.density_threshold:
+            if density < effective_threshold:
                 self.stats["density_filtered"] += 1
                 return FilterResult(
                     is_nonsense=True,
                     reason=f"信息密度过低: {density:.2f}",
                     confidence=1.0 - density,
-                    storage_type="sqlite_only"  # 低密度内容保留在SQLite
+                    storage_type="sqlite_only"
                 )
             
-            # 第三层：向量相似度
-            is_nonsense, similarity = self._vector_filter(combined_text)
-            if is_nonsense:
-                self.stats["vector_filtered"] += 1
-                return FilterResult(
-                    is_nonsense=True,
-                    reason=f"与废话库相似度: {similarity:.2f}",
-                    confidence=similarity,
-                    storage_type="sqlite_only"  # 相似废话保留在SQLite
-                )
+            if self.nonsense_vectors is not None and len(self.nonsense_vectors) > 0:
+                is_nonsense, similarity = self._vector_filter(combined_text)
+                if is_nonsense:
+                    self.stats["vector_filtered"] += 1
+                    return FilterResult(
+                        is_nonsense=True,
+                        reason=f"与废话库相似度: {similarity:.2f}",
+                        confidence=similarity,
+                        storage_type="sqlite_only"
+                    )
         
         self.stats["passed"] += 1
         return FilterResult(

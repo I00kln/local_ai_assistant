@@ -55,14 +55,14 @@ class SensitiveFilter:
     DEFAULT_RULES = [
         FilterRule(
             name="phone",
-            pattern=r'(?<!\d)(1[3-9]\d{9})(?!\d)',
-            replacement=r'1**\*\*\*\*\*\*\2',
+            pattern=r'(?:\+?86[\s\-－—　]?)?(1[3-9]\d)[\s\-－—　]?(\d{4})[\s\-－—　]?(\d{4})',
+            replacement=r'\1****\3',
             description="手机号"
         ),
         FilterRule(
             name="id_card",
-            pattern=r'(?<!\d)(\d{6})(\d{8})(\d{3}[\dXx])(?!\d)',
-            replacement=r'\1********\3',
+            pattern=r'(\d{6})[\s\-－—　]?(\d{4})(\d{4})(\d{2})(\d{2})[\s\-－—　]?(\d{3}[\dXx])',
+            replacement=r'\1********\6',
             description="身份证号"
         ),
         FilterRule(
@@ -73,7 +73,7 @@ class SensitiveFilter:
         ),
         FilterRule(
             name="bank_card",
-            pattern=r'(?<!\d)(\d{4})\d{8,11}(\d{4})(?!\d)',
+            pattern=r'(?<!\d)(\d{4})[\s\-－—　]?\d{4}[\s\-－—　]?\d{1,3}[\s\-－—　]?\d{1,4}[\s\-－—　]?(\d{4})(?!\d)',
             replacement=r'\1 **** **** \2',
             description="银行卡号"
         ),
@@ -91,7 +91,7 @@ class SensitiveFilter:
         ),
         FilterRule(
             name="credit_card",
-            pattern=r'(?<!\d)(\d{4})\s?\d{4}\s?\d{4}\s?(\d{4})(?!\d)',
+            pattern=r'(?<!\d)(\d{4})[\s\-－—　]?\d{4}[\s\-－—　]?\d{4}[\s\-－—　]?(\d{4})(?!\d)',
             replacement=r'\1 **** **** \2',
             description="信用卡号"
         ),
@@ -234,12 +234,13 @@ class SensitiveFilter:
         
         return result, total_detected
     
-    def detect(self, text: str) -> Dict[str, List[str]]:
+    def detect(self, text: str, return_masked: bool = True) -> Dict[str, List[str]]:
         """
-        检测敏感信息（不脱敏）
+        检测敏感信息
         
         Args:
             text: 原始文本
+            return_masked: 是否返回脱敏后的数据（默认True，避免泄露原始敏感信息）
         
         Returns:
             {规则名: [匹配到的敏感信息列表]}
@@ -257,9 +258,18 @@ class SensitiveFilter:
                 matches = re.findall(rule.pattern, text, re.IGNORECASE)
                 if matches:
                     if isinstance(matches[0], tuple):
-                        detected[rule.name] = [''.join(m) for m in matches]
+                        raw_matches = [''.join(m) for m in matches]
                     else:
-                        detected[rule.name] = matches
+                        raw_matches = matches
+                    
+                    if return_masked:
+                        masked_matches = []
+                        for match in raw_matches:
+                            masked = re.sub(rule.pattern, rule.replacement, match, flags=re.IGNORECASE)
+                            masked_matches.append(masked)
+                        detected[rule.name] = masked_matches
+                    else:
+                        detected[rule.name] = raw_matches
             except re.error:
                 continue
         

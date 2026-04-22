@@ -1,8 +1,6 @@
 # token_utils.py
 # Token估算工具函数
 
-from typing import Optional
-
 _tiktoken_available = False
 _encoder = None
 

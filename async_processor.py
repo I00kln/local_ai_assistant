@@ -15,6 +15,7 @@ from nonsense_filter import get_nonsense_filter, FilterResult
 from sqlite_store import get_sqlite_store, MemoryRecord
 from logger import get_logger
 from memory_tags import MemoryTags, MemoryTagHelper
+from memory_merger import get_merger
 
 
 class CompressionStrategy(ABC):
@@ -1051,6 +1052,8 @@ class AsyncMemoryProcessor:
             
             self._process_pending_compressions()
             
+            merged = self._check_and_merge_l2()
+            
             if self._idle_count >= 10 and current_time - self._last_forget_time >= forget_interval:
                 result = self.sqlite.decay_weights(config.memory_decay_days)
                 decayed = result.get("decayed", 0)
@@ -1068,12 +1071,13 @@ class AsyncMemoryProcessor:
                     self._log.info("MEMORY_DECAY", decayed=decayed, forgotten=forgotten)
                 self._last_forget_time = current_time
             
-            total_actions = moved_to_l3 + compressed + moved_to_l2
+            total_actions = moved_to_l3 + compressed + moved_to_l2 + merged
             if total_actions > 0:
                 self._log.info("MEMORY_FLOW_COMPLETE", 
                                l2_to_l3=moved_to_l3, 
                                compressed=compressed, 
-                               l3_to_l2=moved_to_l2)
+                               l3_to_l2=moved_to_l2,
+                               merged=merged)
             
             self._last_compression_time = current_time
             self._idle_count = 0
@@ -1308,6 +1312,7 @@ class AsyncMemoryProcessor:
         注意：
         - 如果记忆有compressed_text，标记为已压缩，未来不再压缩
         - 回流后的记忆若再次存入L3，会跳过压缩流程
+        - 回流完成后触发相似记忆合并检测
         
         并发安全：
         - 使用事务协调器的迁移锁保护整个回流过程
@@ -1325,6 +1330,8 @@ class AsyncMemoryProcessor:
             )
             
             moved_count = 0
+            moved_records = []
+            
             for record in high_weight_records:
                 try:
                     if record.metadata and record.metadata.get(MemoryTags.MOVED_FROM_L2):
@@ -1361,6 +1368,15 @@ class AsyncMemoryProcessor:
                         
                         self.sqlite.add(record)
                         
+                        moved_records.append({
+                            "id": record.id,
+                            "text": record.text,
+                            "created_time": record.created_time,
+                            "weight": record.weight,
+                            "access_count": record.access_count,
+                            "metadata": record.metadata or {}
+                        })
+                        
                         moved_count += 1
                     else:
                         self.sqlite.update_vector_status(record.id, "", is_vectorized=0)
@@ -1369,6 +1385,9 @@ class AsyncMemoryProcessor:
                     self._log.error("L3_TO_L2_MOVE_FAILED", record_id=record.id, error=str(e))
                     self.sqlite.update_vector_status(record.id, "", is_vectorized=0)
             
+            if moved_records:
+                self._trigger_merge_on_backflow(moved_records)
+            
             return moved_count
             
         except Exception as e:
@@ -1376,6 +1395,77 @@ class AsyncMemoryProcessor:
             return 0
         finally:
             self._tx_coordinator.end_migration()
+    
+    def _trigger_merge_on_backflow(self, moved_records: List[Dict]):
+        """
+        L3→L2 回流时触发合并检测
+        
+        检测回流记忆之间或与 L2 现有记忆的相似性，
+        如果发现相似记忆组则触发合并。
+        
+        Args:
+            moved_records: 回流的记忆列表
+        """
+        try:
+            merger = get_merger()
+            
+            result = merger.merge_on_l3_to_l2(
+                moved_records,
+                self.vector_store,
+                self.sqlite
+            )
+            
+            merged_count = result.get("merged_count", 0)
+            
+            if merged_count > 0:
+                self._log.info(
+                    "L3_TO_L2_MERGE_COMPLETE",
+                    merged_count=merged_count,
+                    message=result.get("message", "")
+                )
+                
+        except Exception as e:
+            self._log.error("L3_TO_L2_MERGE_FAILED", error=str(e))
+    
+    def _check_and_merge_l2(self) -> int:
+        """
+        检查并合并 L2（向量库）中的相似记忆
+        
+        触发条件：
+        - 距离上次合并检查超过配置间隔
+        - 发现相似记忆组（相似度 > 阈值）
+        
+        流程：
+        1. 获取 L2 中最近的记忆
+        2. 检测相似记忆组
+        3. 合并相似条目
+        4. 更新存储
+        
+        不影响原有压缩、归档、遗忘逻辑。
+        """
+        try:
+            merger = get_merger()
+            
+            result = merger.check_and_merge_l2(
+                self.vector_store,
+                self.sqlite,
+                force=False
+            )
+            
+            merged_count = result.get("merged_count", 0)
+            
+            if merged_count > 0:
+                self._log.info(
+                    "L2_MERGE_COMPLETE",
+                    merged_count=merged_count,
+                    groups=result.get("groups", 0)
+                )
+            
+            return merged_count
+            
+        except Exception as e:
+            self._log.error("L2_MERGE_CHECK_FAILED", error=str(e))
+            return 0
     
     def _upgrade_sqlite_only(self) -> int:
         """

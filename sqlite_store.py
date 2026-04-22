@@ -698,6 +698,42 @@ class SQLiteStore:
         
         return [self._row_to_record(row) for row in cursor.fetchall()]
     
+    def get_recent_memories(
+        self, 
+        limit: int = 100, 
+        vectorized_only: bool = False
+    ) -> List[MemoryRecord]:
+        """
+        获取最近的记忆（用于合并检测）
+        
+        Args:
+            limit: 返回数量限制
+            vectorized_only: 是否只返回已向量化的记忆（L2）
+        
+        Returns:
+            最近的记忆记录列表
+        """
+        conn = self._get_read_connection()
+        cursor = conn.cursor()
+        
+        if vectorized_only:
+            cursor.execute("""
+                SELECT * FROM memories 
+                WHERE is_vectorized = 1
+                AND is_archived = 0
+                ORDER BY created_time DESC
+                LIMIT ?
+            """, (limit,))
+        else:
+            cursor.execute("""
+                SELECT * FROM memories 
+                WHERE is_archived = 0
+                ORDER BY created_time DESC
+                LIMIT ?
+            """, (limit,))
+        
+        return [self._row_to_record(row) for row in cursor.fetchall()]
+    
     def get_upgradeable_sqlite_only(self, threshold: float = None, limit: int = 20) -> List[MemoryRecord]:
         """
         获取可升级的 sqlite_only 记录

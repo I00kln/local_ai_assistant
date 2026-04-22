@@ -269,7 +269,7 @@ class ContextBuilder:
         策略：
         1. 合并所有结果
         2. 应用来源权重
-        3. 多样性过滤（相似度 > 0.95 视为重复）
+        3. 多样性过滤（文本重叠度 > 0.8 视为重复）
         4. 按综合得分排序
         """
         seen = set()
@@ -304,14 +304,42 @@ class ContextBuilder:
         filtered = []
         for item in merged:
             is_duplicate = False
+            item_text = item.get("text", "")
             for selected in filtered:
-                if selected.get("similarity", 0) >= config.diversity_threshold:
+                selected_text = selected.get("text", "")
+                overlap = self._calculate_text_overlap(item_text, selected_text)
+                if overlap >= config.diversity_threshold:
                     is_duplicate = True
                     break
             if not is_duplicate:
                 filtered.append(item)
         
         return filtered
+    
+    def _calculate_text_overlap(self, text1: str, text2: str) -> float:
+        """
+        计算两个文本的重叠度（基于字符级 Jaccard 相似度）
+        
+        Args:
+            text1: 第一个文本
+            text2: 第二个文本
+        
+        Returns:
+            重叠度 (0-1)
+        """
+        if not text1 or not text2:
+            return 0.0
+        
+        chars1 = set(text1)
+        chars2 = set(text2)
+        
+        if not chars1 or not chars2:
+            return 0.0
+        
+        intersection = len(chars1 & chars2)
+        union = len(chars1 | chars2)
+        
+        return intersection / union if union > 0 else 0.0
     
     def _estimate_tokens(self, text: str) -> int:
         """估算文本的 token 数量"""

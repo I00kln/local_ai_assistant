@@ -3,7 +3,7 @@ import tkinter as tk
 from tkinter import scrolledtext, ttk
 import threading
 from datetime import datetime
-from typing import Optional, List, Dict, Any, Tuple
+from typing import Optional, List, Dict, Any
 
 from config import config
 from models import UIState
@@ -767,11 +767,14 @@ class ChatWindow:
         2. 取消所有待执行的 UI 回调
         3. 等待初始化线程完成（最多5秒）
         4. 停止异步处理器
-        5. 保存记忆状态
-        6. 清理 MemoryManager 资源（SQLite 连接池）
-        7. 清理 VectorStore 资源（ONNX 模型会话）
-        8. 清理 SQLite 资源
-        9. 销毁窗口
+        5. 停止事件总线
+        6. 停止自动归档
+        7. 保存记忆状态
+        8. 清理 MemoryManager 资源（SQLite 连接池）
+        9. 清理 VectorStore 资源（ONNX 模型会话）
+        10. 清理 EmbeddingService 资源
+        11. 清理 SQLite 资源
+        12. 销毁窗口
         """
         self._closing = True
         self._cancel_all_after()
@@ -784,6 +787,20 @@ class ChatWindow:
         if self.async_processor:
             self.async_processor.stop()
         
+        try:
+            from event_bus import get_event_bus
+            get_event_bus().shutdown()
+        except Exception as e:
+            print(f"清理 EventBus 失败: {e}")
+        
+        try:
+            from memory_archiver import get_archiver
+            archiver = get_archiver()
+            if archiver._running:
+                archiver.stop_auto_archive()
+        except Exception as e:
+            print(f"清理 MemoryArchiver 失败: {e}")
+        
         if self.memory:
             self.memory.save()
             self.memory.cleanup_resources()
@@ -795,6 +812,14 @@ class ChatWindow:
                 vector_store.close()
         except Exception as e:
             print(f"清理 VectorStore 失败: {e}")
+        
+        try:
+            from embedding_service import get_embedding_service
+            embedding_service = get_embedding_service()
+            if hasattr(embedding_service, 'cleanup'):
+                embedding_service.cleanup()
+        except Exception as e:
+            print(f"清理 EmbeddingService 失败: {e}")
         
         try:
             from sqlite_store import get_sqlite_store

@@ -3,7 +3,8 @@
 import os
 import threading
 import hashlib
-from typing import List, Optional, Tuple
+from collections import OrderedDict
+from typing import List, Optional
 import numpy as np
 
 
@@ -13,6 +14,11 @@ class EmbeddingService:
     
     单例模式，确保 ONNX 模型只加载一次
     供 VectorStore 和 NonsenseFilter 共享使用
+    
+    缓存策略：
+    - 使用 OrderedDict 实现 LRU 淘汰
+    - 缓存满时淘汰最久未使用的条目
+    - 使用稳定的哈希键（MD5）
     """
     
     _instance: Optional['EmbeddingService'] = None
@@ -36,9 +42,17 @@ class EmbeddingService:
         self._model_lock = threading.Lock()
         self._fallback_mode = False
         self._init_error = None
-        self._embedding_cache = {}
+        self._embedding_cache = OrderedDict()
         self._cache_max_size = 1000
         self._initialized = True
+    
+    def _get_cache_key(self, text: str) -> str:
+        """
+        生成稳定的缓存键
+        
+        使用 MD5 替代 Python hash()，确保跨进程稳定性
+        """
+        return hashlib.md5(text.encode('utf-8')).hexdigest()
     
     def _ensure_initialized(self):
         """
@@ -154,9 +168,10 @@ class EmbeddingService:
         
         if use_cache:
             for idx, text in enumerate(texts):
-                text_hash = hash(text)
-                if text_hash in self._embedding_cache:
-                    result[idx] = self._embedding_cache[text_hash]
+                cache_key = self._get_cache_key(text)
+                if cache_key in self._embedding_cache:
+                    self._embedding_cache.move_to_end(cache_key)
+                    result[idx] = self._embedding_cache[cache_key]
                 else:
                     uncached_indices.append(idx)
                     uncached_texts.append(text)
@@ -173,8 +188,11 @@ class EmbeddingService:
             for idx, text, embedding in zip(uncached_indices, uncached_texts, new_embeddings):
                 result[idx] = embedding
                 
-                if use_cache and len(self._embedding_cache) < self._cache_max_size:
-                    self._embedding_cache[hash(text)] = embedding
+                if use_cache:
+                    cache_key = self._get_cache_key(text)
+                    if len(self._embedding_cache) >= self._cache_max_size:
+                        self._embedding_cache.popitem(last=False)
+                    self._embedding_cache[cache_key] = embedding
         
         return result
     
@@ -247,6 +265,35 @@ class EmbeddingService:
     def clear_cache(self):
         """清空嵌入缓存"""
         self._embedding_cache.clear()
+    
+    def get_cache_stats(self) -> dict:
+        """获取缓存统计信息"""
+        return {
+            "size": len(self._embedding_cache),
+            "max_size": self._cache_max_size,
+            "hit_rate": 0.0
+        }
+    
+    def cleanup(self):
+        """
+        清理资源
+        
+        释放 ONNX 模型会话和缓存
+        用于应用关闭时的资源回收
+        """
+        with self._model_lock:
+            if self._session is not None:
+                del self._session
+                self._session = None
+                print("[EmbeddingService] ONNX 会话已释放")
+            
+            if self._tokenizer is not None:
+                del self._tokenizer
+                self._tokenizer = None
+                print("[EmbeddingService] Tokenizer 已释放")
+            
+            self._embedding_cache.clear()
+            print("[EmbeddingService] 缓存已清空")
 
 
 def get_embedding_service() -> EmbeddingService:
