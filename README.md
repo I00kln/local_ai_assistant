@@ -1,2 +1,2 @@
 # local_ai_assistant
-ai生成测试
+纯ai生成项目，测试用
