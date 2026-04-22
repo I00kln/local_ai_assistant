@@ -1,4 +1,5 @@
 import threading
+import queue
 from typing import Dict, List, Callable, Any, Optional
 from dataclasses import dataclass
 from datetime import datetime
@@ -40,6 +41,7 @@ class EventBus:
     线程安全：
     - 使用 RLock 保护订阅者列表
     - 事件处理在锁外执行，避免死锁
+    - 使用 queue.Queue + 后台线程处理异步事件
     """
     
     _instance: Optional['EventBus'] = None
@@ -61,8 +63,28 @@ class EventBus:
         self._log = get_logger()
         self._subscribers: Dict[EventType, List[EventHandler]] = {}
         self._subscribers_lock = threading.RLock()
-        self._event_queue: List[Event] = []
-        self._queue_lock = threading.Lock()
+        self._event_queue: queue.Queue = queue.Queue()
+        self._running = True
+        self._worker_thread = threading.Thread(
+            target=self._process_loop,
+            daemon=True,
+            name="EventBusWorker"
+        )
+        self._worker_thread.start()
+    
+    def _process_loop(self):
+        """后台线程处理异步事件队列"""
+        while self._running:
+            try:
+                event = self._event_queue.get(timeout=1.0)
+                if event is None:
+                    continue
+                self.publish(event.event_type, event.data, event.source)
+                self._event_queue.task_done()
+            except queue.Empty:
+                continue
+            except Exception as e:
+                self._log.error("EVENT_PROCESS_ERROR", error=str(e))
     
     def subscribe(self, event_type: EventType, handler: EventHandler):
         """
@@ -134,6 +156,8 @@ class EventBus:
         """
         异步发布事件（不阻塞发布者）
         
+        事件会被放入队列，由后台线程异步处理
+        
         Args:
             event_type: 事件类型
             data: 事件数据
@@ -145,19 +169,17 @@ class EventBus:
             data=data,
             source=source
         )
-        
-        with self._queue_lock:
-            self._event_queue.append(event)
+        self._event_queue.put(event)
     
-    def process_queued_events(self):
-        """处理队列中的异步事件"""
-        events = []
-        with self._queue_lock:
-            events = self._event_queue.copy()
-            self._event_queue.clear()
-        
-        for event in events:
-            self.publish(event.event_type, event.data, event.source)
+    def get_queue_size(self) -> int:
+        """获取待处理事件队列大小"""
+        return self._event_queue.qsize()
+    
+    def shutdown(self):
+        """关闭事件总线（优雅退出）"""
+        self._running = False
+        self._event_queue.put(None)
+        self._worker_thread.join(timeout=5.0)
     
     def get_subscriber_count(self, event_type: EventType) -> int:
         """获取事件订阅者数量"""

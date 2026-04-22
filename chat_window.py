@@ -414,58 +414,6 @@ class ChatWindow:
         from token_utils import estimate_tokens
         return estimate_tokens(text)
     
-    def _check_and_truncate_for_local_llm(
-        self, 
-        system_prompt: str, 
-        memory_context: str, 
-        user_input: str,
-        max_tokens: int = None
-    ) -> Tuple[str, str]:
-        """
-        检查并截断内容以适应本地LLM的token限制
-        
-        Args:
-            system_prompt: 系统提示词
-            memory_context: 记忆上下文
-            user_input: 用户输入
-            max_tokens: 最大token数（默认从config读取）
-        
-        Returns:
-            (截断后的记忆上下文, 截断后的用户输入)
-        """
-        if max_tokens is None:
-            max_tokens = config.local.max_context
-        
-        system_tokens = self._estimate_tokens(system_prompt)
-        user_tokens = self._estimate_tokens(user_input)
-        format_overhead = 50
-        
-        available_for_memory = max_tokens - system_tokens - user_tokens - config.local.max_output_tokens - format_overhead
-        available_for_memory = max(available_for_memory, 200)
-        
-        memory_tokens = self._estimate_tokens(memory_context)
-        
-        if memory_tokens <= available_for_memory:
-            return memory_context, user_input
-        
-        ratio = available_for_memory / memory_tokens
-        target_chars = int(len(memory_context) * ratio * 0.9)
-        
-        truncated_memory = memory_context[:target_chars]
-        
-        last_period = max(
-            truncated_memory.rfind('。'),
-            truncated_memory.rfind('.'),
-            truncated_memory.rfind('\n')
-        )
-        
-        if last_period > target_chars * 0.7:
-            truncated_memory = truncated_memory[:last_period + 1]
-        
-        truncated_memory += "\n...[内容已截断以适应token限制]"
-        
-        return truncated_memory, user_input
-    
     def _build_compression_messages(
         self, 
         memory_context: str
@@ -541,7 +489,7 @@ class ChatWindow:
         ]
         
         if apply_token_limit:
-            truncated_memory, truncated_input = self._check_and_truncate_for_local_llm(
+            truncated_memory, truncated_input = self.context_builder.truncate_for_local_llm(
                 system_prompt, memory_context, user_input
             )
         else:

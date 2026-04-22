@@ -7,6 +7,17 @@ from datetime import datetime
 
 
 @dataclass
+class PercentileCache:
+    """百分位数缓存"""
+    p50: float = 0
+    p95: float = 0
+    p99: float = 0
+    avg: float = 0
+    max: float = 0
+    data_version: int = 0
+
+
+@dataclass
 class MetricsCollector:
     """
     轻量级指标收集器
@@ -15,6 +26,7 @@ class MetricsCollector:
     - 线程安全
     - 内存安全（固定大小队列）
     - 低开销（无外部依赖）
+    - 延迟计算+缓存（避免重复排序）
     
     指标类型：
     - 计数器：累计值
@@ -45,6 +57,20 @@ class MetricsCollector:
         self._compression_latencies: deque = deque(maxlen=200)
         self._queue_wait_times: deque = deque(maxlen=500)
         
+        self._data_versions: Dict[str, int] = {
+            "retrieval": 0,
+            "embedding": 0,
+            "compression": 0,
+            "queue": 0
+        }
+        
+        self._percentile_cache: Dict[str, PercentileCache] = {
+            "retrieval": PercentileCache(),
+            "embedding": PercentileCache(),
+            "compression": PercentileCache(),
+            "queue": PercentileCache()
+        }
+        
         self._compression_attempts: int = 0
         self._compression_successes: int = 0
         self._compression_failures: int = 0
@@ -66,6 +92,7 @@ class MetricsCollector:
         with self._lock:
             self._retrieval_latencies.append(duration_ms)
             self._retrieval_total += 1
+            self._data_versions["retrieval"] += 1
     
     def record_retrieval_hits(self, l1: int, l2: int, l3: int):
         """记录各层检索命中数"""
@@ -78,6 +105,7 @@ class MetricsCollector:
         """记录嵌入计算延迟"""
         with self._lock:
             self._embedding_latencies.append(duration_ms)
+            self._data_versions["embedding"] += 1
     
     def record_compression(self, success: bool, duration_ms: float = 0):
         """记录压缩结果"""
@@ -87,6 +115,7 @@ class MetricsCollector:
                 self._compression_successes += 1
                 if duration_ms > 0:
                     self._compression_latencies.append(duration_ms)
+                    self._data_versions["compression"] += 1
             else:
                 self._compression_failures += 1
     
@@ -103,22 +132,52 @@ class MetricsCollector:
         """记录队列等待时间"""
         with self._lock:
             self._queue_wait_times.append(wait_ms)
+            self._data_versions["queue"] += 1
     
-    def _calculate_percentiles(self, data: deque) -> Dict[str, float]:
-        """计算百分位数"""
+    def _calculate_percentiles(self, data: deque, cache_key: str) -> Dict[str, float]:
+        """
+        计算百分位数（带缓存）
+        
+        优化策略：
+        - 只有数据版本变化时才重新计算
+        - 避免高频调用时的重复排序
+        """
         if not data:
             return {"p50": 0, "p95": 0, "p99": 0, "avg": 0, "max": 0}
+        
+        current_version = self._data_versions.get(cache_key, 0)
+        cache = self._percentile_cache.get(cache_key)
+        
+        if cache and cache.data_version == current_version:
+            return {
+                "p50": cache.p50,
+                "p95": cache.p95,
+                "p99": cache.p99,
+                "avg": cache.avg,
+                "max": cache.max,
+            }
         
         sorted_data = sorted(data)
         n = len(sorted_data)
         
-        return {
+        result = {
             "p50": sorted_data[n // 2],
             "p95": sorted_data[int(n * 0.95)] if n >= 20 else sorted_data[-1],
             "p99": sorted_data[int(n * 0.99)] if n >= 100 else sorted_data[-1],
             "avg": sum(sorted_data) / n,
             "max": sorted_data[-1],
         }
+        
+        self._percentile_cache[cache_key] = PercentileCache(
+            p50=result["p50"],
+            p95=result["p95"],
+            p99=result["p99"],
+            avg=result["avg"],
+            max=result["max"],
+            data_version=current_version
+        )
+        
+        return result
     
     def get_metrics(self) -> Dict[str, Any]:
         """获取所有指标"""
@@ -131,7 +190,7 @@ class MetricsCollector:
                 
                 "retrieval": {
                     "total_requests": self._retrieval_total,
-                    "latency_ms": self._calculate_percentiles(self._retrieval_latencies),
+                    "latency_ms": self._calculate_percentiles(self._retrieval_latencies, "retrieval"),
                     "hits": {
                         "l1": self._retrieval_l1_hits,
                         "l2": self._retrieval_l2_hits,
@@ -149,7 +208,7 @@ class MetricsCollector:
                     "successes": self._compression_successes,
                     "failures": self._compression_failures,
                     "success_rate": self._compression_successes / max(1, self._compression_attempts),
-                    "latency_ms": self._calculate_percentiles(self._compression_latencies),
+                    "latency_ms": self._calculate_percentiles(self._compression_latencies, "compression"),
                 },
                 
                 "filter": {
@@ -161,11 +220,11 @@ class MetricsCollector:
                 },
                 
                 "embedding": {
-                    "latency_ms": self._calculate_percentiles(self._embedding_latencies),
+                    "latency_ms": self._calculate_percentiles(self._embedding_latencies, "embedding"),
                 },
                 
                 "queue": {
-                    "wait_time_ms": self._calculate_percentiles(self._queue_wait_times),
+                    "wait_time_ms": self._calculate_percentiles(self._queue_wait_times, "queue"),
                 },
             }
     

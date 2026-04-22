@@ -2,6 +2,7 @@ import logging
 import os
 from datetime import datetime
 from typing import Optional
+from logging.handlers import TimedRotatingFileHandler
 from config import config
 
 
@@ -20,6 +21,11 @@ class StructuredLogger:
     - event: 事件名称
     - 关键字段: 如 userId, recordId 等
     - 决策路径: 如 primaryAttempt, fallbackUsed
+    
+    日志轮转：
+    - 使用 TimedRotatingFileHandler 实现按天轮转
+    - 自动处理跨天日志切分
+    - 保留30天历史日志
     """
     
     _instance: Optional['StructuredLogger'] = None
@@ -41,10 +47,17 @@ class StructuredLogger:
         log_dir = os.path.join(os.path.dirname(__file__), 'logs')
         os.makedirs(log_dir, exist_ok=True)
         
-        log_file = os.path.join(log_dir, f'memory_{datetime.now().strftime("%Y%m%d")}.log')
+        log_file = os.path.join(log_dir, 'memory.log')
         
-        file_handler = logging.FileHandler(log_file, encoding='utf-8')
+        file_handler = TimedRotatingFileHandler(
+            filename=log_file,
+            when='midnight',
+            interval=1,
+            backupCount=30,
+            encoding='utf-8'
+        )
         file_handler.setLevel(logging.DEBUG)
+        file_handler.suffix = "%Y%m%d"
         file_formatter = logging.Formatter(
             '%(asctime)s | %(levelname)-8s | %(message)s',
             datefmt='%Y-%m-%d %H:%M:%S'

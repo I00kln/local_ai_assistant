@@ -1,18 +1,17 @@
 # glm_client.py
-# GLM (智谱AI) 客户端 - 使用 zai-sdk
+# GLM (智谱AI) 客户端
 from typing import Dict, List, Optional
 import re
+import sys
 
 
 class GLMClient:
     """
     GLM (智谱AI) API 客户端
     
-    使用 zai-sdk 调用智谱AI的GLM系列模型
-    支持模型：glm-4, glm-4-flash, glm-4-plus, glm-4-air 等
-    
-    安装依赖：
-        pip install zai-sdk
+    支持两种SDK：
+        - zhipuai (官方SDK): pip install zhipuai
+        - zai-sdk (新版SDK): pip install zai-sdk
     
     获取API Key：
         https://open.bigmodel.cn/
@@ -26,6 +25,7 @@ class GLMClient:
         self.model = model
         self.base_url = base_url or "https://open.bigmodel.cn/api/paas/v4"
         self._client = None
+        self._sdk_name = ""
         self._init_client()
     
     def _init_client(self):
@@ -40,15 +40,45 @@ class GLMClient:
                 api_key=self.api_key,
                 base_url=self.base_url
             )
-            print(f"[GLM] 客户端初始化成功，模型: {self.model}")
+            self._sdk_name = "zhipuai"
+            print(f"[GLM] 客户端初始化成功 (SDK: {self._sdk_name}, 模型: {self.model})")
+            return
         except ImportError:
-            print("[GLM] 未安装智谱AI SDK，请运行: pip install zhipuai 或 pip install zai-sdk")
+            pass
         except Exception as e:
-            print(f"[GLM] 客户端初始化失败: {e}")
-    
-    def _try_zai_sdk(self):
-        """尝试使用 zai-sdk 作为备选（已废弃，逻辑已合并到_init_client）"""
-        pass
+            print(f"[GLM] zhipuai 初始化失败: {e}")
+        
+        try:
+            from zai import ZhipuAiClient
+            self._client = ZhipuAiClient(
+                api_key=self.api_key,
+                base_url=self.base_url
+            )
+            self._sdk_name = "zai-sdk"
+            print(f"[GLM] 客户端初始化成功 (SDK: {self._sdk_name}, 模型: {self.model})")
+            return
+        except ImportError:
+            pass
+        except Exception as e:
+            print(f"[GLM] zai-sdk 初始化失败: {e}")
+        
+        try:
+            from zai import ZaiClient
+            self._client = ZaiClient(
+                api_key=self.api_key,
+                base_url=self.base_url
+            )
+            self._sdk_name = "zai-sdk (ZaiClient)"
+            print(f"[GLM] 客户端初始化成功 (SDK: {self._sdk_name}, 模型: {self.model})")
+            return
+        except ImportError:
+            pass
+        except Exception as e:
+            print(f"[GLM] ZaiClient 初始化失败: {e}")
+        
+        print("[GLM] SDK未安装，请运行以下命令之一:")
+        print("      pip install zhipuai --upgrade")
+        print("      pip install zai-sdk --upgrade")
     
     def chat(self, messages: List[Dict[str, str]], max_tokens: int = 8192) -> str:
         """

@@ -6,7 +6,7 @@ import hashlib
 import re
 from abc import ABC, abstractmethod
 from typing import List, Dict, Any, Set, Tuple, Optional
-from datetime import datetime
+from datetime import datetime, timedelta
 from vector_store import VectorStore, get_vector_store
 from config import config, get_memory_config
 from memory_transaction import get_transaction_coordinator
@@ -14,6 +14,7 @@ from event_bus import get_event_bus, EventType
 from nonsense_filter import get_nonsense_filter, FilterResult
 from sqlite_store import get_sqlite_store, MemoryRecord
 from logger import get_logger
+from memory_tags import MemoryTags, MemoryTagHelper
 
 
 class CompressionStrategy(ABC):
@@ -52,12 +53,12 @@ class LLMCompressionStrategy(CompressionStrategy):
             "last_failure": 0,
             "open_until": 0,
             "threshold": 5,
-            "reset_timeout": 60
+            "reset_timeout": 300
         }
         try:
             async_config = mem_config.async_processor
             self._circuit_breaker["threshold"] = getattr(async_config, 'circuit_breaker_threshold', 5)
-            self._circuit_breaker["reset_timeout"] = getattr(async_config, 'circuit_breaker_reset_timeout', 60)
+            self._circuit_breaker["reset_timeout"] = getattr(async_config, 'circuit_breaker_reset_timeout', 300)
         except Exception:
             pass
     
@@ -161,7 +162,18 @@ class LLMCompressionStrategy(CompressionStrategy):
         return self._compress_single_text(text)
     
     def _compress_single_text(self, text: str) -> Optional[str]:
-        prompt = f"""请将以下对话记录压缩为简洁的摘要，保留所有关键信息。
+        try:
+            from prompts import get_prompt_manager
+            prompt_manager = get_prompt_manager()
+            
+            memory_list = [line.strip() for line in text.split('\n') if line.strip()]
+            
+            if len(memory_list) > 1:
+                messages = prompt_manager.get_compression_prompt(memory_list)
+            else:
+                messages = [
+                    {"role": "system", "content": "你是一个记忆压缩专家。"},
+                    {"role": "user", "content": f"""请将以下对话记录压缩为简洁的摘要，保留所有关键信息。
 
 原始内容：
 {text}
@@ -172,13 +184,8 @@ class LLMCompressionStrategy(CompressionStrategy):
 3. 去除冗余和修饰性内容
 4. 压缩后长度约为原文的30%-50%
 
-压缩结果："""
-
-        try:
-            messages = [
-                {"role": "system", "content": "你是一个记忆压缩专家。"},
-                {"role": "user", "content": prompt}
-            ]
+压缩结果："""}
+                ]
             
             result = self._llm_client.chat(messages, max_tokens=500)
             return result.strip() if result else None
@@ -242,9 +249,19 @@ class LLMCompressionStrategy(CompressionStrategy):
     def _cloud_compress_text(self, text: str) -> Optional[str]:
         try:
             from cloud_client import CloudClient
-            cloud = CloudClient()
+            from prompts import get_prompt_manager
             
-            prompt = f"""请将以下内容压缩为简洁的摘要，保留所有关键信息。
+            cloud = CloudClient()
+            prompt_manager = get_prompt_manager()
+            
+            memory_list = [line.strip() for line in text.split('\n') if line.strip()]
+            
+            if len(memory_list) > 1:
+                messages = prompt_manager.get_compression_prompt(memory_list)
+            else:
+                messages = [
+                    {"role": "system", "content": "你是一个记忆压缩专家。"},
+                    {"role": "user", "content": f"""请将以下内容压缩为简洁的摘要，保留所有关键信息。
 
 原始内容：
 {text}
@@ -255,12 +272,8 @@ class LLMCompressionStrategy(CompressionStrategy):
 3. 去除冗余和修饰性内容
 4. 压缩后长度约为原文的30%-50%
 
-压缩结果："""
-
-            messages = [
-                {"role": "system", "content": "你是一个记忆压缩专家。"},
-                {"role": "user", "content": prompt}
-            ]
+压缩结果："""}
+                ]
             
             result = cloud.chat(messages, max_tokens=1000)
             return result.strip() if result else None
@@ -513,6 +526,11 @@ class AsyncMemoryProcessor:
         检查并清理ChromaDB中的孤立向量
         
         孤立向量：ChromaDB中存在但SQLite中无对应记录
+        
+        优化策略：
+        1. 通过metadata中的sqlite_id快速定位
+        2. 分批处理，每批100条
+        3. 无sqlite_id的旧数据通过vector_id反查
         """
         if not self.sqlite:
             return 0
@@ -523,10 +541,23 @@ class AsyncMemoryProcessor:
                 return 0
             
             orphan_ids = []
-            for vid in all_ids[:100]:
-                record = self.sqlite.get_by_vector_id(vid)
-                if not record:
-                    orphan_ids.append(vid)
+            batch_size = 100
+            
+            for i in range(0, len(all_ids), batch_size):
+                batch_ids = all_ids[i:i + batch_size]
+                
+                for vid in batch_ids:
+                    metadata = self.vector_store.get_metadata(vid)
+                    
+                    if metadata and "sqlite_id" in metadata:
+                        sqlite_id = metadata["sqlite_id"]
+                        record = self.sqlite.get(sqlite_id)
+                        if not record:
+                            orphan_ids.append(vid)
+                    else:
+                        record = self.sqlite.get_by_vector_id(vid)
+                        if not record:
+                            orphan_ids.append(vid)
             
             if orphan_ids:
                 self.vector_store.delete(orphan_ids)
@@ -827,7 +858,9 @@ class AsyncMemoryProcessor:
                     sqlite_ids.append(existing_id)
                     vector_ids.append(pre_generated_id)
                     texts_to_vectorize.append(text)
-                    metadatas_to_vectorize.append(meta)
+                    meta_with_id = dict(meta) if meta else {}
+                    meta_with_id["sqlite_id"] = existing_id
+                    metadatas_to_vectorize.append(meta_with_id)
                 else:
                     pre_generated_id = str(uuid.uuid4())
                     from sqlite_store import MemoryRecord
@@ -847,7 +880,9 @@ class AsyncMemoryProcessor:
                     sqlite_ids.append(new_id)
                     vector_ids.append(record.vector_id)
                     texts_to_vectorize.append(record.text)
-                    metadatas_to_vectorize.append(record.metadata)
+                    meta_with_id = dict(record.metadata) if record.metadata else {}
+                    meta_with_id["sqlite_id"] = new_id
+                    metadatas_to_vectorize.append(meta_with_id)
         else:
             vector_ids = [str(uuid.uuid4()) for _ in texts]
             texts_to_vectorize = texts
@@ -1093,33 +1128,15 @@ class AsyncMemoryProcessor:
                     continue
                 
                 if record.metadata:
-                    if record.metadata.get("promoted_to_l2"):
-                        promoted_time_str = record.metadata.get("promoted_time")
-                        if promoted_time_str:
-                            try:
-                                promoted_time = datetime.fromisoformat(promoted_time_str)
-                                cooldown_end = promoted_time + timedelta(hours=cooldown_hours)
-                                if datetime.now() < cooldown_end:
-                                    self._log.debug("L2_TO_L3_COOLDOWN_PROMOTED", 
-                                                  record_id=record.id,
-                                                  remaining_hours=(cooldown_end - datetime.now()).total_seconds() / 3600)
-                                    continue
-                            except Exception:
-                                pass
+                    if MemoryTagHelper.is_in_cooldown_from_l2(record.metadata, cooldown_hours):
+                        self._log.debug("L2_TO_L3_COOLDOWN_PROMOTED", 
+                                      record_id=record.id)
+                        continue
                     
-                    if record.metadata.get("moved_from_l3"):
-                        moved_from_l3_time_str = record.metadata.get("moved_from_l3_time")
-                        if moved_from_l3_time_str:
-                            try:
-                                moved_from_l3_time = datetime.fromisoformat(moved_from_l3_time_str)
-                                cooldown_end = moved_from_l3_time + timedelta(hours=cooldown_hours * 2)
-                                if datetime.now() < cooldown_end:
-                                    self._log.debug("L2_TO_L3_COOLDOWN_MOVED_FROM_L3",
-                                                  record_id=record.id,
-                                                  remaining_hours=(cooldown_end - datetime.now()).total_seconds() / 3600)
-                                    continue
-                            except Exception:
-                                pass
+                    if MemoryTagHelper.is_in_cooldown_from_l3(record.metadata, cooldown_hours):
+                        self._log.debug("L2_TO_L3_COOLDOWN_MOVED_FROM_L3",
+                                      record_id=record.id)
+                        continue
                 
                 try:
                     self.sqlite.update_vector_status(record.id, record.vector_id, is_vectorized=3)
@@ -1128,20 +1145,7 @@ class AsyncMemoryProcessor:
                     
                     self.sqlite.update_vector_status(record.id, "", is_vectorized=0)
                     
-                    if not record.metadata:
-                        record.metadata = {}
-                    record.metadata["moved_from_l2"] = True
-                    record.metadata["moved_time"] = datetime.now().isoformat()
-                    
-                    if "promoted_to_l2" in record.metadata:
-                        del record.metadata["promoted_to_l2"]
-                        if "promoted_time" in record.metadata:
-                            del record.metadata["promoted_time"]
-                    
-                    if "moved_from_l3" in record.metadata:
-                        del record.metadata["moved_from_l3"]
-                        if "moved_from_l3_time" in record.metadata:
-                            del record.metadata["moved_from_l3_time"]
+                    record.metadata = MemoryTagHelper.mark_moved_to_l3(record.metadata)
                     
                     self.sqlite.add(record)
                     
@@ -1179,20 +1183,17 @@ class AsyncMemoryProcessor:
         
         跳过条件：
         1. 已有压缩文本（compressed_text存在）
-        2. metadata中标记为preserve=True（受保护）
-        3. metadata中标记为compressed=True（已压缩）
-        4. metadata中标记为promoted_from_l3=True（从L3回流，已压缩过）
+        2. metadata中标记为受保护
+        3. metadata中标记为已压缩
         """
         if record.compressed_text:
             return True
         
-        if record.metadata:
-            if record.metadata.get("preserve") is True:
-                return True
-            if record.metadata.get("compressed") is True:
-                return True
-            if record.metadata.get("promoted_from_l3") is True:
-                return True
+        if MemoryTagHelper.is_protected(record.metadata):
+            return True
+        
+        if MemoryTagHelper.is_compressed(record.metadata):
+            return True
         
         return False
     
@@ -1249,18 +1250,17 @@ class AsyncMemoryProcessor:
                         continue
                     
                     target_ratio = self._mem_config.compression.target_ratio
+                    original_length = len(record.text)
                     
                     compress_start = time.perf_counter()
                     compressed_text, strategy_name = self._compression_chain.compress(record.text)
                     compress_duration = (time.perf_counter() - compress_start) * 1000
                     
-                    if compressed_text and len(compressed_text) < len(record.text) * target_ratio:
+                    if compressed_text and len(compressed_text) < original_length * target_ratio:
                         record.compressed_text = compressed_text
-                        if not record.metadata:
-                            record.metadata = {}
-                        record.metadata["compressed"] = True
-                        record.metadata["compressed_time"] = datetime.now().isoformat()
-                        record.metadata["compression_strategy"] = strategy_name
+                        record.metadata = MemoryTagHelper.mark_compressed(
+                            record.metadata, strategy_name, original_length
+                        )
                         
                         if record.vector_id:
                             try:
@@ -1327,8 +1327,8 @@ class AsyncMemoryProcessor:
             moved_count = 0
             for record in high_weight_records:
                 try:
-                    if record.metadata and record.metadata.get("moved_from_l2"):
-                        moved_time_str = record.metadata.get("moved_time")
+                    if record.metadata and record.metadata.get(MemoryTags.MOVED_FROM_L2):
+                        moved_time_str = record.metadata.get(MemoryTags.MOVED_FROM_L2_TIME)
                         if moved_time_str:
                             try:
                                 moved_time = datetime.fromisoformat(moved_time_str)
@@ -1340,10 +1340,7 @@ class AsyncMemoryProcessor:
                     
                     self.sqlite.update_vector_status(record.id, "", is_vectorized=2)
                     
-                    if len(record.text) <= 1000:
-                        text_to_vectorize = record.text
-                    else:
-                        text_to_vectorize = record.compressed_text or record.text
+                    text_to_vectorize = record.text
                     
                     vector_ids = self.vector_store.add(
                         [text_to_vectorize],
@@ -1357,21 +1354,10 @@ class AsyncMemoryProcessor:
                             is_vectorized=1
                         )
                         
-                        if not record.metadata:
-                            record.metadata = {}
-                        record.metadata["promoted_to_l2"] = True
-                        record.metadata["promoted_time"] = datetime.now().isoformat()
-                        record.metadata["moved_from_l3"] = True
-                        record.metadata["moved_from_l3_time"] = datetime.now().isoformat()
-                        
-                        if "moved_from_l2" in record.metadata:
-                            del record.metadata["moved_from_l2"]
-                            if "moved_time" in record.metadata:
-                                del record.metadata["moved_time"]
-                        
-                        if record.compressed_text:
-                            record.metadata["promoted_from_l3"] = True
-                            record.metadata["compressed"] = True
+                        has_compressed = bool(record.compressed_text)
+                        record.metadata = MemoryTagHelper.mark_moved_to_l2(
+                            record.metadata, has_compressed
+                        )
                         
                         self.sqlite.add(record)
                         
@@ -1484,18 +1470,19 @@ class AsyncMemoryProcessor:
     
     def _mark_preserve(self, record: MemoryRecord):
         """标记记忆为保留（不压缩）"""
-        if not record.metadata:
-            record.metadata = {}
-        record.metadata["preserve"] = True
-        record.metadata["preserve_reason"] = "high_density_content"
+        record.metadata = MemoryTagHelper.mark_preserve(
+            record.metadata, "high_density_content"
+        )
         self.sqlite.add(record)
     
     def _mark_pending_compression(self, record: MemoryRecord):
         """标记记忆为待压缩"""
-        if not record.metadata:
-            record.metadata = {}
-        record.metadata["pending_compression"] = True
-        record.metadata["pending_since"] = datetime.now().isoformat()
+        retry_count = 0
+        if record.metadata:
+            retry_count = record.metadata.get(MemoryTags.RETRY_COUNT, 0)
+        record.metadata = MemoryTagHelper.mark_pending_compression(
+            record.metadata, retry_count
+        )
         self.sqlite.add(record)
     
     def _process_pending_compressions(self):
@@ -1524,9 +1511,7 @@ class AsyncMemoryProcessor:
             for record in pending_records:
                 try:
                     if self._should_skip_compression(record):
-                        if record.metadata:
-                            record.metadata.pop("pending_compression", None)
-                            record.metadata.pop("pending_since", None)
+                        record.metadata = MemoryTagHelper.clear_pending_compression(record.metadata)
                         self.sqlite.add(record)
                         skipped_count += 1
                         continue
@@ -1536,23 +1521,19 @@ class AsyncMemoryProcessor:
                         continue
                     
                     if len(record.text) < self._mem_config.compression.min_length:
-                        if record.metadata:
-                            record.metadata.pop("pending_compression", None)
-                            record.metadata.pop("pending_since", None)
+                        record.metadata = MemoryTagHelper.clear_pending_compression(record.metadata)
                         self.sqlite.add(record)
                         continue
                     
+                    original_length = len(record.text)
                     compressed_text, strategy_name = self._compression_chain.compress(record.text)
                     
-                    if compressed_text and len(compressed_text) < len(record.text) * self._mem_config.compression.target_ratio:
+                    if compressed_text and len(compressed_text) < original_length * self._mem_config.compression.target_ratio:
                         record.compressed_text = compressed_text
-                        if not record.metadata:
-                            record.metadata = {}
-                        record.metadata.pop("pending_compression", None)
-                        record.metadata.pop("pending_since", None)
-                        record.metadata["compressed"] = True
-                        record.metadata["compressed_time"] = datetime.now().isoformat()
-                        record.metadata["compression_strategy"] = strategy_name
+                        record.metadata = MemoryTagHelper.clear_pending_compression(record.metadata)
+                        record.metadata = MemoryTagHelper.mark_compressed(
+                            record.metadata, strategy_name, original_length
+                        )
                         self.sqlite.add(record)
                         compressed_count += 1
                         

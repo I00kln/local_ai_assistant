@@ -9,6 +9,7 @@ from typing import List, Dict, Tuple, Optional
 from dataclasses import dataclass
 from datetime import datetime
 from config import config
+from memory_tags import MemoryTags, MemoryTagHelper
 
 
 @dataclass
@@ -18,6 +19,7 @@ class FilterResult:
     reason: str
     confidence: float  # 0-1，越高越是废话
     storage_type: str = "full"  # "full"=存向量库, "sqlite_only"=仅存SQLite, "discard"=丢弃
+    metadata: Dict = None  # 额外元数据标签
 
 
 class NonsenseFilter:
@@ -114,32 +116,43 @@ class NonsenseFilter:
         self.nonsense_db_path = nonsense_db_path
         self.dimension = config.embedding_dimension
         
-        # 使用共享的 EmbeddingService
         self._embedding_service = None
         self._model_lock = threading.Lock()
+        self._ready_event = threading.Event()
         
-        # 加载废话库文本（不预计算向量）
         self.nonsense_texts: List[str] = []
         self.nonsense_vectors: Optional[np.ndarray] = None
         self._vectors_computed = False
         self._load_nonsense_library()
         
-        # 启动后台线程预计算向量（不阻塞主线程）
+        self._exact_hashes = self._build_exact_hashes()
+        
         self._start_vector_precompute_thread()
         
-        # 配置阈值
-        self.length_threshold = 10  # 字符数少于10进入深度检查
-        self.density_threshold = 0.15  # 信息密度阈值
-        self.similarity_threshold = 0.85  # 向量相似度阈值
+        self.length_threshold = 10
+        self.density_threshold = 0.15
+        self.similarity_threshold = 0.85
         
-        # 统计信息
         self.stats = {
             "total_checked": 0,
             "rule_filtered": 0,
+            "hash_filtered": 0,
             "density_filtered": 0,
             "vector_filtered": 0,
             "passed": 0
         }
+    
+    def _build_exact_hashes(self) -> set:
+        """构建高频废话的MD5哈希集合"""
+        import hashlib
+        hashes = set()
+        for text in self.nonsense_texts:
+            text_hash = hashlib.md5(text.strip().encode('utf-8')).hexdigest()
+            hashes.add(text_hash)
+        for text in self.NONSENSE_KEYWORDS:
+            text_hash = hashlib.md5(text.strip().encode('utf-8')).hexdigest()
+            hashes.add(text_hash)
+        return hashes
     
     def _ensure_model_loaded(self):
         """确保 EmbeddingService 已初始化"""
@@ -152,6 +165,7 @@ class NonsenseFilter:
             
             from embedding_service import get_embedding_service
             self._embedding_service = get_embedding_service()
+            self._ready_event.set()
     
     @property
     def tokenizer(self):
@@ -188,18 +202,13 @@ class NonsenseFilter:
         def compute_vectors_background():
             """后台计算向量"""
             try:
-                # 等待一段时间，让主线程完成初始化
-                import time
-                time.sleep(2)
+                self._ready_event.wait(timeout=30.0)
                 
-                # 确保模型已加载
                 self._ensure_model_loaded()
                 
-                # 如果模型加载失败，跳过向量计算
                 if not self._embedding_service.is_available:
                     return
                 
-                # 计算向量
                 vectors = []
                 for text in self.nonsense_texts:
                     try:
@@ -215,7 +224,6 @@ class NonsenseFilter:
             except Exception as e:
                 print(f"废话过滤器：后台向量计算失败: {e}")
         
-        # 启动后台线程
         thread = threading.Thread(target=compute_vectors_background, daemon=True)
         thread.start()
     
@@ -456,35 +464,45 @@ class NonsenseFilter:
         
         流程：
         0. 保护检查（防止误删重要内容）
-        1. 规则过滤（快速拦截90%明显废话）
-        2. 信息密度评分（语义层面）
-        3. 向量相似度匹配（精确匹配）
+        1. Hash快速匹配（毫秒级拦截高频废话）
+        2. 规则过滤（快速拦截90%明显废话）
+        3. 信息密度评分（语义层面）
+        4. 向量相似度匹配（精确匹配）
         
         存储策略：
         - full: 存入向量库+SQLite
         - sqlite_only: 仅存SQLite
         - discard: 完全丢弃
         """
+        import hashlib
         self.stats["total_checked"] += 1
         
-        # 合并对话内容
         combined_text = f"用户: {user_input}\n助理: {assistant_response}"
         
-        # 第0层：保护检查
         if self._check_protected(combined_text):
             self.stats["passed"] += 1
+            protected_metadata = MemoryTagHelper.mark_protected({}, "auto_detected_by_filter")
             return FilterResult(
                 is_nonsense=False,
                 reason="受保护内容（纠错/情感/重要信息）",
                 confidence=0.0,
-                storage_type="full"
+                storage_type="full",
+                metadata=protected_metadata
             )
         
-        # 第一层：规则过滤
+        text_hash = hashlib.md5(combined_text.strip().encode('utf-8')).hexdigest()
+        if text_hash in self._exact_hashes:
+            self.stats["hash_filtered"] += 1
+            return FilterResult(
+                is_nonsense=True,
+                reason="Hash精确匹配：高频废话",
+                confidence=0.99,
+                storage_type="discard"
+            )
+        
         is_nonsense, confidence = self._rule_filter(combined_text)
         if is_nonsense:
             self.stats["rule_filtered"] += 1
-            # 高置信度废话直接丢弃，低置信度仅存SQLite
             storage_type = "discard" if confidence > 0.9 else "sqlite_only"
             return FilterResult(
                 is_nonsense=True,

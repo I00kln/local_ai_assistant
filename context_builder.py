@@ -583,3 +583,65 @@ class ContextBuilder:
         processed_user_input = self._truncate_user_input(current_query, max_user_tokens)
         
         return memory_context, processed_user_input, skip_user
+    
+    def truncate_for_local_llm(
+        self, 
+        system_prompt: str, 
+        memory_context: str, 
+        user_input: str,
+        max_tokens: int = None
+    ) -> Tuple[str, str]:
+        """
+        为本地LLM截断内容以适应token限制
+        
+        将截断逻辑从UI层下沉到此处，确保：
+        1. 按段落/记忆条目颗粒度截断，而非硬切
+        2. 保留完整句子边界
+        3. 优先保留关键信息
+        
+        Args:
+            system_prompt: 系统提示词
+            memory_context: 记忆上下文
+            user_input: 用户输入
+            max_tokens: 最大token数（默认从config读取）
+        
+        Returns:
+            (截断后的记忆上下文, 截断后的用户输入)
+        """
+        if max_tokens is None:
+            max_tokens = self.max_context
+        
+        system_tokens = self._estimate_tokens(system_prompt)
+        user_tokens = self._estimate_tokens(user_input)
+        format_overhead = 50
+        
+        available_for_memory = max_tokens - system_tokens - user_tokens - self.max_output - format_overhead
+        available_for_memory = max(available_for_memory, 200)
+        
+        memory_tokens = self._estimate_tokens(memory_context)
+        
+        if memory_tokens <= available_for_memory:
+            return memory_context, user_input
+        
+        memory_items = memory_context.split('\n')
+        
+        selected_items = []
+        current_tokens = 0
+        
+        for item in memory_items:
+            if not item.strip():
+                continue
+            item_tokens = self._estimate_tokens(item) + 5
+            if current_tokens + item_tokens <= available_for_memory:
+                selected_items.append(item)
+                current_tokens += item_tokens
+            else:
+                break
+        
+        if selected_items:
+            truncated_memory = '\n'.join(selected_items)
+            truncated_memory += "\n...[内容已截断以适应token限制]"
+        else:
+            truncated_memory = self._smart_truncate(memory_context, available_for_memory)
+        
+        return truncated_memory, user_input

@@ -42,7 +42,7 @@ class AsyncProcessorConfig:
     queue_full_action: str = "drop_oldest"
     llm_timeout: int = 30
     circuit_breaker_threshold: int = 5
-    circuit_breaker_reset_timeout: int = 60
+    circuit_breaker_reset_timeout: int = 300
 
 
 @dataclass
@@ -313,7 +313,7 @@ class Config:
         self.async_processor.queue_full_action = os.environ.get("QUEUE_FULL_ACTION", "drop_oldest")
         self.async_processor.llm_timeout = int(os.environ.get("LLM_TIMEOUT", "30"))
         self.async_processor.circuit_breaker_threshold = int(os.environ.get("CIRCUIT_BREAKER_THRESHOLD", "5"))
-        self.async_processor.circuit_breaker_reset_timeout = int(os.environ.get("CIRCUIT_BREAKER_RESET_TIMEOUT", "60"))
+        self.async_processor.circuit_breaker_reset_timeout = int(os.environ.get("CIRCUIT_BREAKER_RESET_TIMEOUT", "300"))
     
     def _load_flow_config(self):
         """加载记忆流动配置"""

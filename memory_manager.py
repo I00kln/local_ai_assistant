@@ -132,73 +132,79 @@ class MemoryManager:
         if threshold is None:
             threshold = 0.0
         
-        if self._tx_coordinator.is_migration_active():
-            if not self._tx_coordinator.wait_for_migration(timeout=5.0):
-                self._log.warning("MIGRATION_TIMEOUT", message="检索可能在迁移期间看到不一致数据")
+        max_retries = 3
+        for attempt in range(max_retries):
+            start_version = self._write_version
+            
+            results = self._do_search(query, top_k, include_l3, threshold, include_l1)
+            
+            if self._write_version == start_version:
+                break
+            
+            self.stats["retry_reads"] += 1
         
-        try:
-            max_retries = 2
-            for attempt in range(max_retries):
-                start_version = self._write_version
-                
-                results = self._do_search(query, top_k, include_l3, threshold, include_l1)
-                
-                if self._write_version == start_version:
-                    return results
-                
-                self.stats["retry_reads"] += 1
-            
-            return results
-        finally:
-            self._tx_coordinator.release_migration_wait()
-            
-            duration_ms = (time.perf_counter() - start_time) * 1000
-            metrics = get_metrics_collector()
-            metrics.record_retrieval_latency(duration_ms)
-            metrics.record_retrieval_hits(
-                self.stats.get("l1_hits", 0),
-                self.stats.get("l2_hits", 0),
-                self.stats.get("l3_hits", 0)
-            )
+        duration_ms = (time.perf_counter() - start_time) * 1000
+        metrics = get_metrics_collector()
+        metrics.record_retrieval_latency(duration_ms)
+        metrics.record_retrieval_hits(
+            self.stats.get("l1_hits", 0),
+            self.stats.get("l2_hits", 0),
+            self.stats.get("l3_hits", 0)
+        )
+        
+        return results
     
     def _do_search(self, query: str, top_k: int, include_l3: bool, threshold: float, include_l1: bool) -> List[MemorySearchResult]:
-        """实际执行搜索（内部方法）"""
+        """
+        实际执行搜索（内部方法）
+        
+        优化：使用超额采样 + 内存重排策略
+        1. 扩大召回范围（top_k * 3）
+        2. 在内存中结合时间衰减、权重等因素重新打分
+        3. 最后截断输出最终的Top-K
+        """
         results = []
         seen_texts = set()
         
         time_context = self._detect_time_context(query)
         
+        recall_multiplier = 3
+        recall_limit = top_k * recall_multiplier
+        
         if include_l1:
-            l1_results = self._search_l1(query, top_k, threshold)
+            l1_results = self._search_l1(query, recall_limit, threshold)
             for r in l1_results:
                 if r.text not in seen_texts:
                     seen_texts.add(r.text)
+                    r.combined_score = r.similarity * r.weight
                     results.append(r)
             self.stats["l1_hits"] += len(l1_results)
         
-        if len(results) < top_k:
-            remaining = top_k - len(results)
+        if len(results) < recall_limit:
+            remaining = recall_limit - len(results)
             l2_results = self._search_l2(query, remaining)
             for r in l2_results:
                 if r.text not in seen_texts:
                     seen_texts.add(r.text)
-                    r.similarity = self._apply_time_decay(r, time_context)
+                    time_decay = self._apply_time_decay(r, time_context)
+                    r.combined_score = time_decay * r.weight
                     results.append(r)
         self.stats["l2_hits"] += len(l2_results)
         
-        if include_l3 and len(results) < top_k and config.sqlite_enabled:
-            remaining = top_k - len(results)
+        if include_l3 and len(results) < recall_limit and config.sqlite_enabled:
+            remaining = recall_limit - len(results)
             l3_results = self._search_l3(query, remaining)
             for r in l3_results:
                 if r.text not in seen_texts:
                     seen_texts.add(r.text)
-                    r.similarity = self._apply_time_decay(r, time_context)
+                    time_decay = self._apply_time_decay(r, time_context)
+                    r.combined_score = time_decay * r.weight
                     results.append(r)
             
             for result in l3_results:
                 self._backfill_to_l2(result)
         
-        results.sort(key=lambda x: x.similarity * x.weight, reverse=True)
+        results.sort(key=lambda x: x.combined_score, reverse=True)
         
         filtered_results = [r for r in results if r.similarity >= threshold]
         
@@ -437,6 +443,8 @@ class MemoryManager:
         """
         搜索L3数据库
         
+        优化：直接使用FTS5的BM25分数，移除Python层冗余的字符串匹配
+        
         对于 sqlite_only 记录（is_vectorized=-1）：
         - 降低权重（乘以 0.5）
         - 标记来源为 L3_SQLITE_ONLY
@@ -444,19 +452,10 @@ class MemoryManager:
         results = []
         
         try:
-            query_lower = query.lower()
-            query_keywords = set(query_lower.split())
-            
-            l3_results = self.sqlite.search(query, limit=top_k * 3)
+            l3_results = self.sqlite.search(query, limit=top_k * 2)
             
             for record in l3_results:
                 text = record.compressed_text or record.text
-                text_lower = text.lower()
-                
-                similarity = self._calculate_text_similarity(query_lower, text_lower, query_keywords)
-                
-                if similarity < 0.3:
-                    continue
                 
                 is_sqlite_only = (record.is_vectorized == -1)
                 
@@ -466,6 +465,8 @@ class MemoryManager:
                 if is_sqlite_only:
                     weight *= 0.5
                     source = "L3_LOW_QUALITY"
+                
+                similarity = min(1.0, record.weight / 2.0)
                 
                 results.append(MemorySearchResult(
                     text=text,

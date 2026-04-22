@@ -23,6 +23,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Any
 from pathlib import Path
+from memory_tags import MemoryTags
 
 
 @dataclass
@@ -153,20 +154,22 @@ class MemoryArchiver:
             with sqlite_store._get_connection() as conn:
                 cursor = conn.cursor()
                 
-                cursor.execute("""
+                cursor.execute(f"""
                     SELECT id, text, compressed_text, source, weight, 
                            access_count, created_time, metadata
                     FROM memories
                     WHERE created_time < ?
                     AND weight < ?
                     AND is_archived = 0
-                    AND (metadata IS NULL OR metadata NOT LIKE '%"important"%')
-                    AND (metadata IS NULL OR metadata NOT LIKE '%"protected"%')
+                    AND (metadata IS NULL OR metadata NOT LIKE ?)
+                    AND (metadata IS NULL OR metadata NOT LIKE ?)
                     ORDER BY weight ASC, created_time ASC
                     LIMIT ?
                 """, (
                     threshold_time,
                     self.config.archive_weight_threshold,
+                    f'%"{MemoryTags.IMPORTANT}"%',
+                    f'%"{MemoryTags.PROTECTED}"%',
                     self.config.max_archive_size
                 ))
                 

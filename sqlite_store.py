@@ -24,8 +24,8 @@ class MemoryRecord:
     last_access_time: Optional[str] = None
     created_time: Optional[str] = None
     metadata: Dict[str, Any] = None
-    vector_id: Optional[str] = None  # ChromaDB中的文档ID
-    is_vectorized: int = 0  # 0=未向量化, 1=已向量化, -1=向量化失败
+    vector_id: Optional[str] = None
+    is_vectorized: int = 0
     
     def __post_init__(self):
         if self.created_time is None:
@@ -45,6 +45,11 @@ class SQLiteStore:
     - 权重管理（访问增加权重，时间降低权重）
     - 定期遗忘机制
     - 全文搜索支持
+    
+    并发策略：
+    - 使用 threading.local() 为每个线程维护独立连接
+    - WAL 模式下读操作可并发执行
+    - 仅写操作使用互斥锁保护
     """
     
     WEIGHT_DECAY_RATE = 0.95
@@ -61,12 +66,48 @@ class SQLiteStore:
     
     def __init__(self, db_path: str = "memory.db"):
         self.db_path = db_path
-        self.lock = threading.RLock()
-        self._connection = None
-        self._connection_lock = threading.Lock()
+        self._write_lock = threading.Lock()
+        self._local = threading.local()
         self._last_cleanup = datetime.now()
         self._integrity_checked = False
         self._init_database()
+    
+    def _get_read_connection(self):
+        """
+        获取读连接（线程本地，无需锁）
+        
+        WAL 模式下，多个读连接可以并发执行
+        """
+        if not hasattr(self._local, 'read_conn') or self._local.read_conn is None:
+            self._local.read_conn = sqlite3.connect(
+                self.db_path,
+                timeout=30.0,
+                check_same_thread=False
+            )
+            self._local.read_conn.row_factory = sqlite3.Row
+            self._local.read_conn.execute("PRAGMA journal_mode=WAL")
+            self._local.read_conn.execute("PRAGMA synchronous=NORMAL")
+            self._local.read_conn.execute("PRAGMA cache_size=-64000")
+            self._local.read_conn.execute("PRAGMA busy_timeout=30000")
+        return self._local.read_conn
+    
+    @contextmanager
+    def _get_write_connection(self):
+        """
+        获取写连接（需要锁保护）
+        
+        写操作需要互斥锁保护，确保数据一致性
+        """
+        with self._write_lock:
+            conn = self._get_read_connection()
+            try:
+                yield conn
+            except sqlite3.Error as e:
+                try:
+                    conn.rollback()
+                except:
+                    pass
+                raise
     
     def _check_integrity(self) -> bool:
         """
@@ -137,52 +178,6 @@ class SQLiteStore:
         except Exception as e:
             print(f"[警告] 创建备份失败: {e}")
     
-    @contextmanager
-    def _get_connection(self):
-        """
-        获取数据库连接（单一长连接模式）
-        
-        使用 check_same_thread=False 的单一长连接：
-        - WAL 模式下 SQLite 原生支持并发读写
-        - 避免跨线程关闭连接的危险操作
-        - 使用锁保护并发访问
-        
-        线程安全：
-        - 使用 _connection_lock 保护连接获取
-        - 自动重连机制
-        """
-        with self._connection_lock:
-            current_time = datetime.now()
-            
-            if self._connection is not None:
-                try:
-                    self._connection.execute("SELECT 1")
-                    yield self._connection
-                    return
-                except sqlite3.Error:
-                    self._connection = None
-            
-            self._connection = sqlite3.connect(
-                self.db_path,
-                timeout=30.0,
-                check_same_thread=False
-            )
-            self._connection.row_factory = sqlite3.Row
-            
-            self._connection.execute("PRAGMA journal_mode=WAL")
-            self._connection.execute("PRAGMA synchronous=NORMAL")
-            self._connection.execute("PRAGMA cache_size=-64000")
-            self._connection.execute("PRAGMA busy_timeout=30000")
-            
-            try:
-                yield self._connection
-            except sqlite3.Error as e:
-                try:
-                    self._connection.rollback()
-                except:
-                    pass
-                raise
-    
     def _init_database(self):
         """
         初始化数据库表结构
@@ -211,7 +206,7 @@ class SQLiteStore:
                     self._rebuild_database()
         
         try:
-            with self._get_connection() as conn:
+            with self._get_write_connection() as conn:
                 cursor = conn.cursor()
                 
                 cursor.execute("""
@@ -270,9 +265,7 @@ class SQLiteStore:
                 shutil.move(self.db_path, corrupt_path)
                 print(f"[备份] 损坏数据库已保存为: {corrupt_path}")
             
-            self._connection = None
-            
-            with self._get_connection() as conn:
+            with self._get_write_connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute("""
                     CREATE TABLE IF NOT EXISTS memories (
@@ -410,74 +403,72 @@ class SQLiteStore:
     
     def add(self, record: MemoryRecord) -> int:
         """添加记忆记录"""
-        with self.lock:
-            with self._get_connection() as conn:
-                cursor = conn.cursor()
-                cursor.execute("""
-                    INSERT INTO memories 
-                    (text, compressed_text, source, weight, access_count, 
-                     last_access_time, created_time, metadata, vector_id, is_vectorized)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    record.text,
-                    record.compressed_text,
-                    record.source,
-                    record.weight,
-                    record.access_count,
-                    record.last_access_time,
-                    record.created_time,
-                    json.dumps(record.metadata, ensure_ascii=False),
-                    record.vector_id,
-                    record.is_vectorized
-                ))
-                conn.commit()
-                return cursor.lastrowid
+        with self._get_write_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO memories 
+                (text, compressed_text, source, weight, access_count, 
+                 last_access_time, created_time, metadata, vector_id, is_vectorized)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                record.text,
+                record.compressed_text,
+                record.source,
+                record.weight,
+                record.access_count,
+                record.last_access_time,
+                record.created_time,
+                json.dumps(record.metadata, ensure_ascii=False),
+                record.vector_id,
+                record.is_vectorized
+            ))
+            conn.commit()
+            return cursor.lastrowid
     
     def add_batch(self, records: List[MemoryRecord]) -> List[int]:
         """批量添加记忆（优化版：使用 executemany）"""
         if not records:
             return []
         
-        with self.lock:
-            with self._get_connection() as conn:
-                cursor = conn.cursor()
-                
-                cursor.execute("SELECT MAX(id) FROM memories")
-                max_id_before = cursor.fetchone()[0] or 0
-                
-                data = [(
-                    record.text,
-                    record.compressed_text,
-                    record.source,
-                    record.weight,
-                    record.access_count,
-                    record.last_access_time,
-                    record.created_time,
-                    json.dumps(record.metadata, ensure_ascii=False),
-                    record.vector_id,
-                    record.is_vectorized
-                ) for record in records]
-                
-                cursor.executemany("""
-                    INSERT INTO memories 
-                    (text, compressed_text, source, weight, access_count, 
-                     last_access_time, created_time, metadata, vector_id, is_vectorized)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, data)
-                
-                conn.commit()
-                
-                return list(range(max_id_before + 1, max_id_before + 1 + len(records)))
+        with self._get_write_connection() as conn:
+            cursor = conn.cursor()
+            
+            cursor.execute("SELECT MAX(id) FROM memories")
+            max_id_before = cursor.fetchone()[0] or 0
+            
+            data = [(
+                record.text,
+                record.compressed_text,
+                record.source,
+                record.weight,
+                record.access_count,
+                record.last_access_time,
+                record.created_time,
+                json.dumps(record.metadata, ensure_ascii=False),
+                record.vector_id,
+                record.is_vectorized
+            ) for record in records]
+            
+            cursor.executemany("""
+                INSERT INTO memories 
+                (text, compressed_text, source, weight, access_count, 
+                 last_access_time, created_time, metadata, vector_id, is_vectorized)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, data)
+            
+            conn.commit()
+            
+            return list(range(max_id_before + 1, max_id_before + 1 + len(records)))
     
     def get(self, record_id: int) -> Optional[MemoryRecord]:
         """根据ID获取记录"""
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT * FROM memories WHERE id = ?", (record_id,))
-            row = cursor.fetchone()
-            if row:
-                return self._row_to_record(row)
-            return None
+        conn = self._get_read_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM memories WHERE id = ?", (record_id,))
+        row = cursor.fetchone()
+        if row:
+            return self._row_to_record(row)
+        return None
     
     def search(self, query: str, limit: int = 10, min_weight: float = 0.0) -> List[MemoryRecord]:
         """
@@ -485,25 +476,24 @@ class SQLiteStore:
         
         使用FTS5进行全文搜索，返回匹配的记忆
         """
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            
-            # 使用FTS5全文搜索
-            cursor.execute("""
-                SELECT m.* FROM memories m
-                JOIN memories_fts fts ON m.id = fts.rowid
-                WHERE memories_fts MATCH ?
-                AND m.weight >= ?
-                AND m.is_archived = 0
-                ORDER BY m.weight DESC, bm25(memories_fts) ASC
-                LIMIT ?
-            """, (query, min_weight, limit))
-            
-            results = []
-            for row in cursor.fetchall():
-                results.append(self._row_to_record(row))
-            
-            return results
+        conn = self._get_read_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute("""
+            SELECT m.* FROM memories m
+            JOIN memories_fts fts ON m.id = fts.rowid
+            WHERE memories_fts MATCH ?
+            AND m.weight >= ?
+            AND m.is_archived = 0
+            ORDER BY m.weight DESC, bm25(memories_fts) ASC
+            LIMIT ?
+        """, (query, min_weight, limit))
+        
+        results = []
+        for row in cursor.fetchall():
+            results.append(self._row_to_record(row))
+        
+        return results
     
     def search_by_keywords(self, keywords: List[str], limit: int = 10) -> List[MemoryRecord]:
         """
@@ -511,32 +501,31 @@ class SQLiteStore:
         
         使用LIKE进行模糊匹配
         """
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            
-            # 构建LIKE查询
-            conditions = []
-            params = []
-            for kw in keywords:
-                conditions.append("(text LIKE ? OR compressed_text LIKE ?)")
-                params.extend([f"%{kw}%", f"%{kw}%"])
-            
-            query = f"""
-                SELECT * FROM memories 
-                WHERE ({' OR '.join(conditions)})
-                AND is_archived = 0
-                ORDER BY weight DESC, last_access_time DESC
-                LIMIT ?
-            """
-            params.append(limit)
-            
-            cursor.execute(query, params)
-            
-            results = []
-            for row in cursor.fetchall():
-                results.append(self._row_to_record(row))
-            
-            return results
+        conn = self._get_read_connection()
+        cursor = conn.cursor()
+        
+        conditions = []
+        params = []
+        for kw in keywords:
+            conditions.append("(text LIKE ? OR compressed_text LIKE ?)")
+            params.extend([f"%{kw}%", f"%{kw}%"])
+        
+        query = f"""
+            SELECT * FROM memories 
+            WHERE ({' OR '.join(conditions)})
+            AND is_archived = 0
+            ORDER BY weight DESC, last_access_time DESC
+            LIMIT ?
+        """
+        params.append(limit)
+        
+        cursor.execute(query, params)
+        
+        results = []
+        for row in cursor.fetchall():
+            results.append(self._row_to_record(row))
+        
+        return results
     
     def update_weight(self, record_id: int, delta: float = None, boost: bool = False):
         """
@@ -547,29 +536,26 @@ class SQLiteStore:
             delta: 权重变化量（正数增加，负数减少）
             boost: 是否为访问提升（使用固定提升比例）
         """
-        with self.lock:
-            with self._get_connection() as conn:
-                cursor = conn.cursor()
-                
-                if boost:
-                    # 访问提升：增加权重并更新访问时间
-                    cursor.execute("""
-                        UPDATE memories 
-                        SET weight = MIN(?, weight * ?),
-                            access_count = access_count + 1,
-                            last_access_time = ?
-                        WHERE id = ?
-                    """, (self.MAX_WEIGHT, self.WEIGHT_BOOST_ON_ACCESS, 
-                          datetime.now().isoformat(), record_id))
-                else:
-                    # 手动调整
-                    cursor.execute("""
-                        UPDATE memories 
-                        SET weight = MAX(0, MIN(?, weight + ?))
-                        WHERE id = ?
-                    """, (self.MAX_WEIGHT, delta or 0, record_id))
-                
-                conn.commit()
+        with self._get_write_connection() as conn:
+            cursor = conn.cursor()
+            
+            if boost:
+                cursor.execute("""
+                    UPDATE memories 
+                    SET weight = MIN(?, weight * ?),
+                        access_count = access_count + 1,
+                        last_access_time = ?
+                    WHERE id = ?
+                """, (self.MAX_WEIGHT, self.WEIGHT_BOOST_ON_ACCESS, 
+                      datetime.now().isoformat(), record_id))
+            else:
+                cursor.execute("""
+                    UPDATE memories 
+                    SET weight = MAX(0, MIN(?, weight + ?))
+                    WHERE id = ?
+                """, (self.MAX_WEIGHT, delta or 0, record_id))
+            
+            conn.commit()
     
     def decay_weights(self, days_threshold: int = None, batch_size: int = 1000) -> Dict[str, Any]:
         """
@@ -601,88 +587,87 @@ class SQLiteStore:
         total_forgotten = 0
         all_vector_ids_to_delete = []
         
-        with self.lock:
-            with self._get_connection() as conn:
-                cursor = conn.cursor()
-                
-                threshold_time = (datetime.now() - timedelta(days=days_threshold)).isoformat()
-                
-                while True:
-                    cursor.execute("""
-                        UPDATE memories 
-                        SET weight = weight * ?
-                        WHERE id IN (
-                            SELECT id FROM memories 
-                            WHERE created_time < ?
-                            AND is_archived = 0
-                            AND weight > ?
-                            AND (metadata IS NULL OR metadata NOT LIKE '%"important"%')
-                            LIMIT ?
-                        )
-                    """, (self.WEIGHT_DECAY_RATE, threshold_time, 
-                          self.MIN_WEIGHT_THRESHOLD, batch_size))
-                    
-                    batch_decayed = cursor.rowcount
-                    total_decayed += batch_decayed
-                    
-                    if batch_decayed < batch_size:
-                        break
-                
-                while True:
-                    cursor.execute("""
-                        SELECT id, vector_id FROM memories 
-                        WHERE weight < ?
+        with self._get_write_connection() as conn:
+            cursor = conn.cursor()
+            
+            threshold_time = (datetime.now() - timedelta(days=days_threshold)).isoformat()
+            
+            while True:
+                cursor.execute("""
+                    UPDATE memories 
+                    SET weight = weight * ?
+                    WHERE id IN (
+                        SELECT id FROM memories 
+                        WHERE created_time < ?
                         AND is_archived = 0
-                        AND is_vectorized = 1
-                        AND vector_id IS NOT NULL
-                        AND vector_id != ''
+                        AND weight > ?
                         AND (metadata IS NULL OR metadata NOT LIKE '%"important"%')
                         LIMIT ?
-                    """, (self.MIN_WEIGHT_THRESHOLD, batch_size))
-                    
-                    rows = cursor.fetchall()
-                    if not rows:
-                        break
-                    
-                    ids_to_delete = [row[0] for row in rows]
-                    vector_ids = [row[1] for row in rows if row[1]]
-                    all_vector_ids_to_delete.extend(vector_ids)
-                    
-                    placeholders = ",".join("?" * len(ids_to_delete))
-                    cursor.execute(f"""
-                        DELETE FROM memories 
-                        WHERE id IN ({placeholders})
-                    """, ids_to_delete)
-                    
-                    total_forgotten += len(ids_to_delete)
+                    )
+                """, (self.WEIGHT_DECAY_RATE, threshold_time, 
+                      self.MIN_WEIGHT_THRESHOLD, batch_size))
                 
-                conn.commit()
+                batch_decayed = cursor.rowcount
+                total_decayed += batch_decayed
                 
-                if total_decayed > 0 or total_forgotten > 0:
-                    print(f"权重衰减完成: {total_decayed} 条记忆衰减, {total_forgotten} 条记忆遗忘")
+                if batch_decayed < batch_size:
+                    break
+            
+            while True:
+                cursor.execute("""
+                    SELECT id, vector_id FROM memories 
+                    WHERE weight < ?
+                    AND is_archived = 0
+                    AND is_vectorized = 1
+                    AND vector_id IS NOT NULL
+                    AND vector_id != ''
+                    AND (metadata IS NULL OR metadata NOT LIKE '%"important"%')
+                    LIMIT ?
+                """, (self.MIN_WEIGHT_THRESHOLD, batch_size))
                 
-                return {
-                    "decayed": total_decayed,
-                    "forgotten": total_forgotten,
-                    "vector_ids_to_delete": all_vector_ids_to_delete
-                }
+                rows = cursor.fetchall()
+                if not rows:
+                    break
+                
+                ids_to_delete = [row[0] for row in rows]
+                vector_ids = [row[1] for row in rows if row[1]]
+                all_vector_ids_to_delete.extend(vector_ids)
+                
+                placeholders = ",".join("?" * len(ids_to_delete))
+                cursor.execute(f"""
+                    DELETE FROM memories 
+                    WHERE id IN ({placeholders})
+                """, ids_to_delete)
+                
+                total_forgotten += len(ids_to_delete)
+            
+            conn.commit()
+            
+            if total_decayed > 0 or total_forgotten > 0:
+                print(f"权重衰减完成: {total_decayed} 条记忆衰减, {total_forgotten} 条记忆遗忘")
+            
+            return {
+                "decayed": total_decayed,
+                "forgotten": total_forgotten,
+                "vector_ids_to_delete": all_vector_ids_to_delete
+            }
     
     def get_low_weight_memories(self, threshold: float = None, limit: int = 100) -> List[MemoryRecord]:
         """获取低权重记忆（准备遗忘或压缩）"""
         if threshold is None:
             threshold = self.MIN_WEIGHT_THRESHOLD * 2
         
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("""
-                SELECT * FROM memories 
-                WHERE weight < ?
-                AND is_archived = 0
-                ORDER BY weight ASC, last_access_time ASC
-                LIMIT ?
-            """, (threshold, limit))
-            
-            return [self._row_to_record(row) for row in cursor.fetchall()]
+        conn = self._get_read_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT * FROM memories 
+            WHERE weight < ?
+            AND is_archived = 0
+            ORDER BY weight ASC, last_access_time ASC
+            LIMIT ?
+        """, (threshold, limit))
+        
+        return [self._row_to_record(row) for row in cursor.fetchall()]
     
     def get_high_weight_memories(self, threshold: float = None, limit: int = 50) -> List[MemoryRecord]:
         """
@@ -698,19 +683,19 @@ class SQLiteStore:
         
         recent_time = (datetime.now() - timedelta(days=7)).isoformat()
         
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("""
-                SELECT * FROM memories 
-                WHERE weight >= ?
-                AND last_access_time > ?
-                AND is_vectorized = 0
-                AND is_archived = 0
-                ORDER BY weight DESC, last_access_time DESC
-                LIMIT ?
-            """, (threshold, recent_time, limit))
-            
-            return [self._row_to_record(row) for row in cursor.fetchall()]
+        conn = self._get_read_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT * FROM memories 
+            WHERE weight >= ?
+            AND last_access_time > ?
+            AND is_vectorized = 0
+            AND is_archived = 0
+            ORDER BY weight DESC, last_access_time DESC
+            LIMIT ?
+        """, (threshold, recent_time, limit))
+        
+        return [self._row_to_record(row) for row in cursor.fetchall()]
     
     def get_upgradeable_sqlite_only(self, threshold: float = None, limit: int = 20) -> List[MemoryRecord]:
         """
@@ -729,35 +714,35 @@ class SQLiteStore:
         
         recent_time = (datetime.now() - timedelta(days=7)).isoformat()
         
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("""
-                SELECT * FROM memories 
-                WHERE weight >= ?
-                AND last_access_time > ?
-                AND is_vectorized = -1
-                AND is_archived = 0
-                ORDER BY weight DESC, last_access_time DESC
-                LIMIT ?
-            """, (threshold, recent_time, limit))
-            
-            return [self._row_to_record(row) for row in cursor.fetchall()]
+        conn = self._get_read_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT * FROM memories 
+            WHERE weight >= ?
+            AND last_access_time > ?
+            AND is_vectorized = -1
+            AND is_archived = 0
+            ORDER BY weight DESC, last_access_time DESC
+            LIMIT ?
+        """, (threshold, recent_time, limit))
+        
+        return [self._row_to_record(row) for row in cursor.fetchall()]
     
     def get_unaccessed_memories(self, days: int = 7, limit: int = 100) -> List[MemoryRecord]:
         """获取长时间未访问的记忆"""
         threshold_time = (datetime.now() - timedelta(days=days)).isoformat()
         
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("""
-                SELECT * FROM memories 
-                WHERE last_access_time < ?
-                AND is_archived = 0
-                ORDER BY last_access_time ASC
-                LIMIT ?
-            """, (threshold_time, limit))
-            
-            return [self._row_to_record(row) for row in cursor.fetchall()]
+        conn = self._get_read_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT * FROM memories 
+            WHERE last_access_time < ?
+            AND is_archived = 0
+            ORDER BY last_access_time ASC
+            LIMIT ?
+        """, (threshold_time, limit))
+        
+        return [self._row_to_record(row) for row in cursor.fetchall()]
     
     def mark_important(self, record_id: int, important: bool = True):
         """
@@ -765,103 +750,94 @@ class SQLiteStore:
         
         重要记忆不会被权重衰减或遗忘
         """
-        with self.lock:
-            with self._get_connection() as conn:
-                cursor = conn.cursor()
+        with self._get_write_connection() as conn:
+            cursor = conn.cursor()
+            
+            cursor.execute("SELECT metadata FROM memories WHERE id = ?", (record_id,))
+            row = cursor.fetchone()
+            
+            if row:
+                metadata = json.loads(row[0]) if row[0] else {}
+                tags = metadata.get("tags", [])
                 
-                cursor.execute("SELECT metadata FROM memories WHERE id = ?", (record_id,))
-                row = cursor.fetchone()
+                if important:
+                    if "important" not in tags:
+                        tags.append("important")
+                else:
+                    if "important" in tags:
+                        tags.remove("important")
                 
-                if row:
-                    metadata = json.loads(row[0]) if row[0] else {}
-                    tags = metadata.get("tags", [])
-                    
-                    if important:
-                        if "important" not in tags:
-                            tags.append("important")
-                    else:
-                        if "important" in tags:
-                            tags.remove("important")
-                    
-                    metadata["tags"] = tags
-                    
-                    cursor.execute("""
-                        UPDATE memories SET metadata = ? WHERE id = ?
-                    """, (json.dumps(metadata, ensure_ascii=False), record_id))
-                    conn.commit()
-                    
-                    return True
-                return False
+                metadata["tags"] = tags
+                
+                cursor.execute("""
+                    UPDATE memories SET metadata = ? WHERE id = ?
+                """, (json.dumps(metadata, ensure_ascii=False), record_id))
+                conn.commit()
+                
+                return True
+            return False
     
     def archive_memory(self, record_id: int):
         """归档记忆（软删除）"""
-        with self.lock:
-            with self._get_connection() as conn:
-                cursor = conn.cursor()
-                cursor.execute("""
-                    UPDATE memories SET is_archived = 1 WHERE id = ?
-                """, (record_id,))
-                conn.commit()
+        with self._get_write_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                UPDATE memories SET is_archived = 1 WHERE id = ?
+            """, (record_id,))
+            conn.commit()
     
     def delete_memory(self, record_id: int):
         """永久删除记忆"""
-        with self.lock:
-            with self._get_connection() as conn:
-                cursor = conn.cursor()
-                cursor.execute("DELETE FROM memories WHERE id = ?", (record_id,))
-                conn.commit()
+        with self._get_write_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM memories WHERE id = ?", (record_id,))
+            conn.commit()
     
     def get_stats(self) -> Dict[str, Any]:
         """获取数据库统计信息"""
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            
-            # 总记录数
-            cursor.execute("SELECT COUNT(*) FROM memories WHERE is_archived = 0")
-            total_count = cursor.fetchone()[0]
-            
-            # 平均权重
-            cursor.execute("SELECT AVG(weight) FROM memories WHERE is_archived = 0")
-            avg_weight = cursor.fetchone()[0] or 0
-            
-            # 高权重记忆数
-            cursor.execute("""
-                SELECT COUNT(*) FROM memories 
-                WHERE weight > 2.0 AND is_archived = 0
-            """)
-            high_weight_count = cursor.fetchone()[0]
-            
-            # 低权重记忆数
-            cursor.execute("""
-                SELECT COUNT(*) FROM memories 
-                WHERE weight < ? AND is_archived = 0
-            """, (self.MIN_WEIGHT_THRESHOLD * 2,))
-            low_weight_count = cursor.fetchone()[0]
-            
-            # 最近访问
-            cursor.execute("""
-                SELECT COUNT(*) FROM memories 
-                WHERE last_access_time > ?
-                AND is_archived = 0
-            """, ((datetime.now() - timedelta(days=1)).isoformat(),))
-            recent_access_count = cursor.fetchone()[0]
-            
-            return {
-                "total_count": total_count,
-                "avg_weight": round(avg_weight, 3),
-                "high_weight_count": high_weight_count,
-                "low_weight_count": low_weight_count,
-                "recent_access_count": recent_access_count,
-                "db_size_mb": round(os.path.getsize(self.db_path) / 1024 / 1024, 2) 
-                              if os.path.exists(self.db_path) else 0
-            }
+        conn = self._get_read_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute("SELECT COUNT(*) FROM memories WHERE is_archived = 0")
+        total_count = cursor.fetchone()[0]
+        
+        cursor.execute("SELECT AVG(weight) FROM memories WHERE is_archived = 0")
+        avg_weight = cursor.fetchone()[0] or 0
+        
+        cursor.execute("""
+            SELECT COUNT(*) FROM memories 
+            WHERE weight > 2.0 AND is_archived = 0
+        """)
+        high_weight_count = cursor.fetchone()[0]
+        
+        cursor.execute("""
+            SELECT COUNT(*) FROM memories 
+            WHERE weight < ? AND is_archived = 0
+        """, (self.MIN_WEIGHT_THRESHOLD * 2,))
+        low_weight_count = cursor.fetchone()[0]
+        
+        cursor.execute("""
+            SELECT COUNT(*) FROM memories 
+            WHERE last_access_time > ?
+            AND is_archived = 0
+        """, ((datetime.now() - timedelta(days=1)).isoformat(),))
+        recent_access_count = cursor.fetchone()[0]
+        
+        return {
+            "total_count": total_count,
+            "avg_weight": round(avg_weight, 3),
+            "high_weight_count": high_weight_count,
+            "low_weight_count": low_weight_count,
+            "recent_access_count": recent_access_count,
+            "db_size_mb": round(os.path.getsize(self.db_path) / 1024 / 1024, 2) 
+                          if os.path.exists(self.db_path) else 0
+        }
     
     def vacuum(self):
         """清理数据库碎片"""
-        with self.lock:
-            with self._get_connection() as conn:
-                conn.execute("VACUUM")
-                print("数据库清理完成")
+        with self._get_write_connection() as conn:
+            conn.execute("VACUUM")
+            print("数据库清理完成")
     
     def _row_to_record(self, row: sqlite3.Row) -> MemoryRecord:
         """将数据库行转换为MemoryRecord"""
@@ -895,15 +871,14 @@ class SQLiteStore:
             vector_id: ChromaDB中的文档ID
             is_vectorized: 向量化状态 (1=成功, -1=失败, 0=未处理)
         """
-        with self.lock:
-            with self._get_connection() as conn:
-                cursor = conn.cursor()
-                cursor.execute("""
-                    UPDATE memories 
-                    SET vector_id = ?, is_vectorized = ?
-                    WHERE id = ?
-                """, (vector_id, is_vectorized, record_id))
-                conn.commit()
+        with self._get_write_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                UPDATE memories 
+                SET vector_id = ?, is_vectorized = ?
+                WHERE id = ?
+            """, (vector_id, is_vectorized, record_id))
+            conn.commit()
     
     def get_unvectorized(self, limit: int = 50) -> List[MemoryRecord]:
         """
@@ -913,16 +888,16 @@ class SQLiteStore:
         - is_vectorized=0: 未处理
         - is_vectorized=2: 迁移中断，需要恢复
         """
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("""
-                SELECT * FROM memories 
-                WHERE is_vectorized IN (0, 2)
-                AND is_archived = 0
-                ORDER BY created_time DESC
-                LIMIT ?
-            """, (limit,))
-            return [self._row_to_record(row) for row in cursor.fetchall()]
+        conn = self._get_read_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT * FROM memories 
+            WHERE is_vectorized IN (0, 2)
+            AND is_archived = 0
+            ORDER BY created_time DESC
+            LIMIT ?
+        """, (limit,))
+        return [self._row_to_record(row) for row in cursor.fetchall()]
     
     def get_records_by_vector_status(self, is_vectorized: int, limit: int = 50) -> List[MemoryRecord]:
         """
@@ -939,41 +914,41 @@ class SQLiteStore:
         Returns:
             符合条件的记录列表
         """
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("""
-                SELECT * FROM memories 
-                WHERE is_vectorized = ?
-                AND is_archived = 0
-                ORDER BY created_time DESC
-                LIMIT ?
-            """, (is_vectorized, limit))
-            return [self._row_to_record(row) for row in cursor.fetchall()]
+        conn = self._get_read_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT * FROM memories 
+            WHERE is_vectorized = ?
+            AND is_archived = 0
+            ORDER BY created_time DESC
+            LIMIT ?
+        """, (is_vectorized, limit))
+        return [self._row_to_record(row) for row in cursor.fetchall()]
     
     def get_pending_compressions(self, limit: int = 20) -> List[MemoryRecord]:
         """获取待压缩的记录"""
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("""
-                SELECT * FROM memories 
-                WHERE json_extract(metadata, '$.pending_compression') = 1
-                AND is_archived = 0
-                ORDER BY created_time ASC
-                LIMIT ?
-            """, (limit,))
-            return [self._row_to_record(row) for row in cursor.fetchall()]
+        conn = self._get_read_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT * FROM memories 
+            WHERE json_extract(metadata, '$.pending_compression') = 1
+            AND is_archived = 0
+            ORDER BY created_time ASC
+            LIMIT ?
+        """, (limit,))
+        return [self._row_to_record(row) for row in cursor.fetchall()]
     
     def get_by_vector_id(self, vector_id: str) -> Optional[MemoryRecord]:
         """根据ChromaDB ID获取SQLite记录"""
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("""
-                SELECT * FROM memories WHERE vector_id = ?
-            """, (vector_id,))
-            row = cursor.fetchone()
-            if row:
-                return self._row_to_record(row)
-            return None
+        conn = self._get_read_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT * FROM memories WHERE vector_id = ?
+        """, (vector_id,))
+        row = cursor.fetchone()
+        if row:
+            return self._row_to_record(row)
+        return None
     
     def exists_by_text_hash(self, text_hash: str) -> Tuple[bool, Optional[int]]:
         """
@@ -982,17 +957,17 @@ class SQLiteStore:
         Returns:
             (exists, record_id): 是否存在，存在的记录ID
         """
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("""
-                SELECT id FROM memories 
-                WHERE text_hash = ? AND is_archived = 0
-                LIMIT 1
-            """, (text_hash,))
-            row = cursor.fetchone()
-            if row:
-                return True, row[0]
-            return False, None
+        conn = self._get_read_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT id FROM memories 
+            WHERE text_hash = ? AND is_archived = 0
+            LIMIT 1
+        """, (text_hash,))
+        row = cursor.fetchone()
+        if row:
+            return True, row[0]
+        return False, None
     
     def compute_text_hash(self, text: str) -> str:
         """计算文本哈希（用于幂等性检查）"""
@@ -1013,29 +988,28 @@ class SQLiteStore:
         if exists:
             return existing_id
         
-        with self.lock:
-            with self._get_connection() as conn:
-                cursor = conn.cursor()
-                cursor.execute("""
-                    INSERT INTO memories 
-                    (text, compressed_text, source, weight, access_count, 
-                     last_access_time, created_time, metadata, vector_id, is_vectorized, text_hash)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    record.text,
-                    record.compressed_text,
-                    record.source,
-                    record.weight,
-                    record.access_count,
-                    record.last_access_time,
-                    record.created_time,
-                    json.dumps(record.metadata, ensure_ascii=False),
-                    record.vector_id,
-                    record.is_vectorized,
-                    text_hash
-                ))
-                conn.commit()
-                return cursor.lastrowid
+        with self._get_write_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO memories 
+                (text, compressed_text, source, weight, access_count, 
+                 last_access_time, created_time, metadata, vector_id, is_vectorized, text_hash)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                record.text,
+                record.compressed_text,
+                record.source,
+                record.weight,
+                record.access_count,
+                record.last_access_time,
+                record.created_time,
+                json.dumps(record.metadata, ensure_ascii=False),
+                record.vector_id,
+                record.is_vectorized,
+                text_hash
+            ))
+            conn.commit()
+            return cursor.lastrowid
     
     def add_batch_with_hash(self, records: List[MemoryRecord], text_hashes: List[str] = None) -> List[int]:
         """
@@ -1076,38 +1050,37 @@ class SQLiteStore:
                 new_hashes.append(text_hash)
         
         if new_records:
-            with self.lock:
-                with self._get_connection() as conn:
-                    cursor = conn.cursor()
-                    
-                    cursor.execute("SELECT MAX(id) FROM memories")
-                    max_id_before = cursor.fetchone()[0] or 0
-                    
-                    data = [(
-                        r.text,
-                        r.compressed_text,
-                        r.source,
-                        r.weight,
-                        r.access_count,
-                        r.last_access_time,
-                        r.created_time,
-                        json.dumps(r.metadata, ensure_ascii=False),
-                        r.vector_id,
-                        r.is_vectorized,
-                        h
-                    ) for r, h in zip(new_records, new_hashes)]
-                    
-                    cursor.executemany("""
-                        INSERT INTO memories 
-                        (text, compressed_text, source, weight, access_count, 
-                         last_access_time, created_time, metadata, vector_id, is_vectorized, text_hash)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """, data)
-                    
-                    conn.commit()
-                    
-                    new_ids = list(range(max_id_before + 1, max_id_before + 1 + len(new_records)))
-                    result_ids.extend(new_ids)
+            with self._get_write_connection() as conn:
+                cursor = conn.cursor()
+                
+                cursor.execute("SELECT MAX(id) FROM memories")
+                max_id_before = cursor.fetchone()[0] or 0
+                
+                data = [(
+                    r.text,
+                    r.compressed_text,
+                    r.source,
+                    r.weight,
+                    r.access_count,
+                    r.last_access_time,
+                    r.created_time,
+                    json.dumps(r.metadata, ensure_ascii=False),
+                    r.vector_id,
+                    r.is_vectorized,
+                    h
+                ) for r, h in zip(new_records, new_hashes)]
+                
+                cursor.executemany("""
+                    INSERT INTO memories 
+                    (text, compressed_text, source, weight, access_count, 
+                     last_access_time, created_time, metadata, vector_id, is_vectorized, text_hash)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, data)
+                
+                conn.commit()
+                
+                new_ids = list(range(max_id_before + 1, max_id_before + 1 + len(new_records)))
+                result_ids.extend(new_ids)
         
         return result_ids
     
@@ -1122,36 +1095,34 @@ class SQLiteStore:
         if not updates:
             return
         
-        with self.lock:
-            with self._get_connection() as conn:
-                cursor = conn.cursor()
-                
-                data = [(vid, is_vectorized, rid) for rid, vid in updates]
-                
-                cursor.executemany("""
-                    UPDATE memories 
-                    SET vector_id = ?, is_vectorized = ?
-                    WHERE id = ?
-                """, data)
-                
-                conn.commit()
+        with self._get_write_connection() as conn:
+            cursor = conn.cursor()
+            
+            data = [(vid, is_vectorized, rid) for rid, vid in updates]
+            
+            cursor.executemany("""
+                UPDATE memories 
+                SET vector_id = ?, is_vectorized = ?
+                WHERE id = ?
+            """, data)
+            
+            conn.commit()
     
     def delete_by_vector_id(self, vector_id: str) -> bool:
         """根据ChromaDB ID删除SQLite记录（同步删除）"""
-        with self.lock:
-            with self._get_connection() as conn:
-                cursor = conn.cursor()
-                cursor.execute("""
-                    DELETE FROM memories WHERE vector_id = ?
-                """, (vector_id,))
-                conn.commit()
-                return cursor.rowcount > 0
+        with self._get_write_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                DELETE FROM memories WHERE vector_id = ?
+            """, (vector_id,))
+            conn.commit()
+            return cursor.rowcount > 0
     
     def __len__(self) -> int:
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT COUNT(*) FROM memories WHERE is_archived = 0")
-            return cursor.fetchone()[0]
+        conn = self._get_read_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM memories WHERE is_archived = 0")
+        return cursor.fetchone()[0]
     
     def count(self) -> int:
         """获取记录总数"""
@@ -1182,23 +1153,22 @@ class SQLiteStore:
         """
         from datetime import datetime
         
-        with self.lock:
-            with self._get_connection() as conn:
-                cursor = conn.cursor()
-                cursor.execute("""
-                    INSERT INTO conversations 
-                    (session_id, user_input, assistant_response, source, timestamp, metadata)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                """, (
-                    session_id,
-                    user_input,
-                    assistant_response,
-                    source,
-                    datetime.now().isoformat(),
-                    json.dumps(metadata or {}, ensure_ascii=False)
-                ))
-                conn.commit()
-                return cursor.lastrowid
+        with self._get_write_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO conversations 
+                (session_id, user_input, assistant_response, source, timestamp, metadata)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (
+                session_id,
+                user_input,
+                assistant_response,
+                source,
+                datetime.now().isoformat(),
+                json.dumps(metadata or {}, ensure_ascii=False)
+            ))
+            conn.commit()
+            return cursor.lastrowid
     
     def get_conversations(
         self, 
@@ -1217,36 +1187,36 @@ class SQLiteStore:
         Returns:
             会话记录列表
         """
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            
-            if session_id:
-                cursor.execute("""
-                    SELECT * FROM conversations 
-                    WHERE session_id = ?
-                    ORDER BY timestamp DESC
-                    LIMIT ? OFFSET ?
-                """, (session_id, limit, offset))
-            else:
-                cursor.execute("""
-                    SELECT * FROM conversations 
-                    ORDER BY timestamp DESC
-                    LIMIT ? OFFSET ?
-                """, (limit, offset))
-            
-            results = []
-            for row in cursor.fetchall():
-                results.append({
-                    "id": row["id"],
-                    "session_id": row["session_id"],
-                    "user_input": row["user_input"],
-                    "assistant_response": row["assistant_response"],
-                    "source": row["source"],
-                    "timestamp": row["timestamp"],
-                    "metadata": json.loads(row["metadata"]) if row["metadata"] else {}
-                })
-            
-            return results
+        conn = self._get_read_connection()
+        cursor = conn.cursor()
+        
+        if session_id:
+            cursor.execute("""
+                SELECT * FROM conversations 
+                WHERE session_id = ?
+                ORDER BY timestamp DESC
+                LIMIT ? OFFSET ?
+            """, (session_id, limit, offset))
+        else:
+            cursor.execute("""
+                SELECT * FROM conversations 
+                ORDER BY timestamp DESC
+                LIMIT ? OFFSET ?
+            """, (limit, offset))
+        
+        results = []
+        for row in cursor.fetchall():
+            results.append({
+                "id": row["id"],
+                "session_id": row["session_id"],
+                "user_input": row["user_input"],
+                "assistant_response": row["assistant_response"],
+                "source": row["source"],
+                "timestamp": row["timestamp"],
+                "metadata": json.loads(row["metadata"]) if row["metadata"] else {}
+            })
+        
+        return results
     
     def get_recent_conversations(self, limit: int = 20) -> List[Dict[str, Any]]:
         """
@@ -1258,24 +1228,24 @@ class SQLiteStore:
         Returns:
             会话记录列表（按时间正序）
         """
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("""
-                SELECT * FROM conversations 
-                ORDER BY timestamp DESC
-                LIMIT ?
-            """, (limit,))
-            
-            results = []
-            for row in cursor.fetchall():
-                results.append({
-                    "user": row["user_input"],
-                    "assistant": row["assistant_response"],
-                    "source": row["source"],
-                    "timestamp": row["timestamp"]
-                })
-            
-            return list(reversed(results))
+        conn = self._get_read_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT * FROM conversations 
+            ORDER BY timestamp DESC
+            LIMIT ?
+        """, (limit,))
+        
+        results = []
+        for row in cursor.fetchall():
+            results.append({
+                "user": row["user_input"],
+                "assistant": row["assistant_response"],
+                "source": row["source"],
+                "timestamp": row["timestamp"]
+            })
+        
+        return list(reversed(results))
     
     def clear_conversations(self, session_id: str = None):
         """
@@ -1284,28 +1254,27 @@ class SQLiteStore:
         Args:
             session_id: 会话ID（可选，不指定则清空所有）
         """
-        with self.lock:
-            with self._get_connection() as conn:
-                cursor = conn.cursor()
-                
-                if session_id:
-                    cursor.execute("DELETE FROM conversations WHERE session_id = ?", (session_id,))
-                else:
-                    cursor.execute("DELETE FROM conversations")
-                
-                conn.commit()
-    
-    def get_conversation_count(self, session_id: str = None) -> int:
-        """获取会话记录数量"""
-        with self._get_connection() as conn:
+        with self._get_write_connection() as conn:
             cursor = conn.cursor()
             
             if session_id:
-                cursor.execute("SELECT COUNT(*) FROM conversations WHERE session_id = ?", (session_id,))
+                cursor.execute("DELETE FROM conversations WHERE session_id = ?", (session_id,))
             else:
-                cursor.execute("SELECT COUNT(*) FROM conversations")
+                cursor.execute("DELETE FROM conversations")
             
-            return cursor.fetchone()[0]
+            conn.commit()
+    
+    def get_conversation_count(self, session_id: str = None) -> int:
+        """获取会话记录数量"""
+        conn = self._get_read_connection()
+        cursor = conn.cursor()
+        
+        if session_id:
+            cursor.execute("SELECT COUNT(*) FROM conversations WHERE session_id = ?", (session_id,))
+        else:
+            cursor.execute("SELECT COUNT(*) FROM conversations")
+        
+        return cursor.fetchone()[0]
     
     def close(self):
         """
@@ -1313,14 +1282,12 @@ class SQLiteStore:
         
         用于会话结束或测试清理
         """
-        with self.lock:
-            with self._connection_lock:
-                if self._connection is not None:
-                    try:
-                        self._connection.close()
-                    except Exception:
-                        pass
-                    self._connection = None
+        if hasattr(self._local, 'read_conn') and self._local.read_conn is not None:
+            try:
+                self._local.read_conn.close()
+            except Exception:
+                pass
+            self._local.read_conn = None
 
 
 # 全局实例
