@@ -436,7 +436,7 @@ class LLMTagger:
     
     def __init__(self, config: TagConfig = None):
         self.config = config or TagConfig()
-        self._task_queue = queue.Queue()
+        self._task_queue = queue.Queue(maxsize=100)
         self._result_cache: Dict[str, MemoryTag] = {}
         self._running = False
         self._worker_thread: Optional[threading.Thread] = None
@@ -490,6 +490,7 @@ class LLMTagger:
         memory_id = task.get("memory_id")
         memory_text = task.get("memory_text")
         callback = task.get("callback")
+        use_atomic_update = task.get("use_atomic_update", True)
         
         if not memory_text:
             return
@@ -502,6 +503,28 @@ class LLMTagger:
                 tag.updated_at = datetime.now().isoformat()
                 
                 self._result_cache[memory_id] = tag
+                
+                if use_atomic_update:
+                    try:
+                        memory_id_int = int(memory_id)
+                        from sqlite_store import SQLiteStore
+                        sqlite_store = SQLiteStore()
+                        sqlite_store.update_metadata_field(
+                            record_id=memory_id_int,
+                            field_path="semantic_tag",
+                            field_value=tag.to_dict()
+                        )
+                        self._log.info(
+                            "LLM_TAG_ATOMIC_UPDATE",
+                            memory_id=memory_id,
+                            category=tag.category
+                        )
+                    except (ValueError, Exception) as e:
+                        self._log.warning(
+                            "LLM_TAG_ATOMIC_FAILED",
+                            memory_id=memory_id,
+                            error=str(e)
+                        )
                 
                 if callback:
                     callback(memory_id, tag)
@@ -550,22 +573,107 @@ class LLMTagger:
         return None
     
     def _parse_llm_response(self, response: str) -> Optional[MemoryTag]:
-        """解析 LLM 响应"""
+        """
+        解析 LLM 响应
+        
+        使用多层策略提取 JSON：
+        1. 优先提取 Markdown JSON 代码块
+        2. 使用括号栈匹配算法提取完整 JSON 对象
+        3. 支持嵌套 JSON 结构
+        """
+        if not response:
+            return None
+        
+        json_str = self._extract_json(response)
+        
+        if not json_str:
+            return None
+        
         try:
-            json_match = re.search(r'\{[^{}]*\}', response, re.DOTALL)
-            if json_match:
-                data = json.loads(json_match.group())
-                return MemoryTag(
-                    category=data.get("category", "other"),
-                    importance=data.get("importance", "medium"),
-                    sentiment=data.get("sentiment", "neutral"),
-                    entities=data.get("entities", []),
-                    time_sensitive=data.get("time_sensitive", False),
-                    topics=data.get("topics", []),
-                    confidence=0.9
-                )
-        except json.JSONDecodeError:
-            pass
+            data = json.loads(json_str)
+            return MemoryTag(
+                category=data.get("category", "other"),
+                importance=data.get("importance", "medium"),
+                sentiment=data.get("sentiment", "neutral"),
+                entities=data.get("entities", []),
+                time_sensitive=data.get("time_sensitive", False),
+                topics=data.get("topics", []),
+                confidence=0.9
+            )
+        except json.JSONDecodeError as e:
+            self._log.error("JSON_DECODE_FAILED", error=str(e), json_preview=json_str[:100])
+            return None
+    
+    def _extract_json(self, text: str) -> Optional[str]:
+        """
+        从文本中提取 JSON 字符串
+        
+        策略：
+        1. 提取 Markdown JSON 代码块 ```json ... ```
+        2. 提取普通代码块 ``` ... ```
+        3. 使用括号栈匹配提取完整 JSON 对象
+        """
+        import re
+        
+        json_block_pattern = r'```(?:json)?\s*([\s\S]*?)\s*```'
+        matches = re.findall(json_block_pattern, text, re.IGNORECASE)
+        
+        for match in matches:
+            candidate = match.strip()
+            if candidate.startswith('{') and candidate.endswith('}'):
+                try:
+                    json.loads(candidate)
+                    return candidate
+                except json.JSONDecodeError:
+                    continue
+        
+        json_str = self._extract_json_by_brace_stack(text)
+        if json_str:
+            return json_str
+        
+        return None
+    
+    def _extract_json_by_brace_stack(self, text: str) -> Optional[str]:
+        """
+        使用括号栈匹配算法提取完整的 JSON 对象
+        
+        支持嵌套结构，正确处理字符串内的括号
+        """
+        start_idx = -1
+        brace_count = 0
+        in_string = False
+        escape_next = False
+        
+        for i, char in enumerate(text):
+            if escape_next:
+                escape_next = False
+                continue
+            
+            if char == '\\' and in_string:
+                escape_next = True
+                continue
+            
+            if char == '"' and not escape_next:
+                in_string = not in_string
+                continue
+            
+            if in_string:
+                continue
+            
+            if char == '{':
+                if brace_count == 0:
+                    start_idx = i
+                brace_count += 1
+            elif char == '}':
+                brace_count -= 1
+                if brace_count == 0 and start_idx >= 0:
+                    candidate = text[start_idx:i+1]
+                    try:
+                        json.loads(candidate)
+                        return candidate
+                    except json.JSONDecodeError:
+                        start_idx = -1
+                        brace_count = 0
         
         return None
     
@@ -573,7 +681,8 @@ class LLMTagger:
         self, 
         memory_id: str, 
         memory_text: str,
-        callback: Optional[Callable] = None
+        callback: Optional[Callable] = None,
+        use_atomic_update: bool = True
     ):
         """
         提交异步标记任务
@@ -582,6 +691,7 @@ class LLMTagger:
             memory_id: 记忆ID
             memory_text: 记忆文本
             callback: 完成回调函数 callback(memory_id, tag)
+            use_atomic_update: 是否使用原子更新（默认 True）
         """
         if not self.config.llm_tagging_enabled:
             return
@@ -590,9 +700,17 @@ class LLMTagger:
             task = {
                 "memory_id": memory_id,
                 "memory_text": memory_text,
-                "callback": callback
+                "callback": callback,
+                "use_atomic_update": use_atomic_update
             }
-            self._task_queue.put(task)
+            try:
+                self._task_queue.put(task, block=False)
+            except queue.Full:
+                self._log.warning(
+                    "LLM_TAG_QUEUE_FULL",
+                    memory_id=memory_id,
+                    queue_size=self._task_queue.qsize()
+                )
         else:
             tag = self._classify_with_llm(memory_text)
             if tag and callback:
@@ -625,13 +743,13 @@ class TagMerger:
         合并多个标签
         
         策略：
-        1. category: 投票决定
-        2. importance: 取最高
-        3. sentiment: 投票决定
-        4. entities: 合并去重
-        5. time_sensitive: 任一为 true 则为 true
-        6. topics: 合并去重
-        7. 用户修正的标签优先级最高
+        1. 用户修正的标签有一票否决权（最高优先级）
+        2. category: 用户修正优先，否则投票决定
+        3. importance: 取最高
+        4. sentiment: 用户修正优先，否则投票决定
+        5. entities: 合并去重
+        6. time_sensitive: 任一为 true 则为 true
+        7. topics: 合并去重
         """
         if not tags_list:
             return MemoryTag()
@@ -640,21 +758,28 @@ class TagMerger:
             return tags_list[0]
         
         user_corrected_tags = [t for t in tags_list if t.user_corrected]
-        if user_corrected_tags:
+        has_user_correction = len(user_corrected_tags) > 0
+        
+        if has_user_correction:
             base_tag = user_corrected_tags[0]
+            category = base_tag.category
+            sentiment = base_tag.sentiment
+            confidence = base_tag.confidence
         else:
-            base_tag = tags_list[0]
+            category = self._vote_category(tags_list)
+            sentiment = self._vote_sentiment(tags_list)
+            confidence = self._average_confidence(tags_list)
         
         return MemoryTag(
-            category=self._vote_category(tags_list),
+            category=category,
             importance=self._max_importance(tags_list),
-            sentiment=self._vote_sentiment(tags_list),
+            sentiment=sentiment,
             entities=self._merge_entities(tags_list),
             time_sensitive=self._any_time_sensitive(tags_list),
             topics=self._merge_topics(tags_list),
             source=TagSource.MERGED.value,
-            confidence=self._average_confidence(tags_list),
-            user_corrected=len(user_corrected_tags) > 0
+            confidence=confidence,
+            user_corrected=has_user_correction
         )
     
     def _vote_category(self, tags_list: List[MemoryTag]) -> str:
@@ -1013,6 +1138,43 @@ class TagClassifier:
         metadata["semantic_tag"] = tag.to_dict()
         
         return metadata
+    
+    def update_tag_atomically(
+        self, 
+        record_id: int, 
+        tag: MemoryTag,
+        sqlite_store = None
+    ) -> bool:
+        """
+        原子更新数据库中的 semantic_tag 字段
+        
+        使用 SQLite json_set 进行原子操作，避免并发覆盖
+        
+        Args:
+            record_id: 记录ID
+            tag: 标签对象
+            sqlite_store: SQLite 存储实例（可选，自动获取）
+        
+        Returns:
+            是否成功
+        """
+        if sqlite_store is None:
+            try:
+                from sqlite_store import SQLiteStore
+                sqlite_store = SQLiteStore()
+            except Exception as e:
+                self._log.error("GET_SQLITE_STORE_FAILED", error=str(e))
+                return False
+        
+        try:
+            return sqlite_store.update_metadata_field(
+                record_id=record_id,
+                field_path="semantic_tag",
+                field_value=tag.to_dict()
+            )
+        except Exception as e:
+            self._log.error("ATOMIC_TAG_UPDATE_FAILED", error=str(e))
+            return False
     
     def get_stats(self) -> Dict[str, Any]:
         """获取统计信息"""

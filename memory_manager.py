@@ -616,6 +616,7 @@ class MemoryManager:
         - 不参与检索
         - 优先被合并/删除
         - 保留原始数据（可恢复）
+        - 从 L2 向量库中移除（防止"僵尸记忆"复活）
         
         Args:
             record_id: 记忆ID
@@ -630,6 +631,17 @@ class MemoryManager:
                 return False
             
             record.metadata = MemoryTagHelper.mark_forgotten(record.metadata, reason)
+            
+            if record.vector_id:
+                try:
+                    self.vector_store.delete(ids=[record.vector_id])
+                    print(f"已从 L2 向量库删除: {record.vector_id}")
+                except Exception as e:
+                    print(f"L2 向量删除失败（非致命）: {e}")
+                
+                record.vector_id = ""
+                record.is_vectorized = 0
+            
             self.sqlite.add(record)
             
             self.stats["forgotten"] += 1
@@ -645,6 +657,8 @@ class MemoryManager:
         """
         取消遗忘标记（恢复记忆）
         
+        恢复后需要重新向量化才能参与 L2 检索
+        
         Args:
             record_id: 记忆ID
         
@@ -657,9 +671,12 @@ class MemoryManager:
                 return False
             
             record.metadata = MemoryTagHelper.unmark_forgotten(record.metadata)
+            
+            record.metadata["needs_revectorization"] = True
+            
             self.sqlite.add(record)
             
-            print(f"记忆 {record_id} 已恢复")
+            print(f"记忆 {record_id} 已恢复，需要重新向量化")
             
             return True
             

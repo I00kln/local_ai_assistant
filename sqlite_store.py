@@ -558,6 +558,107 @@ class SQLiteStore:
             
             conn.commit()
     
+    def update_metadata_field(
+        self, 
+        record_id: int, 
+        field_path: str, 
+        field_value: Any
+    ) -> bool:
+        """
+        原子更新 metadata 中的特定字段
+        
+        使用 SQLite json_set 函数进行原子操作，避免并发覆盖
+        
+        Args:
+            record_id: 记录ID
+            field_path: 字段路径（如 "semantic_tag" 或 "tags.custom"）
+            field_value: 字段值
+        
+        Returns:
+            是否成功
+        """
+        with self._get_write_connection() as conn:
+            cursor = conn.cursor()
+            
+            try:
+                json_path = f"$.{field_path}"
+                value_json = json.dumps(field_value, ensure_ascii=False)
+                
+                cursor.execute("""
+                    UPDATE memories 
+                    SET metadata = json_set(
+                        COALESCE(metadata, '{}'),
+                        ?, ?
+                    )
+                    WHERE id = ?
+                """, (json_path, value_json, record_id))
+                
+                conn.commit()
+                return cursor.rowcount > 0
+                
+            except sqlite3.OperationalError as e:
+                if "no such function: json_set" in str(e):
+                    return self._update_metadata_field_fallback(
+                        record_id, field_path, field_value
+                    )
+                raise
+            except Exception as e:
+                print(f"原子更新 metadata 字段失败: {e}")
+                return False
+    
+    def _update_metadata_field_fallback(
+        self, 
+        record_id: int, 
+        field_path: str, 
+        field_value: Any
+    ) -> bool:
+        """
+        原子更新 metadata 字段的回退方案
+        
+        当 SQLite 不支持 json_set 时使用
+        使用锁保护读取-修改-写入操作
+        """
+        with self.lock:
+            record = self.get(record_id)
+            if not record:
+                return False
+            
+            if record.metadata is None:
+                record.metadata = {}
+            
+            path_parts = field_path.split(".")
+            current = record.metadata
+            
+            for part in path_parts[:-1]:
+                if part not in current:
+                    current[part] = {}
+                current = current[part]
+            
+            current[path_parts[-1]] = field_value
+            
+            return self.update_metadata(record_id, record.metadata)
+    
+    def update_metadata(self, record_id: int, metadata: Dict) -> bool:
+        """
+        更新整个 metadata
+        
+        Args:
+            record_id: 记录ID
+            metadata: 新的 metadata
+        
+        Returns:
+            是否成功
+        """
+        with self._get_write_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                UPDATE memories 
+                SET metadata = ?
+                WHERE id = ?
+            """, (json.dumps(metadata, ensure_ascii=False), record_id))
+            conn.commit()
+            return cursor.rowcount > 0
+    
     def decay_weights(self, days_threshold: int = None, batch_size: int = 1000) -> Dict[str, Any]:
         """
         权重衰减（遗忘机制）
@@ -1052,9 +1153,7 @@ class SQLiteStore:
         """
         批量添加记忆记录（带文本哈希，支持幂等性）
         
-        性能优化：
-        - 使用 executemany 批量插入
-        - 跳过已存在的记录
+        使用单条插入获取准确的 lastrowid，避免 MAX(id) 计算错误
         
         Args:
             records: 记录列表
@@ -1090,34 +1189,28 @@ class SQLiteStore:
             with self._get_write_connection() as conn:
                 cursor = conn.cursor()
                 
-                cursor.execute("SELECT MAX(id) FROM memories")
-                max_id_before = cursor.fetchone()[0] or 0
-                
-                data = [(
-                    r.text,
-                    r.compressed_text,
-                    r.source,
-                    r.weight,
-                    r.access_count,
-                    r.last_access_time,
-                    r.created_time,
-                    json.dumps(r.metadata, ensure_ascii=False),
-                    r.vector_id,
-                    r.is_vectorized,
-                    h
-                ) for r, h in zip(new_records, new_hashes)]
-                
-                cursor.executemany("""
-                    INSERT INTO memories 
-                    (text, compressed_text, source, weight, access_count, 
-                     last_access_time, created_time, metadata, vector_id, is_vectorized, text_hash)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, data)
+                for record, text_hash in zip(new_records, new_hashes):
+                    cursor.execute("""
+                        INSERT INTO memories 
+                        (text, compressed_text, source, weight, access_count, 
+                         last_access_time, created_time, metadata, vector_id, is_vectorized, text_hash)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (
+                        record.text,
+                        record.compressed_text,
+                        record.source,
+                        record.weight,
+                        record.access_count,
+                        record.last_access_time,
+                        record.created_time,
+                        json.dumps(record.metadata, ensure_ascii=False),
+                        record.vector_id,
+                        record.is_vectorized,
+                        text_hash
+                    ))
+                    result_ids.append(cursor.lastrowid)
                 
                 conn.commit()
-                
-                new_ids = list(range(max_id_before + 1, max_id_before + 1 + len(new_records)))
-                result_ids.extend(new_ids)
         
         return result_ids
     
