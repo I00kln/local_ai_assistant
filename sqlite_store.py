@@ -394,6 +394,21 @@ class SQLiteStore:
                 ON memories(is_archived, weight, is_vectorized)
             """)
             
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_weight_access 
+                ON memories(weight DESC, last_access_time DESC)
+            """)
+            
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_vectorized_weight 
+                ON memories(is_vectorized, weight DESC)
+            """)
+            
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_source_weight 
+                ON memories(source, weight DESC)
+            """)
+            
             # 触发器：自动同步FTS索引
             cursor.execute("""
                 CREATE TRIGGER IF NOT EXISTS memories_ai AFTER INSERT ON memories BEGIN
@@ -468,32 +483,40 @@ class SQLiteStore:
                 return cursor.lastrowid
     
     def add_batch(self, records: List[MemoryRecord]) -> List[int]:
-        """批量添加记忆"""
+        """批量添加记忆（优化版：使用 executemany）"""
+        if not records:
+            return []
+        
         with self.lock:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
-                ids = []
-                for record in records:
-                    cursor.execute("""
-                        INSERT INTO memories 
-                        (text, compressed_text, source, weight, access_count, 
-                         last_access_time, created_time, metadata, vector_id, is_vectorized)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """, (
-                        record.text,
-                        record.compressed_text,
-                        record.source,
-                        record.weight,
-                        record.access_count,
-                        record.last_access_time,
-                        record.created_time,
-                        json.dumps(record.metadata, ensure_ascii=False),
-                        record.vector_id,
-                        record.is_vectorized
-                    ))
-                    ids.append(cursor.lastrowid)
+                
+                cursor.execute("SELECT MAX(id) FROM memories")
+                max_id_before = cursor.fetchone()[0] or 0
+                
+                data = [(
+                    record.text,
+                    record.compressed_text,
+                    record.source,
+                    record.weight,
+                    record.access_count,
+                    record.last_access_time,
+                    record.created_time,
+                    json.dumps(record.metadata, ensure_ascii=False),
+                    record.vector_id,
+                    record.is_vectorized
+                ) for record in records]
+                
+                cursor.executemany("""
+                    INSERT INTO memories 
+                    (text, compressed_text, source, weight, access_count, 
+                     last_access_time, created_time, metadata, vector_id, is_vectorized)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, data)
+                
                 conn.commit()
-                return ids
+                
+                return list(range(max_id_before + 1, max_id_before + 1 + len(records)))
     
     def get(self, record_id: int) -> Optional[MemoryRecord]:
         """根据ID获取记录"""
@@ -1036,6 +1059,105 @@ class SQLiteStore:
                 ))
                 conn.commit()
                 return cursor.lastrowid
+    
+    def add_batch_with_hash(self, records: List[MemoryRecord], text_hashes: List[str] = None) -> List[int]:
+        """
+        批量添加记忆记录（带文本哈希，支持幂等性）
+        
+        性能优化：
+        - 使用 executemany 批量插入
+        - 跳过已存在的记录
+        
+        Args:
+            records: 记录列表
+            text_hashes: 文本哈希列表（可选，不提供则自动计算）
+        
+        Returns:
+            记录ID列表
+        """
+        if not records:
+            return []
+        
+        if text_hashes is None:
+            text_hashes = [self.compute_text_hash(r.text) for r in records]
+        
+        existing_map = {}
+        for text_hash in text_hashes:
+            exists, existing_id = self.exists_by_text_hash(text_hash)
+            if exists:
+                existing_map[text_hash] = existing_id
+        
+        new_records = []
+        new_hashes = []
+        result_ids = []
+        
+        for record, text_hash in zip(records, text_hashes):
+            if text_hash in existing_map:
+                result_ids.append(existing_map[text_hash])
+            else:
+                new_records.append(record)
+                new_hashes.append(text_hash)
+        
+        if new_records:
+            with self.lock:
+                with self._get_connection() as conn:
+                    cursor = conn.cursor()
+                    
+                    cursor.execute("SELECT MAX(id) FROM memories")
+                    max_id_before = cursor.fetchone()[0] or 0
+                    
+                    data = [(
+                        r.text,
+                        r.compressed_text,
+                        r.source,
+                        r.weight,
+                        r.access_count,
+                        r.last_access_time,
+                        r.created_time,
+                        json.dumps(r.metadata, ensure_ascii=False),
+                        r.vector_id,
+                        r.is_vectorized,
+                        h
+                    ) for r, h in zip(new_records, new_hashes)]
+                    
+                    cursor.executemany("""
+                        INSERT INTO memories 
+                        (text, compressed_text, source, weight, access_count, 
+                         last_access_time, created_time, metadata, vector_id, is_vectorized, text_hash)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, data)
+                    
+                    conn.commit()
+                    
+                    new_ids = list(range(max_id_before + 1, max_id_before + 1 + len(new_records)))
+                    result_ids.extend(new_ids)
+        
+        return result_ids
+    
+    def batch_update_vector_status(self, updates: List[tuple], is_vectorized: int = 1):
+        """
+        批量更新记录的向量化状态
+        
+        Args:
+            updates: [(record_id, vector_id), ...] 列表
+            is_vectorized: 向量化状态
+        """
+        if not updates:
+            return
+        
+        with self.lock:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                
+                data = [(vid, is_vectorized, rid) for rid, vid in updates]
+                
+                cursor.executemany("""
+                    UPDATE memories 
+                    SET vector_id = ?, is_vectorized = ?
+                    WHERE id = ?
+                """, data)
+                
+                conn.commit()
     
     def delete_by_vector_id(self, vector_id: str) -> bool:
         """根据ChromaDB ID删除SQLite记录（同步删除）"""

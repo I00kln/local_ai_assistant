@@ -66,6 +66,15 @@ class CompressionConfig:
 
 
 @dataclass
+class PrivacyConfig:
+    """隐私与安全配置"""
+    sensitive_filter_enabled: bool = True
+    local_encryption_enabled: bool = False
+    excluded_keywords: str = ""
+    log_sensitive_detection: bool = False
+
+
+@dataclass
 class SQLitePoolConfig:
     """SQLite 连接池配置"""
     max_pool_size: int = 10
@@ -169,6 +178,7 @@ class Config:
         self.async_processor = AsyncProcessorConfig()
         self.memory_flow = MemoryFlowConfig()
         self.compression = CompressionConfig()
+        self.privacy = PrivacyConfig()
         self.sqlite_pool = SQLitePoolConfig()
         self.decay = DecayConfig()
         self.retrieval = RetrievalConfig()
@@ -207,6 +217,7 @@ class Config:
         self._load_async_config()
         self._load_flow_config()
         self._load_compression_config()
+        self._load_privacy_config()
         self._load_sqlite_pool_config()
         self._load_decay_config()
         self._load_retrieval_config()
@@ -263,6 +274,11 @@ class Config:
         self.async_processor.max_pending_compressions = int(os.environ.get("MAX_PENDING_COMPRESSIONS", "50"))
         self.async_processor.compressor_check_interval = int(os.environ.get("COMPRESSOR_CHECK_INTERVAL", "300"))
         self.async_processor.compressor_failure_threshold = int(os.environ.get("COMPRESSOR_FAILURE_THRESHOLD", "5"))
+        self.async_processor.max_queue_size = int(os.environ.get("MAX_QUEUE_SIZE", "1000"))
+        self.async_processor.queue_full_action = os.environ.get("QUEUE_FULL_ACTION", "drop_oldest")
+        self.async_processor.llm_timeout = int(os.environ.get("LLM_TIMEOUT", "30"))
+        self.async_processor.circuit_breaker_threshold = int(os.environ.get("CIRCUIT_BREAKER_THRESHOLD", "5"))
+        self.async_processor.circuit_breaker_reset_timeout = int(os.environ.get("CIRCUIT_BREAKER_RESET_TIMEOUT", "60"))
     
     def _load_flow_config(self):
         """加载记忆流动配置"""
@@ -280,6 +296,13 @@ class Config:
         self.compression.fallback_enabled = os.environ.get("COMPRESSION_FALLBACK_ENABLED", "true").lower() == "true"
         self.compression.key_patterns = os.environ.get("COMPRESSION_KEY_PATTERNS", 
             r'\d+|[A-Z][a-z]+|设置|配置|修改|添加|删除|创建|因为|所以|如果|那么|但是')
+    
+    def _load_privacy_config(self):
+        """加载隐私与安全配置"""
+        self.privacy.sensitive_filter_enabled = os.environ.get("SENSITIVE_FILTER_ENABLED", "true").lower() == "true"
+        self.privacy.local_encryption_enabled = os.environ.get("LOCAL_ENCRYPTION_ENABLED", "false").lower() == "true"
+        self.privacy.excluded_keywords = os.environ.get("PRIVACY_EXCLUDED_KEYWORDS", "")
+        self.privacy.log_sensitive_detection = os.environ.get("LOG_SENSITIVE_DETECTION", "false").lower() == "true"
     
     def _load_sqlite_pool_config(self):
         """加载SQLite连接池配置"""

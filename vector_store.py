@@ -28,6 +28,8 @@ class ONNXEmbeddingFunction:
         self.name = "onnx_bge"
         self._fallback_mode = False
         self._init_error = None
+        self._embedding_cache = {}
+        self._cache_max_size = 1000
     
     def _ensure_initialized(self):
         """
@@ -127,6 +129,11 @@ class ONNXEmbeddingFunction:
         """
         将文本列表转换为嵌入向量列表
         
+        缓存策略：
+        - 相同文本复用缓存的嵌入向量
+        - 缓存最大 1000 条
+        - LRU 淘汰策略
+        
         降级模式：
         - 使用基于文本哈希的确定性随机向量
         - 相同文本始终生成相同向量
@@ -138,35 +145,58 @@ class ONNXEmbeddingFunction:
         
         self._ensure_initialized()
         
-        start_time = time.perf_counter()
+        result = []
+        uncached_texts = []
+        uncached_indices = []
         
-        if self._fallback_mode:
-            result = self._generate_fallback_embeddings(texts)
-        else:
-            texts_with_prefix = [f"为这个句子生成表示：{t}" for t in texts]
-            
-            encoded = self._tokenizer.encode_batch(texts_with_prefix)
-            
-            input_ids = np.array([e.ids for e in encoded], dtype=np.int64)
-            attention_mask = np.array([e.attention_mask for e in encoded], dtype=np.int64)
-            
-            inputs_onnx = {
-                "input_ids": input_ids,
-                "attention_mask": attention_mask
-            }
-            
-            outputs = self._session.run(None, inputs_onnx)
-            
-            last_hidden_state = outputs[0]
-            embeddings = last_hidden_state[:, 0, :]
-            
-            norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
-            embeddings = embeddings / np.maximum(norms, 1e-12)
-            
-            result = embeddings.tolist()
+        for i, text in enumerate(texts):
+            cache_key = hash(text)
+            if cache_key in self._embedding_cache:
+                result.append(self._embedding_cache[cache_key])
+            else:
+                result.append(None)
+                uncached_texts.append(text)
+                uncached_indices.append(i)
         
-        duration_ms = (time.perf_counter() - start_time) * 1000
-        get_metrics_collector().record_embedding_latency(duration_ms)
+        if uncached_texts:
+            start_time = time.perf_counter()
+            
+            if self._fallback_mode:
+                new_embeddings = self._generate_fallback_embeddings(uncached_texts)
+            else:
+                texts_with_prefix = [f"为这个句子生成表示：{t}" for t in uncached_texts]
+                
+                encoded = self._tokenizer.encode_batch(texts_with_prefix)
+                
+                input_ids = np.array([e.ids for e in encoded], dtype=np.int64)
+                attention_mask = np.array([e.attention_mask for e in encoded], dtype=np.int64)
+                
+                inputs_onnx = {
+                    "input_ids": input_ids,
+                    "attention_mask": attention_mask
+                }
+                
+                outputs = self._session.run(None, inputs_onnx)
+                
+                last_hidden_state = outputs[0]
+                embeddings = last_hidden_state[:, 0, :]
+                
+                norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
+                embeddings = embeddings / np.maximum(norms, 1e-12)
+                
+                new_embeddings = embeddings.tolist()
+            
+            duration_ms = (time.perf_counter() - start_time) * 1000
+            get_metrics_collector().record_embedding_latency(duration_ms)
+            
+            for idx, text, embedding in zip(uncached_indices, uncached_texts, new_embeddings):
+                result[idx] = embedding
+                
+                if len(self._embedding_cache) >= self._cache_max_size:
+                    oldest_key = next(iter(self._embedding_cache))
+                    del self._embedding_cache[oldest_key]
+                
+                self._embedding_cache[hash(text)] = embedding
         
         return result
     
@@ -248,10 +278,15 @@ class VectorStore:
             # 创建自定义嵌入函数
             self.embedding_function = ONNXEmbeddingFunction()
             
-            # 获取或创建集合（不使用embedding_function参数，手动处理嵌入）
+            # 获取或创建集合（带优化的 HNSW 参数）
             self.collection = self.client.get_or_create_collection(
                 name=self.collection_name,
-                metadata={"hnsw:space": "ip"}
+                metadata={
+                    "hnsw:space": "ip",
+                    "hnsw:M": 24,
+                    "hnsw:construction_ef": 200,
+                    "hnsw:search_ef": 100,
+                }
             )
             
             print(f"集合 '{self.collection_name}' 加载完成，当前文档数: {self.collection.count()}")

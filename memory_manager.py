@@ -454,11 +454,10 @@ class MemoryManager:
         results = []
         
         try:
-            keywords = query.split()
             query_lower = query.lower()
             query_keywords = set(query_lower.split())
             
-            l3_results = self.sqlite.search_by_keywords(keywords, limit=top_k * 3)
+            l3_results = self.sqlite.search(query, limit=top_k * 3)
             
             for record in l3_results:
                 text = record.compressed_text or record.text

@@ -1,7 +1,39 @@
 # cloud_client.py
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 from abc import ABC, abstractmethod
 from config import config
+import re
+
+
+def validate_api_key(provider: str, api_key: str) -> Tuple[bool, str]:
+    """
+    验证 API 密钥格式
+    
+    Args:
+        provider: 提供商 (openai, gemini)
+        api_key: API 密钥
+    
+    Returns:
+        (是否有效, 错误信息)
+    """
+    if not api_key:
+        return False, "API 密钥为空"
+    
+    if provider.lower() == "openai":
+        if not api_key.startswith("sk-"):
+            return False, "OpenAI API 密钥应以 'sk-' 开头"
+        if len(api_key) < 20:
+            return False, "OpenAI API 密钥长度不足"
+        if not re.match(r'^sk-[A-Za-z0-9_-]+$', api_key):
+            return False, "OpenAI API 密钥格式无效"
+    
+    elif provider.lower() == "gemini":
+        if len(api_key) < 20:
+            return False, "Gemini API 密钥长度不足"
+        if not re.match(r'^[A-Za-z0-9_-]+$', api_key):
+            return False, "Gemini API 密钥格式无效"
+    
+    return True, ""
 
 
 class CloudAIClient(ABC):
@@ -143,6 +175,11 @@ class CloudClientFactory:
     
     @staticmethod
     def create(provider: str, api_key: str, model: str = None, base_url: str = None) -> Optional[CloudAIClient]:
+        is_valid, error_msg = validate_api_key(provider, api_key)
+        if not is_valid:
+            print(f"[安全] API 密钥验证失败: {error_msg}")
+            return None
+        
         if provider.lower() == "openai":
             return OpenAIClient(api_key, model or "gpt-4o-mini", base_url)
         elif provider.lower() == "gemini":
@@ -158,6 +195,9 @@ class HybridClient:
     def __init__(self, local_client, cloud_client: Optional[CloudAIClient] = None):
         self.local_client = local_client
         self.cloud_client = cloud_client
+        self._sensitive_filter = None
+        self._filter_enabled = True
+        self._init_sensitive_filter()
         self.cloud_system_prompt = """你是一个智能助手，负责基于用户问题和历史上下文提供高质量的回答。
 
 【任务说明】
@@ -171,6 +211,44 @@ class HybridClient:
 3. 如果历史上下文与问题无关，直接基于你的知识回答
 4. 保持自然、友好的对话风格"""
     
+    def _init_sensitive_filter(self):
+        """初始化敏感信息过滤器"""
+        try:
+            from sensitive_filter import get_sensitive_filter
+            self._sensitive_filter = get_sensitive_filter()
+            self._filter_enabled = config.privacy.sensitive_filter_enabled
+            
+            excluded_keywords = []
+            if config.privacy.excluded_keywords:
+                excluded_keywords = [
+                    kw.strip() 
+                    for kw in config.privacy.excluded_keywords.split(",") 
+                    if kw.strip()
+                ]
+            
+            self._sensitive_filter.configure(
+                enabled=self._filter_enabled,
+                excluded_keywords=excluded_keywords
+            )
+        except ImportError:
+            print("[安全] 敏感信息过滤器未安装")
+            self._sensitive_filter = None
+    
+    def _mask_sensitive(self, text: str) -> Tuple[str, Dict]:
+        """
+        脱敏处理
+        
+        Args:
+            text: 原始文本
+        
+        Returns:
+            (脱敏后文本, 检测统计)
+        """
+        if not self._filter_enabled or not self._sensitive_filter:
+            return text, {}
+        
+        return self._sensitive_filter.mask(text)
+    
     def process(
         self, 
         user_input: str, 
@@ -181,8 +259,9 @@ class HybridClient:
         """
         处理流程：
         1. 本地LLM已返回压缩结果
-        2. 将用户输入 + 本地结果发送到云端
-        3. 返回云端结果
+        2. 敏感信息脱敏（如启用）
+        3. 将用户输入 + 本地结果发送到云端
+        4. 返回云端结果
         
         Args:
             user_input: 用户原始输入
@@ -198,6 +277,7 @@ class HybridClient:
         ]
         
         context_parts = []
+        total_detected = {}
         
         if metadata:
             meta_info = self._format_metadata(metadata)
@@ -205,10 +285,20 @@ class HybridClient:
                 context_parts.append(f"【上下文元数据】\n{meta_info}")
         
         if memory_context:
-            context_parts.append(f"【历史上下文】\n{memory_context}")
+            masked_context, detected = self._mask_sensitive(memory_context)
+            context_parts.append(f"【历史上下文】\n{masked_context}")
+            total_detected.update(detected)
         
-        context_parts.append(f"【当前问题】\n{user_input}")
-        context_parts.append(f"【本地参考】\n{local_response}")
+        masked_input, detected = self._mask_sensitive(user_input)
+        context_parts.append(f"【当前问题】\n{masked_input}")
+        total_detected.update(detected)
+        
+        masked_response, detected = self._mask_sensitive(local_response)
+        context_parts.append(f"【本地参考】\n{masked_response}")
+        total_detected.update(detected)
+        
+        if total_detected and config.privacy.log_sensitive_detection:
+            print(f"[安全] 检测到敏感信息: {total_detected}")
         
         user_message = "\n\n".join(context_parts)
         messages.append({"role": "user", "content": user_message})
@@ -260,9 +350,14 @@ class HybridClient:
         if not self.cloud_client or not self.cloud_client.is_available():
             return ""
         
+        masked_input, detected = self._mask_sensitive(user_input)
+        
+        if detected and config.privacy.log_sensitive_detection:
+            print(f"[安全] 检测到敏感信息: {detected}")
+        
         messages = [
             {"role": "system", "content": "你是一个智能助手，请提供完整、详细、有帮助的回答。"},
-            {"role": "user", "content": user_input}
+            {"role": "user", "content": masked_input}
         ]
         
         return self.cloud_client.chat(messages)

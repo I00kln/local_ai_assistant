@@ -407,7 +407,8 @@ class AsyncMemoryProcessor:
         self.thread = threading.Thread(target=self._process_loop, daemon=True)
         self.thread.start()
         
-        self._startup_recovery()
+        recovery_thread = threading.Thread(target=self._startup_recovery, daemon=True)
+        recovery_thread.start()
         
         self._log.info("ASYNC_PROCESSOR_STARTED")
     
@@ -419,32 +420,57 @@ class AsyncMemoryProcessor:
         解决：
         1. ChromaDB写入成功但SQLite更新失败导致的数据不一致
         2. L2→L3迁移中断导致的孤立记录（is_vectorized=2）
+        
+        防重复机制：
+        - 添加向量前先搜索是否已存在相同文本（相似度>0.99）
+        - 如果存在则更新SQLite状态，不重复添加
         """
         if not self.sqlite:
             return
         
         try:
             unvectorized = self.sqlite.get_unvectorized(limit=50)
-            if unvectorized:
-                print(f"[启动补偿] 发现 {len(unvectorized)} 条未向量化记录，开始重试...")
+            if not unvectorized:
+                return
+            
+            print(f"[启动补偿] 发现 {len(unvectorized)} 条未向量化记录，开始检查...")
+            
+            success_count = 0
+            skip_count = 0
+            fail_count = 0
+            
+            for record in unvectorized:
+                if record.is_vectorized == -1:
+                    skip_count += 1
+                    continue
                 
-                for record in unvectorized:
-                    if record.is_vectorized == -1:
-                        continue
-                    
-                    if record.is_vectorized == 2 and record.vector_id:
-                        try:
-                            self.vector_store.delete(ids=[record.vector_id])
-                        except Exception:
-                            pass
-                    
+                if record.is_vectorized == 2 and record.vector_id:
                     try:
-                        vector_ids = self.vector_store.add([record.text], [record.metadata or {}])
-                        if vector_ids:
-                            self.sqlite.update_vector_status(record.id, vector_ids[0], is_vectorized=1)
-                            print(f"[启动补偿] 记录 {record.id} 同步成功")
-                    except Exception as e:
-                        print(f"[启动补偿] 记录 {record.id} 同步失败: {e}")
+                        self.vector_store.delete(ids=[record.vector_id])
+                    except Exception:
+                        pass
+                
+                existing = self.vector_store.search(record.text, n_results=1)
+                if existing and existing[0].get("similarity", 0) > 0.99:
+                    existing_id = existing[0].get("id")
+                    self.sqlite.update_vector_status(record.id, existing_id, is_vectorized=1)
+                    skip_count += 1
+                    self._log.debug("STARTUP_RECOVERY_SKIP", record_id=record.id, reason="vector_exists")
+                    continue
+                
+                try:
+                    vector_ids = self.vector_store.add([record.text], [record.metadata or {}])
+                    if vector_ids:
+                        self.sqlite.update_vector_status(record.id, vector_ids[0], is_vectorized=1)
+                        success_count += 1
+                    else:
+                        fail_count += 1
+                except Exception as e:
+                    fail_count += 1
+                    self._log.error("STARTUP_RECOVERY_FAILED", record_id=record.id, error=str(e))
+            
+            if success_count > 0 or skip_count > 0 or fail_count > 0:
+                print(f"[启动补偿] 完成: 成功={success_count}, 跳过={skip_count}, 失败={fail_count}")
             
             orphan_vectors = self._check_and_clean_orphan_vectors()
             if orphan_vectors > 0:
@@ -471,8 +497,8 @@ class AsyncMemoryProcessor:
             
             orphan_ids = []
             for vid in all_ids[:100]:
-                records = self.sqlite.get_by_vector_id(vid)
-                if not records:
+                record = self.sqlite.get_by_vector_id(vid)
+                if not record:
                     orphan_ids.append(vid)
             
             if orphan_ids:
@@ -499,9 +525,8 @@ class AsyncMemoryProcessor:
                 return
             
             for vid in all_ids[:50]:
-                records = self.sqlite.get_by_vector_id(vid)
-                if records:
-                    record = records[0]
+                record = self.sqlite.get_by_vector_id(vid)
+                if record:
                     chroma_metadata = self.vector_store.get_metadata(vid)
                     if chroma_metadata:
                         sqlite_time = record.created_time
@@ -694,13 +719,19 @@ class AsyncMemoryProcessor:
     
     def _flush_buffer(self):
         """
-        将缓冲区数据原子化写入
+        将缓冲区数据原子化写入（批量优化版）
         
         流程（两阶段提交）：
-        1. 检查幂等性（文本哈希）
-        2. 写入SQLite（标记为待向量化）
-        3. 写入ChromaDB
-        4. 更新SQLite状态
+        1. 批量检查幂等性（文本哈希）
+        2. 批量写入SQLite（标记为待向量化）
+        3. 批量写入ChromaDB
+        4. 批量更新SQLite状态
+        
+        性能优化：
+        - 使用批量哈希计算
+        - 使用批量存在性检查
+        - 使用批量插入（add_batch）
+        - 使用批量状态更新
         
         失败恢复：
         - 启动时通过 _startup_recovery 重试未向量化的记录
@@ -719,18 +750,28 @@ class AsyncMemoryProcessor:
             self.batch_buffer.clear()
             self._buffer_first_item_time = None
         
+        if not texts:
+            return
+        
         sqlite_ids = []
         texts_to_vectorize = []
         metadatas_to_vectorize = []
-        hash_list = []
         
         if self.sqlite:
-            for text, meta in zip(texts, metadatas):
-                text_hash = self.sqlite.compute_text_hash(text)
-                hash_list.append(text_hash)
-                
+            text_hashes = [self.sqlite.compute_text_hash(text) for text in texts]
+            
+            existing_map = {}
+            for text_hash in text_hashes:
                 exists, existing_id = self.sqlite.exists_by_text_hash(text_hash)
                 if exists:
+                    existing_map[text_hash] = existing_id
+            
+            new_records = []
+            new_record_hashes = []
+            
+            for i, (text, meta, text_hash) in enumerate(zip(texts, metadatas, text_hashes)):
+                if text_hash in existing_map:
+                    existing_id = existing_map[text_hash]
                     record = self.sqlite.get(existing_id)
                     if record and record.is_vectorized == 1:
                         self._log.debug("SKIP_DUPLICATE", text_preview=text[:50])
@@ -746,8 +787,13 @@ class AsyncMemoryProcessor:
                         metadata=meta,
                         is_vectorized=0
                     )
-                    record_id = self.sqlite.add_with_hash(record, text_hash)
-                    sqlite_ids.append((record_id, text_hash))
+                    new_records.append(record)
+                    new_record_hashes.append(text_hash)
+            
+            if new_records:
+                new_ids = self.sqlite.add_batch_with_hash(new_records, new_record_hashes)
+                for new_id, text_hash, text, meta in zip(new_ids, new_record_hashes, texts[len(sqlite_ids):], metadatas[len(sqlite_ids):]):
+                    sqlite_ids.append((new_id, text_hash))
                     texts_to_vectorize.append(text)
                     metadatas_to_vectorize.append(meta)
         else:
@@ -764,8 +810,10 @@ class AsyncMemoryProcessor:
             vector_ids = self.vector_store.add(texts_to_vectorize, metadatas_to_vectorize)
             
             if self.sqlite and sqlite_ids and vector_ids:
-                for (sqlite_id, text_hash), vector_id in zip(sqlite_ids, vector_ids):
-                    self.sqlite.update_vector_status(sqlite_id, vector_id, is_vectorized=1)
+                self.sqlite.batch_update_vector_status(
+                    [(sid, vid) for (sid, _), vid in zip(sqlite_ids, vector_ids)],
+                    is_vectorized=1
+                )
             
             self._log.info("ATOMIC_WRITE_COMPLETE", count=len(texts_to_vectorize))
             self._last_flush_time = time.time()
@@ -787,8 +835,10 @@ class AsyncMemoryProcessor:
                     self._log.error("ROLLBACK_FAILED", error=str(del_e))
             
             if self.sqlite and sqlite_ids:
-                for sqlite_id, text_hash in sqlite_ids:
-                    self.sqlite.update_vector_status(sqlite_id, "", is_vectorized=-1)
+                self.sqlite.batch_update_vector_status(
+                    [(sid, "") for sid, _ in sqlite_ids],
+                    is_vectorized=-1
+                )
         finally:
             self._tx_coordinator.end_migration()
     

@@ -91,19 +91,47 @@ class LlamaClient:
     
     def check_connection(self) -> bool:
         """检查 llama.cpp 服务是否可用"""
+        base_url = self.api_url.replace("/completion", "")
+        
         try:
-            response = requests.get(self.api_url.replace("/completion", "/health"), timeout=5)
-            return response.status_code == 200
-        except requests.exceptions.RequestException:
-            try:
-                test_messages = [{"role": "user", "content": "Hi"}]
-                test_payload = {"model": "local", "messages": test_messages, "max_tokens": 1}
-                response = requests.post(self.chat_api_url, json=test_payload, timeout=5)
-                return response.status_code == 200
-            except requests.exceptions.RequestException:
-                try:
-                    test_payload = {"prompt": "Hello", "n_predict": 1}
-                    response = requests.post(self.api_url, json=test_payload, timeout=5)
-                    return response.status_code == 200
-                except requests.exceptions.RequestException:
-                    return False
+            response = requests.get(f"{base_url}/health", timeout=5)
+            if response.status_code == 200:
+                print(f"[LLM] 连接成功: {base_url}/health")
+                return True
+        except requests.exceptions.ConnectionError:
+            print(f"[LLM] 连接失败: 无法连接到 {base_url}，请确保 llama.cpp 服务已启动")
+        except requests.exceptions.Timeout:
+            print(f"[LLM] 连接超时: {base_url}/health 响应超过5秒")
+        except requests.exceptions.RequestException as e:
+            print(f"[LLM] 健康检查失败: {e}")
+        
+        try:
+            test_messages = [{"role": "user", "content": "Hi"}]
+            test_payload = {"model": "local", "messages": test_messages, "max_tokens": 1}
+            response = requests.post(self.chat_api_url, json=test_payload, timeout=5)
+            if response.status_code == 200:
+                print(f"[LLM] Chat API 连接成功: {self.chat_api_url}")
+                return True
+            else:
+                print(f"[LLM] Chat API 返回错误: {response.status_code}")
+        except requests.exceptions.ConnectionError:
+            print(f"[LLM] Chat API 连接失败: {self.chat_api_url}")
+        except requests.exceptions.RequestException as e:
+            print(f"[LLM] Chat API 测试失败: {e}")
+        
+        try:
+            test_payload = {"prompt": "Hello", "n_predict": 1}
+            response = requests.post(self.api_url, json=test_payload, timeout=5)
+            if response.status_code == 200:
+                print(f"[LLM] Completion API 连接成功: {self.api_url}")
+                return True
+            else:
+                print(f"[LLM] Completion API 返回错误: {response.status_code}")
+        except requests.exceptions.RequestException as e:
+            print(f"[LLM] Completion API 测试失败: {e}")
+        
+        print(f"[LLM] 所有连接尝试失败，请检查:")
+        print(f"  1. llama.cpp 服务是否已启动")
+        print(f"  2. API URL 配置是否正确: {self.api_url}")
+        print(f"  3. 端口是否被防火墙阻止")
+        return False

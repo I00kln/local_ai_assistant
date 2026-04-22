@@ -306,26 +306,40 @@ class ChatWindow:
             self._append_message("system", f"获取过滤统计失败: {e}")
     
     def _check_connections(self):
-        """检查连接状态"""
+        """检查连接状态（异步）"""
         if self._closing:
             return
         
-        local_ok = self.llm and self.llm.check_connection()
-        cloud_ok = self.hybrid_client and self.hybrid_client.is_cloud_available()
+        def check_in_background():
+            local_ok = False
+            cloud_ok = False
+            
+            try:
+                local_ok = self.llm and self.llm.check_connection()
+            except Exception:
+                pass
+            
+            try:
+                cloud_ok = self.hybrid_client and self.hybrid_client.is_cloud_available()
+            except Exception:
+                pass
+            
+            status_parts = []
+            if local_ok:
+                status_parts.append("本地LLM已连接")
+            else:
+                status_parts.append("本地LLM未连接")
+            
+            if cloud_ok:
+                status_parts.append(f"云端AI({config.cloud.provider})可用")
+            
+            self._safe_after(0, lambda: self.state_manager.add_status_message(" | ".join(status_parts)))
+            
+            if not local_ok:
+                self._safe_after(0, lambda: self._append_message("system", "无法连接到 llama.cpp，请确保服务已启动"))
         
-        status_parts = []
-        if local_ok:
-            status_parts.append("本地LLM已连接")
-        else:
-            status_parts.append("本地LLM未连接")
-        
-        if cloud_ok:
-            status_parts.append(f"云端AI({config.cloud.provider})可用")
-        
-        self.state_manager.add_status_message(" | ".join(status_parts))
-        
-        if not local_ok:
-            self._append_message("system", "无法连接到 llama.cpp，请确保服务已启动")
+        check_thread = threading.Thread(target=check_in_background, daemon=True)
+        check_thread.start()
     
     def _send_message(self):
         """发送用户消息"""
@@ -342,8 +356,10 @@ class ChatWindow:
         
         self.send_button.config(state=tk.DISABLED)
         
-        use_local = self.local_var.get() and self.llm and self.llm.check_connection()
-        use_cloud = self.cloud_var.get() and self.hybrid_client and self.hybrid_client.is_cloud_available()
+        use_local = self.local_var.get() and self.llm is not None
+        use_cloud = self.cloud_var.get() and self.hybrid_client is not None
+        show_memory = self.show_memory_enabled.get()
+        show_local = self.show_local_enabled.get()
         
         if use_local and use_cloud:
             self.state_manager.set_state(UIState.PROCESSING_HYBRID, "本地+云端处理中")
@@ -356,7 +372,7 @@ class ChatWindow:
             self._safe_after(0, lambda: self.send_button.config(state=tk.NORMAL))
             return
         
-        thread = threading.Thread(target=self._process_message, args=(user_input, use_local, use_cloud), daemon=True)
+        thread = threading.Thread(target=self._process_message, args=(user_input, use_local, use_cloud, show_memory, show_local), daemon=True)
         thread.start()
     
     def _build_retrieval_metadata(self, memories: List[Dict], memory_context: str) -> Dict[str, Any]:
@@ -384,7 +400,7 @@ class ChatWindow:
             "avg_similarity": sum(m.get("similarity", 0) for m in memories) / len(memories) if memories else 0
         }
     
-    def _process_message(self, user_input: str, use_local: bool, use_cloud: bool):
+    def _process_message(self, user_input: str, use_local: bool, use_cloud: bool, show_memory: bool = True, show_local: bool = True):
         """处理用户消息（后台线程）"""
         if self._closing:
             self._safe_after(0, lambda: self.send_button.config(state=tk.NORMAL))
@@ -399,7 +415,7 @@ class ChatWindow:
             
             retrieval_metadata = self._build_retrieval_metadata(retrieved_memories, memory_context)
             
-            if self.show_memory_enabled.get() and retrieved_memories:
+            if show_memory and retrieved_memories:
                 memory_info = "\n".join([
                     f"  [{m.get('similarity', 0):.2f}][{m.get('source', '?')}] {m.get('text', '')[:50]}..."
                     for m in retrieved_memories[:5]
@@ -452,7 +468,7 @@ class ChatWindow:
                     messages.append({"role": "user", "content": user_message})
                     local_response = self.llm.chat(messages)
                     
-                    if local_response and self.show_local_enabled.get():
+                    if local_response and show_local:
                         self._safe_after(0, lambda resp=local_response: self._append_message("assistant", resp))
                     
                     if local_response:
@@ -537,8 +553,7 @@ class ChatWindow:
                     "source": "cloud" if cloud_success else "local"
                 })
             
-            memory_count = len(self.memory) if self.memory else 0
-            self._safe_after(0, lambda cnt=memory_count: self.state_manager.set_state(UIState.IDLE, f"记忆数: {cnt}"))
+            self._safe_after(0, lambda: self.state_manager.set_state(UIState.IDLE))
             
         except Exception as e:
             error_msg = str(e)
