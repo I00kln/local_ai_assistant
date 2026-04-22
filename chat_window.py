@@ -32,12 +32,23 @@ class ChatWindow:
         self._setup_ui()
         
         self.state_manager = UIStateManager(self.status_label, self.memory_count_label)
-        self.state_manager.set_state(UIState.INITIALIZING, "正在加载组件...")
+        self.state_manager.set_state(UIState.INITIALIZING, "正在初始化...")
         
-        after_id = self.window.after(100, self._async_init)
+        self.window.update()
+        
+        after_id = self.window.after(50, self._start_background_init)
         self._after_ids.append(after_id)
         
         self.window.protocol("WM_DELETE_WINDOW", self._on_close)
+    
+    def _start_background_init(self):
+        """启动后台初始化（延迟启动）"""
+        if self._closing:
+            return
+        
+        self.state_manager.set_state(UIState.INITIALIZING, "正在连接数据库...")
+        self._init_thread = threading.Thread(target=self._async_init, daemon=True)
+        self._init_thread.start()
     
     def _setup_ui(self):
         """设置界面"""
@@ -178,51 +189,58 @@ class ChatWindow:
         self._after_ids.clear()
     
     def _async_init(self):
-        """后台异步初始化组件"""
-        def init_components():
+        """后台异步初始化组件（分阶段）"""
+        if self._closing:
+            return
+        
+        try:
+            self._safe_after(0, lambda: self.state_manager.set_state(
+                UIState.INITIALIZING, "正在连接数据库..."
+            ))
+            self._safe_after(0, lambda: self._append_message("system", "初始化记忆系统..."))
+            
+            from memory_manager import get_memory_manager
+            self.memory = get_memory_manager()
+            
             if self._closing:
                 return
             
-            try:
-                self._safe_after(0, lambda: self._append_message("system", "初始化记忆系统..."))
-                
-                from memory_manager import get_memory_manager
-                self.memory = get_memory_manager()
-                
-                if self._closing:
-                    return
-                
-                l2_count = len(self.memory.vector_store)
-                l3_count = self.memory.sqlite.count() if self.memory.sqlite else 0
-                self._safe_after(0, lambda msg=f"L2向量库: {l2_count}条, L3数据库: {l3_count}条": 
-                    self._append_message("system", f"记忆库加载完成 - {msg}"))
-                
-                self.state_manager.set_memory_counts(l2_count, l3_count)
-                
-                from llm_client import LlamaClient
-                self.llm = LlamaClient()
-                
-                from context_builder import ContextBuilder
-                self.context_builder = ContextBuilder(self.memory)
-                
-                from async_processor import AsyncMemoryProcessor
-                self.async_processor = AsyncMemoryProcessor()
-                self.async_processor.start()
-                
-                self._init_cloud_client()
-                
-                self._initialized = True
-                
-                self._safe_after(0, self._enable_ui)
-                self._safe_after(0, self._check_connections)
-                
-            except Exception as e:
-                err_msg = str(e)
-                self._safe_after(0, lambda msg=err_msg: self._append_message("system", f"初始化失败: {msg}"))
-                self._safe_after(0, lambda: self.state_manager.set_state(UIState.ERROR, "初始化失败"))
-        
-        self._init_thread = threading.Thread(target=init_components, daemon=True)
-        self._init_thread.start()
+            l2_count = len(self.memory.vector_store)
+            l3_count = self.memory.sqlite.count() if self.memory.sqlite else 0
+            self._safe_after(0, lambda msg=f"L2向量库: {l2_count}条, L3数据库: {l3_count}条": 
+                self._append_message("system", f"记忆库加载完成 - {msg}"))
+            
+            self.state_manager.set_memory_counts(l2_count, l3_count)
+            
+            self._safe_after(0, lambda: self.state_manager.set_state(
+                UIState.INITIALIZING, "正在加载AI模型..."
+            ))
+            
+            from llm_client import LlamaClient
+            self.llm = LlamaClient()
+            
+            from context_builder import ContextBuilder
+            self.context_builder = ContextBuilder(self.memory)
+            
+            self._safe_after(0, lambda: self.state_manager.set_state(
+                UIState.INITIALIZING, "正在启动后台处理器..."
+            ))
+            
+            from async_processor import AsyncMemoryProcessor
+            self.async_processor = AsyncMemoryProcessor()
+            self.async_processor.start()
+            
+            self._init_cloud_client()
+            
+            self._initialized = True
+            
+            self._safe_after(0, self._enable_ui)
+            self._safe_after(0, self._check_connections)
+            
+        except Exception as e:
+            err_msg = str(e)
+            self._safe_after(0, lambda msg=err_msg: self._append_message("system", f"初始化失败: {msg}"))
+            self._safe_after(0, lambda: self.state_manager.set_state(UIState.ERROR, "初始化失败"))
     
     def _init_cloud_client(self):
         """初始化云端客户端"""

@@ -5,7 +5,6 @@ import threading
 import hashlib
 from collections import OrderedDict
 from typing import List, Optional
-import numpy as np
 
 
 class EmbeddingService:
@@ -71,6 +70,7 @@ class EmbeddingService:
                 return
             
             try:
+                import numpy as np
                 from config import config
                 import onnxruntime as ort
                 from tokenizers import Tokenizer
@@ -196,7 +196,7 @@ class EmbeddingService:
         
         return result
     
-    def embed_single(self, text: str, use_prefix: bool = False) -> np.ndarray:
+    def embed_single(self, text: str, use_prefix: bool = False):
         """
         生成单个文本的嵌入向量
         
@@ -207,6 +207,8 @@ class EmbeddingService:
         Returns:
             嵌入向量 (numpy array)
         """
+        import numpy as np
+        
         self._ensure_initialized()
         
         if self._fallback_mode:
@@ -218,6 +220,7 @@ class EmbeddingService:
     
     def _generate_real_embeddings(self, texts: List[str]) -> List[List[float]]:
         """生成真实的嵌入向量"""
+        import numpy as np
         import time
         from metrics import get_metrics_collector
         
@@ -254,8 +257,10 @@ class EmbeddingService:
             embeddings.append(embedding.tolist())
         return embeddings
     
-    def _generate_fallback_embedding(self, text: str) -> np.ndarray:
+    def _generate_fallback_embedding(self, text: str):
         """生成单个文本的降级模式嵌入向量"""
+        import numpy as np
+        
         text_hash = hashlib.md5(text.encode()).hexdigest()
         np.random.seed(int(text_hash[:8], 16))
         embedding = np.random.randn(self._dimension).astype(np.float32)
