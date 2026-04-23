@@ -3,6 +3,75 @@ from typing import Dict, List, Optional, Tuple
 from abc import ABC, abstractmethod
 from config import config
 import re
+from urllib.parse import urlparse
+
+
+class SecurityError(Exception):
+    """安全错误"""
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
+
+
+def validate_https_url(url: str, allow_localhost: bool = True) -> Tuple[bool, str]:
+    """
+    验证 URL 是否使用 HTTPS
+    
+    Args:
+        url: 待验证的 URL
+        allow_localhost: 是否允许 localhost HTTP（本地开发）
+    
+    Returns:
+        (是否安全, 错误信息)
+    """
+    if not url:
+        return True, ""
+    
+    try:
+        parsed = urlparse(url)
+        
+        if allow_localhost and parsed.hostname in ("localhost", "127.0.0.1", "::1"):
+            return True, ""
+        
+        if parsed.scheme != "https":
+            return False, f"URL 必须使用 HTTPS: {url}"
+        
+        return True, ""
+    except Exception as e:
+        return False, f"URL 解析失败: {e}"
+
+
+def enforce_https(url: str, provider: str = "") -> str:
+    """
+    强制使用 HTTPS
+    
+    Args:
+        url: 原始 URL
+        provider: 提供商名称（用于日志）
+    
+    Returns:
+        HTTPS URL
+    
+    Raises:
+        SecurityError: 如果配置要求 HTTPS 但 URL 无法转换
+    """
+    if not url:
+        return url
+    
+    parsed = urlparse(url)
+    
+    if parsed.hostname in ("localhost", "127.0.0.1", "::1"):
+        return url
+    
+    if parsed.scheme == "http" and config.privacy.https_only:
+        secure_url = url.replace("http://", "https://", 1)
+        print(f"[安全] 已将 {provider} URL 升级为 HTTPS")
+        return secure_url
+    
+    if parsed.scheme not in ("https", "http"):
+        raise SecurityError("INVALID_URL_SCHEME", f"不支持的 URL 协议: {parsed.scheme}")
+    
+    return url
 
 
 def validate_api_key(provider: str, api_key: str) -> Tuple[bool, str]:
@@ -19,25 +88,27 @@ def validate_api_key(provider: str, api_key: str) -> Tuple[bool, str]:
     if not api_key:
         return False, "API 密钥为空"
     
+    min_length = config.privacy.api_key_min_length
+    
     provider_lower = provider.lower()
     
     if provider_lower == "openai":
         if not api_key.startswith("sk-"):
             return False, "OpenAI API 密钥应以 'sk-' 开头"
-        if len(api_key) < 20:
-            return False, "OpenAI API 密钥长度不足"
+        if len(api_key) < min_length:
+            return False, f"OpenAI API 密钥长度不足（最小 {min_length}）"
         if not re.match(r'^sk-[A-Za-z0-9_-]+$', api_key):
             return False, "OpenAI API 密钥格式无效"
     
     elif provider_lower == "gemini":
-        if len(api_key) < 20:
-            return False, "Gemini API 密钥长度不足"
+        if len(api_key) < min_length:
+            return False, f"Gemini API 密钥长度不足（最小 {min_length}）"
         if not re.match(r'^[A-Za-z0-9_-]+$', api_key):
             return False, "Gemini API 密钥格式无效"
     
     elif provider_lower == "glm":
-        if len(api_key) < 20:
-            return False, "GLM API 密钥长度不足"
+        if len(api_key) < min_length:
+            return False, f"GLM API 密钥长度不足（最小 {min_length}）"
         if not re.match(r'^[A-Za-z0-9._-]+$', api_key):
             return False, "GLM API 密钥格式无效"
     
@@ -62,7 +133,7 @@ class OpenAIClient(CloudAIClient):
     def __init__(self, api_key: str, model: str = "gpt-4o-mini", base_url: str = None):
         self.api_key = api_key
         self.model = model
-        self.base_url = base_url
+        self.base_url = enforce_https(base_url, "OpenAI") if base_url else None
         self._client = None
         self._init_client()
     
@@ -262,6 +333,21 @@ class HybridClient:
         
         return self._sensitive_filter.mask(text)
     
+    def _mask_sensitive_dict(self, data: Dict) -> Tuple[Dict, Dict]:
+        """
+        脱敏字典数据
+        
+        Args:
+            data: 原始字典
+        
+        Returns:
+            (脱敏后字典, 检测统计)
+        """
+        if not self._filter_enabled or not self._sensitive_filter:
+            return data, {}
+        
+        return self._sensitive_filter.mask_dict(data)
+    
     def process(
         self, 
         user_input: str, 
@@ -291,9 +377,11 @@ class HybridClient:
         total_detected = {}
         
         if metadata:
-            meta_info = self._format_metadata(metadata)
+            masked_metadata, detected = self._mask_sensitive_dict(metadata)
+            meta_info = self._format_metadata(masked_metadata)
             if meta_info:
                 context_parts.append(f"【上下文元数据】\n{meta_info}")
+            total_detected.update(detected)
         
         if compressed_memory:
             masked_memory, detected = self._mask_sensitive(compressed_memory)

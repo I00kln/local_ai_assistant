@@ -119,6 +119,7 @@ class MemoryManager:
         - 等待迁移操作完成后再执行检索
         - 使用版本号检测并发修改
         - 检测到修改时自动重试（最多2次）
+        - 迁移超时时记录警告但继续执行
         
         Args:
             query: 搜索查询
@@ -136,8 +137,16 @@ class MemoryManager:
         start_time = time.perf_counter()
         
         if self._tx_coordinator.is_migration_active():
-            self._tx_coordinator.wait_for_migration(timeout=5.0)
-            self._tx_coordinator.release_migration_wait()
+            migration_type = self._tx_coordinator.get_migration_type()
+            acquired = self._tx_coordinator.wait_for_migration(timeout=5.0)
+            if acquired:
+                self._tx_coordinator.release_migration_wait()
+            else:
+                self._log.warning(
+                    "SEARCH_MIGRATION_TIMEOUT",
+                    migration_type=migration_type,
+                    message="迁移超时，继续执行检索（可能看到中间状态）"
+                )
         
         if top_k is None:
             top_k = config.max_retrieve_results
@@ -171,19 +180,26 @@ class MemoryManager:
         """
         实际执行搜索（内部方法）
         
-        优化：使用超额采样 + 内存重排策略
-        1. 扩大召回范围（top_k * 3）
-        2. 在内存中结合时间衰减、权重等因素重新打分
-        3. 最后截断输出最终的Top-K
-        4. 过滤掉 forgotten 记忆
+        优化策略：
+        1. 可配置的超额采样倍数（recall_multiplier）
+        2. ChromaDB where 过滤器预过滤 forgotten 记忆
+        3. 早停机制：高质量结果足够时提前终止
+        4. 内存重排结合时间衰减、权重等因素
+        
+        时间复杂度：
+            - 优化前: O(recall_limit) 固定超额采样
+            - 优化后: O(actual_recall) 动态调整，可能提前终止
         """
         results = []
         seen_texts = set()
         
         time_context = self._detect_time_context(query)
         
-        recall_multiplier = 3
+        recall_multiplier = getattr(config, 'recall_multiplier', 3)
         recall_limit = top_k * recall_multiplier
+        
+        high_quality_threshold = 0.95
+        min_high_quality = top_k
         
         if include_l1:
             l1_results = self._search_l1(query, recall_limit, threshold)
@@ -196,9 +212,11 @@ class MemoryManager:
                     results.append(r)
             self.stats["l1_hits"] += len(l1_results)
         
-        if len(results) < recall_limit:
+        high_quality_count = sum(1 for r in results if r.similarity >= high_quality_threshold)
+        
+        if len(results) < recall_limit and high_quality_count < min_high_quality:
             remaining = recall_limit - len(results)
-            l2_results = self._search_l2(query, remaining)
+            l2_results = self._search_l2(query, remaining, time_context)
             for r in l2_results:
                 if r.text not in seen_texts:
                     if MemoryTagHelper.is_forgotten(r.metadata):
@@ -209,7 +227,9 @@ class MemoryManager:
                     results.append(r)
         self.stats["l2_hits"] += len(l2_results)
         
-        if include_l3 and len(results) < recall_limit and config.sqlite_enabled:
+        high_quality_count = sum(1 for r in results if r.similarity >= high_quality_threshold)
+        
+        if include_l3 and len(results) < recall_limit and high_quality_count < min_high_quality and config.sqlite_enabled:
             remaining = recall_limit - len(results)
             l3_results = self._search_l3(query, remaining)
             for r in l3_results:
@@ -440,20 +460,51 @@ class MemoryManager:
         results.sort(key=lambda x: x.similarity, reverse=True)
         return results[:top_k]
     
-    def _search_l2(self, query: str, top_k: int) -> List[MemorySearchResult]:
-        """搜索L2向量库"""
+    def _search_l2(self, query: str, top_k: int, time_context: Dict = None) -> List[MemorySearchResult]:
+        """
+        搜索L2向量库（优化版）
+        
+        优化策略：
+        1. 使用 ChromaDB where 过滤器预过滤 forgotten 记忆
+        2. 减少内存层的过滤开销
+        3. 支持时间上下文感知
+        
+        Args:
+            query: 查询文本
+            top_k: 返回数量
+            time_context: 时间上下文（用于时间范围过滤）
+        
+        时间复杂度：
+            - 优化前: O(n) 内存过滤
+            - 优化后: O(k) 向量检索，k 为返回数量
+        """
         results = []
         
         try:
-            l2_results = self.vector_store.search(query, n_results=top_k)
+            where_filter = {
+                "$or": [
+                    {"forgotten": {"$ne": True}},
+                    {"forgotten": None}
+                ]
+            }
+            
+            l2_results = self.vector_store.search(
+                query, 
+                n_results=top_k,
+                where=where_filter
+            )
             
             for r in l2_results:
+                metadata = r.get("metadata", {})
+                if metadata.get(MemoryTags.FORGOTTEN):
+                    continue
+                
                 results.append(MemorySearchResult(
                     text=r["text"],
                     source="L2",
                     similarity=r["similarity"],
-                    weight=1.0,
-                    metadata=r.get("metadata", {})
+                    weight=metadata.get("weight", 1.0),
+                    metadata=metadata
                 ))
         except Exception as e:
             print(f"L2搜索失败: {e}")

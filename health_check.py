@@ -1,7 +1,7 @@
 import threading
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 from datetime import datetime
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from logger import get_logger
 
@@ -14,6 +14,15 @@ class HealthStatus(Enum):
     UNKNOWN = "unknown"
 
 
+class DegradationLevel(Enum):
+    """降级级别"""
+    NONE = "none"
+    MINIMAL = "minimal"
+    PARTIAL = "partial"
+    SEVERE = "severe"
+    CRITICAL = "critical"
+
+
 @dataclass
 class ComponentHealth:
     """组件健康状态"""
@@ -22,6 +31,39 @@ class ComponentHealth:
     message: str
     details: Dict[str, Any]
     checked_at: datetime
+    degradation_level: DegradationLevel = DegradationLevel.NONE
+    fallback_active: bool = False
+    dependencies: List[str] = field(default_factory=list)
+
+
+@dataclass
+class DependencyInfo:
+    """依赖信息"""
+    name: str
+    component: str
+    critical: bool
+    status: HealthStatus
+
+
+DEPENDENCY_GRAPH = {
+    "vector_store": [
+        DependencyInfo("embedding_service", "embedding", True, HealthStatus.UNKNOWN),
+        DependencyInfo("chromadb", "chromadb", True, HealthStatus.UNKNOWN),
+    ],
+    "sqlite_store": [
+        DependencyInfo("sqlite", "sqlite", True, HealthStatus.UNKNOWN),
+        DependencyInfo("disk_space", "system", True, HealthStatus.UNKNOWN),
+    ],
+    "async_processor": [
+        DependencyInfo("vector_store", "vector_store", True, HealthStatus.UNKNOWN),
+        DependencyInfo("sqlite_store", "sqlite_store", True, HealthStatus.UNKNOWN),
+        DependencyInfo("llm_client", "llm", False, HealthStatus.UNKNOWN),
+    ],
+    "memory_manager": [
+        DependencyInfo("vector_store", "vector_store", True, HealthStatus.UNKNOWN),
+        DependencyInfo("sqlite_store", "sqlite_store", False, HealthStatus.UNKNOWN),
+    ],
+}
 
 
 class HealthChecker:
@@ -33,6 +75,11 @@ class HealthChecker:
     - SQLiteStore: 数据库连接、记录数量
     - MemoryManager: L1/L2/L3 记忆数量
     - AsyncProcessor: 处理队列状态、压缩器可用性
+    
+    增强：
+    - 依赖关系检查
+    - 降级状态追踪
+    - 降级状态机
     """
     
     _instance: Optional['HealthChecker'] = None
@@ -53,11 +100,41 @@ class HealthChecker:
         self._initialized = True
         self._log = get_logger()
         self._components: Dict[str, Any] = {}
+        self._degradation_state: Dict[str, DegradationLevel] = {}
+        self._fallback_status: Dict[str, bool] = {}
     
     def register_component(self, name: str, component: Any):
         """注册组件"""
         self._components[name] = component
+        self._degradation_state[name] = DegradationLevel.NONE
+        self._fallback_status[name] = False
         self._log.debug("HEALTH_COMPONENT_REGISTERED", component=name)
+    
+    def set_degradation(self, component: str, level: DegradationLevel, fallback: bool = False):
+        """
+        设置组件降级状态
+        
+        Args:
+            component: 组件名称
+            level: 降级级别
+            fallback: 是否启用了降级方案
+        """
+        self._degradation_state[component] = level
+        self._fallback_status[component] = fallback
+        self._log.info("DEGRADATION_STATE_CHANGED", 
+                      component=component, 
+                      level=level.value,
+                      fallback=fallback)
+    
+    def get_degradation_state(self) -> Dict[str, Any]:
+        """获取所有组件的降级状态"""
+        return {
+            name: {
+                "level": level.value,
+                "fallback_active": self._fallback_status.get(name, False)
+            }
+            for name, level in self._degradation_state.items()
+        }
     
     def check_all(self) -> Dict[str, ComponentHealth]:
         """检查所有组件健康状态"""
@@ -66,6 +143,9 @@ class HealthChecker:
         for name, component in self._components.items():
             try:
                 health = self._check_component(name, component)
+                health.degradation_level = self._degradation_state.get(name, DegradationLevel.NONE)
+                health.fallback_active = self._fallback_status.get(name, False)
+                health.dependencies = [d.name for d in DEPENDENCY_GRAPH.get(name, [])]
                 results[name] = health
             except Exception as e:
                 results[name] = ComponentHealth(
@@ -73,7 +153,8 @@ class HealthChecker:
                     status=HealthStatus.UNHEALTHY,
                     message=f"检查失败: {str(e)}",
                     details={"error": str(e)},
-                    checked_at=datetime.now()
+                    checked_at=datetime.now(),
+                    degradation_level=self._degradation_state.get(name, DegradationLevel.CRITICAL)
                 )
         
         return results
@@ -336,7 +417,244 @@ class HealthChecker:
         return "\n".join(lines)
 
 
+class DegradationStateMachine:
+    """
+    降级状态机
+    
+    管理组件降级状态转换：
+    - NONE → MINIMAL → PARTIAL → SEVERE → CRITICAL
+    - 支持自动恢复和手动恢复
+    """
+    
+    TRANSITIONS = {
+        DegradationLevel.NONE: [DegradationLevel.MINIMAL],
+        DegradationLevel.MINIMAL: [DegradationLevel.NONE, DegradationLevel.PARTIAL],
+        DegradationLevel.PARTIAL: [DegradationLevel.MINIMAL, DegradationLevel.SEVERE],
+        DegradationLevel.SEVERE: [DegradationLevel.PARTIAL, DegradationLevel.CRITICAL],
+        DegradationLevel.CRITICAL: [DegradationLevel.SEVERE],
+    }
+    
+    RECOVERY_PATH = {
+        DegradationLevel.CRITICAL: DegradationLevel.SEVERE,
+        DegradationLevel.SEVERE: DegradationLevel.PARTIAL,
+        DegradationLevel.PARTIAL: DegradationLevel.MINIMAL,
+        DegradationLevel.MINIMAL: DegradationLevel.NONE,
+    }
+    
+    def __init__(self):
+        self._states: Dict[str, DegradationLevel] = {}
+        self._recovery_attempts: Dict[str, int] = {}
+        self._max_recovery_attempts = 3
+    
+    def get_state(self, component: str) -> DegradationLevel:
+        """获取组件当前降级状态"""
+        return self._states.get(component, DegradationLevel.NONE)
+    
+    def degrade(self, component: str) -> DegradationLevel:
+        """
+        降级组件状态
+        
+        Returns:
+            新的降级级别
+        """
+        current = self._states.get(component, DegradationLevel.NONE)
+        
+        if current == DegradationLevel.CRITICAL:
+            return current
+        
+        transitions = self.TRANSITIONS.get(current, [])
+        if len(transitions) > 1:
+            new_state = transitions[1]
+        elif transitions:
+            new_state = transitions[0]
+        else:
+            new_state = current
+        
+        self._states[component] = new_state
+        self._recovery_attempts[component] = 0
+        return new_state
+    
+    def recover(self, component: str) -> DegradationLevel:
+        """
+        尝试恢复组件状态
+        
+        Returns:
+            新的降级级别
+        """
+        current = self._states.get(component, DegradationLevel.NONE)
+        
+        if current == DegradationLevel.NONE:
+            return current
+        
+        attempts = self._recovery_attempts.get(component, 0) + 1
+        self._recovery_attempts[component] = attempts
+        
+        if attempts >= self._max_recovery_attempts:
+            new_state = self.RECOVERY_PATH.get(current, DegradationLevel.NONE)
+            self._states[component] = new_state
+            self._recovery_attempts[component] = 0
+            return new_state
+        
+        return current
+    
+    def force_recover(self, component: str) -> DegradationLevel:
+        """强制恢复到上一级"""
+        current = self._states.get(component, DegradationLevel.NONE)
+        new_state = self.RECOVERY_PATH.get(current, DegradationLevel.NONE)
+        self._states[component] = new_state
+        self._recovery_attempts[component] = 0
+        return new_state
+
+
+class HealthEndpoint:
+    """
+    健康检查端点
+    
+    提供 HTTP 风格的健康检查 API：
+    - /health: 基本健康状态
+    - /health/ready: 就绪探针
+    - /health/live: 存活探针
+    - /health/degradation: 降级状态
+    - /health/dependencies: 依赖关系
+    """
+    
+    def __init__(self, health_checker: HealthChecker):
+        self._checker = health_checker
+        self._state_machine = DegradationStateMachine()
+        self._log = get_logger()
+    
+    def health(self) -> Dict[str, Any]:
+        """
+        基本健康状态
+        
+        Returns:
+            整体健康状态和各组件状态
+        """
+        return self._checker.get_summary()
+    
+    def ready(self) -> Dict[str, Any]:
+        """
+        就绪探针
+        
+        检查系统是否准备好接收请求
+        
+        Returns:
+            就绪状态和原因
+        """
+        results = self._checker.check_all()
+        
+        critical_unhealthy = []
+        for name, health in results.items():
+            deps = DEPENDENCY_GRAPH.get(name, [])
+            for dep in deps:
+                if dep.critical and health.status == HealthStatus.UNHEALTHY:
+                    critical_unhealthy.append(name)
+                    break
+        
+        ready = len(critical_unhealthy) == 0
+        
+        return {
+            "ready": ready,
+            "reason": "所有关键组件正常" if ready else f"关键组件异常: {critical_unhealthy}",
+            "checked_at": datetime.now().isoformat()
+        }
+    
+    def live(self) -> Dict[str, Any]:
+        """
+        存活探针
+        
+        检查进程是否存活
+        
+        Returns:
+            存活状态
+        """
+        return {
+            "alive": True,
+            "checked_at": datetime.now().isoformat()
+        }
+    
+    def degradation(self) -> Dict[str, Any]:
+        """
+        降级状态
+        
+        Returns:
+            各组件的降级状态
+        """
+        return {
+            "states": self._checker.get_degradation_state(),
+            "state_machine": {
+                component: self._state_machine.get_state(component).value
+                for component in self._checker._components.keys()
+            },
+            "checked_at": datetime.now().isoformat()
+        }
+    
+    def dependencies(self) -> Dict[str, Any]:
+        """
+        依赖关系
+        
+        Returns:
+            组件依赖关系图
+        """
+        return {
+            "graph": {
+                component: [
+                    {"name": dep.name, "critical": dep.critical}
+                    for dep in deps
+                ]
+                for component, deps in DEPENDENCY_GRAPH.items()
+            },
+            "checked_at": datetime.now().isoformat()
+        }
+    
+    def trigger_degradation(self, component: str) -> Dict[str, Any]:
+        """
+        触发组件降级
+        
+        Args:
+            component: 组件名称
+        
+        Returns:
+            新的降级状态
+        """
+        new_level = self._state_machine.degrade(component)
+        self._checker.set_degradation(component, new_level, fallback=True)
+        
+        return {
+            "component": component,
+            "new_level": new_level.value,
+            "checked_at": datetime.now().isoformat()
+        }
+    
+    def trigger_recovery(self, component: str, force: bool = False) -> Dict[str, Any]:
+        """
+        触发组件恢复
+        
+        Args:
+            component: 组件名称
+            force: 是否强制恢复
+        
+        Returns:
+            新的降级状态
+        """
+        if force:
+            new_level = self._state_machine.force_recover(component)
+        else:
+            new_level = self._state_machine.recover(component)
+        
+        fallback_active = new_level != DegradationLevel.NONE
+        self._checker.set_degradation(component, new_level, fallback_active)
+        
+        return {
+            "component": component,
+            "new_level": new_level.value,
+            "force": force,
+            "checked_at": datetime.now().isoformat()
+        }
+
+
 _health_checker: Optional[HealthChecker] = None
+_health_endpoint: Optional[HealthEndpoint] = None
 
 
 def get_health_checker() -> HealthChecker:
@@ -345,3 +663,11 @@ def get_health_checker() -> HealthChecker:
     if _health_checker is None:
         _health_checker = HealthChecker()
     return _health_checker
+
+
+def get_health_endpoint() -> HealthEndpoint:
+    """获取全局健康端点实例"""
+    global _health_endpoint
+    if _health_endpoint is None:
+        _health_endpoint = HealthEndpoint(get_health_checker())
+    return _health_endpoint

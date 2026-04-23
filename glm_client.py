@@ -2,6 +2,20 @@
 # GLM (智谱AI) 客户端
 from typing import Dict, List, Optional
 import re
+from urllib.parse import urlparse
+
+try:
+    from cloud_client import enforce_https
+except ImportError:
+    def enforce_https(url: str, provider: str = "") -> str:
+        if not url:
+            return url
+        parsed = urlparse(url)
+        if parsed.hostname in ("localhost", "127.0.0.1", "::1"):
+            return url
+        if parsed.scheme == "http":
+            return url.replace("http://", "https://", 1)
+        return url
 
 
 class GLMClient:
@@ -22,7 +36,8 @@ class GLMClient:
     def __init__(self, api_key: str, model: str = "glm-4-flash", base_url: str = None):
         self.api_key = api_key
         self.model = model
-        self.base_url = base_url or "https://open.bigmodel.cn/api/paas/v4"
+        default_url = "https://open.bigmodel.cn/api/paas/v4"
+        self.base_url = enforce_https(base_url or default_url, "GLM")
         self._client = None
         self._sdk_name = ""
         self._init_client()

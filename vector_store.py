@@ -518,50 +518,70 @@ class VectorStore:
             "persist_directory": self.persist_directory
         }
     
-    def deduplicate(self, sqlite_store=None) -> int:
+    def deduplicate(self, sqlite_store=None, batch_size: int = 500) -> int:
         """
-        去重 - 基于文本内容
+        去重 - 基于文本内容（分批增量处理版）
         
         Args:
             sqlite_store: SQLite存储实例（可选，用于同步删除）
+            batch_size: 每批处理的文档数量（默认500）
         
         Returns:
             移除的重复文档数量
+        
+        时间复杂度：
+            - 优化前: O(n) 内存加载全部文档
+            - 优化后: O(batch_size) 分批处理，内存占用恒定
         """
-        if self.collection.count() == 0:
+        total_count = self.collection.count()
+        if total_count == 0:
             return 0
         
-        # 获取所有文档
-        results = self.collection.get(
-            include=["documents", "metadatas"]
-        )
-        
-        if not results["ids"]:
-            return 0
-        
-        # 找出重复的文档
+        total_duplicates = 0
         seen_texts = {}
-        duplicate_ids = []
+        offset = 0
         
-        for i, text in enumerate(results["documents"]):
-            doc_id = results["ids"][i]
-            if text in seen_texts:
-                duplicate_ids.append(doc_id)
-            else:
-                seen_texts[text] = doc_id
+        while offset < total_count:
+            try:
+                results = self.collection.get(
+                    limit=batch_size,
+                    offset=offset,
+                    include=["documents", "metadatas"]
+                )
+                
+                if not results["ids"]:
+                    break
+                
+                duplicate_ids = []
+                
+                for i, text in enumerate(results["documents"]):
+                    doc_id = results["ids"][i]
+                    if text in seen_texts:
+                        duplicate_ids.append(doc_id)
+                    else:
+                        seen_texts[text] = doc_id
+                
+                if duplicate_ids:
+                    self.collection.delete(ids=duplicate_ids)
+                    total_duplicates += len(duplicate_ids)
+                    
+                    if sqlite_store:
+                        for dup_id in duplicate_ids:
+                            try:
+                                sqlite_store.delete_by_vector_id(dup_id)
+                            except Exception:
+                                pass
+                
+                offset += batch_size
+                
+            except Exception as e:
+                print(f"[去重] 批次处理失败 (offset={offset}): {e}")
+                break
         
-        # 删除重复文档
-        if duplicate_ids:
-            self.collection.delete(ids=duplicate_ids)
-            
-            # 同步删除SQLite中的记录
-            if sqlite_store:
-                for dup_id in duplicate_ids:
-                    sqlite_store.delete_by_vector_id(dup_id)
-            
-            print(f"去重完成：移除 {len(duplicate_ids)} 条重复记忆")
+        if total_duplicates > 0:
+            print(f"去重完成：移除 {total_duplicates} 条重复记忆")
         
-        return len(duplicate_ids)
+        return total_duplicates
     
     def __len__(self) -> int:
         return self.collection.count()
@@ -581,6 +601,24 @@ class VectorStore:
             return results.get("ids", [])
         except Exception as e:
             print(f"获取文档ID失败: {e}")
+            return []
+    
+    def get_ids_batch(self, limit: int = 100, offset: int = 0) -> List[str]:
+        """
+        分批获取文档ID（增量处理版）
+        
+        Args:
+            limit: 每批返回数量
+            offset: 起始偏移量
+        
+        Returns:
+            文档ID列表
+        """
+        try:
+            results = self.collection.get(limit=limit, offset=offset)
+            return results.get("ids", [])
+        except Exception as e:
+            print(f"分批获取文档ID失败: {e}")
             return []
     
     def get_metadata(self, doc_id: str) -> Optional[Dict]:

@@ -97,6 +97,7 @@ class TransactionCoordinator:
         self._vector_store = None
         self._migration_lock = threading.RLock()
         self._migration_active = False
+        self._migration_type: Optional[str] = None
         self._tx_table_initialized = False
     
     def set_stores(self, sqlite_store, vector_store):
@@ -266,15 +267,19 @@ class TransactionCoordinator:
             self._log.error("GET_PENDING_TRANSACTIONS_FAILED", error=str(e))
             return []
     
-    def begin_migration(self):
+    def begin_migration(self, migration_type: str = "unknown"):
         """
         开始迁移操作
         
         获取迁移锁，阻止检索操作访问正在迁移的数据
+        
+        Args:
+            migration_type: 迁移类型 (flush_buffer, l2_to_l3, l3_to_l2, merge, etc.)
         """
         self._migration_lock.acquire()
         self._migration_active = True
-        self._log.debug("MIGRATION_STARTED")
+        self._migration_type = migration_type
+        self._log.debug("MIGRATION_STARTED", migration_type=migration_type)
     
     def end_migration(self):
         """
@@ -282,13 +287,19 @@ class TransactionCoordinator:
         
         释放迁移锁
         """
+        migration_type = self._migration_type
         self._migration_active = False
+        self._migration_type = None
         self._migration_lock.release()
-        self._log.debug("MIGRATION_ENDED")
+        self._log.debug("MIGRATION_ENDED", migration_type=migration_type)
     
     def is_migration_active(self) -> bool:
         """检查是否有迁移操作正在进行"""
         return self._migration_active
+    
+    def get_migration_type(self) -> Optional[str]:
+        """获取当前迁移类型"""
+        return self._migration_type
     
     def wait_for_migration(self, timeout: float = 5.0) -> bool:
         """

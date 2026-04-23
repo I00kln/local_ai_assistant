@@ -43,6 +43,8 @@ class AsyncProcessorConfig:
     llm_timeout: int = 30
     circuit_breaker_threshold: int = 5
     circuit_breaker_reset_timeout: int = 300
+    dedup_batch_size: int = 500
+    orphan_cleanup_batch_size: int = 100
 
 
 @dataclass
@@ -72,6 +74,10 @@ class PrivacyConfig:
     local_encryption_enabled: bool = False
     excluded_keywords: str = ""
     log_sensitive_detection: bool = False
+    https_only: bool = True
+    verify_ssl: bool = True
+    api_key_min_length: int = 20
+    mask_in_logs: bool = True
 
 
 @dataclass
@@ -112,6 +118,8 @@ class RetrievalConfig:
     source_weight_l2: float = 1.0
     source_weight_l3: float = 0.8
     diversity_threshold: float = 0.95
+    recall_multiplier: int = 3
+    high_quality_threshold: float = 0.95
 
 
 @dataclass
@@ -128,6 +136,20 @@ class SQLiteStoreConfig:
     """SQLite 存储配置"""
     db_path: str = "memory.db"
     enabled: bool = True
+    encryption_enabled: bool = False
+    encryption_key_env: str = "SQLITE_ENCRYPTION_KEY"
+
+
+@dataclass
+class SecurityConfig:
+    """安全配置"""
+    https_only: bool = True
+    verify_ssl: bool = True
+    api_key_min_length: int = 20
+    sensitive_filter_enabled: bool = True
+    log_sensitive_detection: bool = True
+    excluded_keywords: str = ""
+    mask_in_logs: bool = True
 
 
 @dataclass
@@ -338,6 +360,10 @@ class Config:
         self.privacy.local_encryption_enabled = os.environ.get("LOCAL_ENCRYPTION_ENABLED", "false").lower() == "true"
         self.privacy.excluded_keywords = os.environ.get("PRIVACY_EXCLUDED_KEYWORDS", "")
         self.privacy.log_sensitive_detection = os.environ.get("LOG_SENSITIVE_DETECTION", "false").lower() == "true"
+        self.privacy.https_only = os.environ.get("HTTPS_ONLY", "true").lower() == "true"
+        self.privacy.verify_ssl = os.environ.get("VERIFY_SSL", "true").lower() == "true"
+        self.privacy.api_key_min_length = int(os.environ.get("API_KEY_MIN_LENGTH", "20"))
+        self.privacy.mask_in_logs = os.environ.get("MASK_IN_LOGS", "true").lower() == "true"
     
     def _load_sqlite_pool_config(self):
         """加载SQLite连接池配置"""

@@ -47,6 +47,9 @@ class MergeConfig:
     long_text_threshold: int = 200
     short_text_similarity_boost: float = 0.03
     long_text_similarity_penalty: float = 0.04
+    max_memories: int = 100
+    use_ann: bool = True
+    ann_threshold: int = 20
 
 
 @dataclass
@@ -166,6 +169,7 @@ class MemoryMerger:
         self._log = get_logger()
         self._last_merge_check = 0
         self._tx_coordinator = None
+        self._vector_store = None
     
     def configure(self, **kwargs):
         """更新配置"""
@@ -178,6 +182,12 @@ class MemoryMerger:
         if self._embedding_service is None:
             from embedding_service import get_embedding_service
             self._embedding_service = get_embedding_service()
+    
+    def _ensure_vector_store(self):
+        """确保 VectorStore 已初始化"""
+        if self._vector_store is None:
+            from vector_store import get_vector_store
+            self._vector_store = get_vector_store()
     
     def _ensure_tx_coordinator(self):
         """确保事务协调器已初始化"""
@@ -319,7 +329,11 @@ class MemoryMerger:
         if len(memories) < self.config.min_group_size:
             return False, f"记忆数量不足（{len(memories)} < {self.config.min_group_size}）"
         
-        similar_groups = self._find_similar_groups(memories)
+        similar_groups = self._find_similar_groups(
+            memories,
+            max_memories=self.config.max_memories,
+            use_ann=self.config.use_ann
+        )
         
         large_groups = [g for g in similar_groups if len(g) >= self.config.min_group_size]
         
@@ -328,24 +342,125 @@ class MemoryMerger:
         
         return False, "未发现需要合并的相似记忆组"
     
-    def _find_similar_groups(self, memories: List[Dict]) -> List[List[Dict]]:
+    def _find_similar_groups(
+        self, 
+        memories: List[Dict],
+        max_memories: int = None,
+        use_ann: bool = None
+    ) -> List[List[Dict]]:
         """
-        使用向量相似度聚类相似记忆
+        使用向量相似度聚类相似记忆（优化版）
         
         Args:
             memories: 记忆列表
+            max_memories: 最大处理数量，超出则截断（默认使用配置）
+            use_ann: 是否使用近似最近邻（默认使用配置）
         
         Returns:
             相似记忆分组列表
+        
+        时间复杂度：
+            - 优化前: O(n²) 全量相似度矩阵计算
+            - 优化后 (ANN): O(n * k) k为每个记忆的近邻数
+            - 优化后 (截断): O(max_memories²)
         """
+        if max_memories is None:
+            max_memories = self.config.max_memories
+        if use_ann is None:
+            use_ann = self.config.use_ann
         if len(memories) < 2:
             return [[m] for m in memories]
+        
+        if len(memories) > max_memories:
+            memories = sorted(memories, key=lambda m: m.get("weight", 1.0), reverse=True)[:max_memories]
+            self._log.info("SIMILAR_GROUPS_TRUNCATED", 
+                          original=len(memories), 
+                          limited=max_memories)
         
         self._ensure_embedding_service()
         
         if not self._embedding_service.is_available:
             return [[m] for m in memories]
         
+        if use_ann and len(memories) > self.config.ann_threshold:
+            return self._find_similar_groups_ann(memories)
+        
+        return self._find_similar_groups_exact(memories)
+    
+    def _find_similar_groups_ann(self, memories: List[Dict]) -> List[List[Dict]]:
+        """
+        使用近似最近邻方法聚类相似记忆
+        
+        策略：对每个记忆，使用向量搜索找到相似记忆
+        时间复杂度: O(n * k) 其中 k 是每个记忆的近邻数
+        """
+        groups = []
+        used_ids = set()
+        
+        for i, memory in enumerate(memories):
+            memory_id = memory.get("id", i)
+            if memory_id in used_ids:
+                continue
+            
+            text = memory.get("text", "")
+            if not text:
+                continue
+            
+            group = [memory]
+            used_ids.add(memory_id)
+            
+            threshold = self._get_dynamic_threshold(text)
+            
+            try:
+                similar_memories = self._find_similar_via_embedding(text, threshold)
+                
+                for similar in similar_memories:
+                    similar_id = similar.get("id")
+                    if similar_id and similar_id not in used_ids:
+                        for m in memories:
+                            if m.get("id") == similar_id:
+                                group.append(m)
+                                used_ids.add(similar_id)
+                                break
+            except Exception:
+                pass
+            
+            groups.append(group)
+        
+        return groups
+    
+    def _find_similar_via_embedding(self, text: str, threshold: float) -> List[Dict]:
+        """
+        通过嵌入向量查找相似记忆
+        
+        使用向量存储的搜索功能，避免全量矩阵计算
+        """
+        try:
+            self._ensure_vector_store()
+            if self._vector_store is None:
+                return []
+            
+            results = self._vector_store.search(text, n_results=10)
+            
+            similar = []
+            for r in results:
+                if r.get("similarity", 0) >= threshold:
+                    similar.append({
+                        "id": r.get("id"),
+                        "text": r.get("text"),
+                        "similarity": r.get("similarity")
+                    })
+            
+            return similar[1:]
+        except Exception:
+            return []
+    
+    def _find_similar_groups_exact(self, memories: List[Dict]) -> List[List[Dict]]:
+        """
+        精确计算相似度矩阵（用于小规模数据）
+        
+        时间复杂度: O(n²)
+        """
         vectors = []
         valid_memories = []
         
@@ -898,7 +1013,7 @@ class MemoryMerger:
         if not merged_memories:
             return
         
-        self._tx_coordinator.begin_migration()
+        self._tx_coordinator.begin_migration("merge")
         
         try:
             for merged in merged_memories:

@@ -13,6 +13,42 @@ from config import config
 from memory_tags import MemoryTags
 
 
+class EncryptionError(Exception):
+    """加密错误"""
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
+
+
+def get_encryption_key() -> Optional[str]:
+    """
+    从环境变量获取加密密钥
+    
+    Returns:
+        加密密钥或 None
+    """
+    key_env = getattr(config.sqlite, 'encryption_key_env', 'SQLITE_ENCRYPTION_KEY')
+    return os.environ.get(key_env)
+
+
+def is_sqlcipher_available() -> bool:
+    """
+    检查 SQLCipher 是否可用
+    
+    Returns:
+        SQLCipher 是否可用
+    """
+    try:
+        import sqlcipher3
+        return True
+    except ImportError:
+        try:
+            from pysqlcipher3 import dbapi2
+            return True
+        except ImportError:
+            return False
+
+
 @dataclass
 class MemoryRecord:
     """记忆记录结构"""
@@ -64,33 +100,142 @@ class SQLiteStore:
     MAX_POOL_SIZE = 10
     CONNECTION_TIMEOUT = 3600
     BACKUP_SUFFIX = ".backup"
+    CONNECTION_HEALTH_CHECK_INTERVAL = 300
+    BACKUP_INTERVAL = 3600
+    MAX_BACKUP_VERSIONS = 3
     
-    def __init__(self, db_path: str = "memory.db"):
+    def __init__(self, db_path: str = "memory.db", encryption_key: str = None):
         self.db_path = db_path
         self._write_lock = threading.Lock()
         self.lock = self._write_lock
         self._local = threading.local()
         self._last_cleanup = datetime.now()
         self._integrity_checked = False
+        self._last_connection_check: Dict[int, float] = {}
+        self._last_backup_time: float = 0
+        
+        self._encryption_enabled = False
+        self._encryption_key = None
+        
+        encryption_configured = getattr(config.sqlite, 'encryption_enabled', False)
+        if encryption_configured:
+            key = encryption_key or get_encryption_key()
+            if key and is_sqlcipher_available():
+                self._encryption_enabled = True
+                self._encryption_key = key
+                print("[安全] SQLite 加密已启用 (SQLCipher)")
+            elif encryption_configured and not key:
+                print("[警告] SQLite 加密已配置但未找到密钥，请设置 SQLITE_ENCRYPTION_KEY 环境变量")
+            elif encryption_configured and not is_sqlcipher_available():
+                print("[警告] SQLite 加密已配置但 SQLCipher 不可用，请安装: pip install sqlcipher3")
+        
         self._init_database()
+    
+    def _validate_connection(self, conn) -> bool:
+        """
+        验证连接是否有效
+        
+        Args:
+            conn: SQLite 连接
+        
+        Returns:
+            连接是否有效
+        """
+        try:
+            cursor = conn.cursor()
+            cursor.execute("SELECT 1")
+            return True
+        except (sqlite3.OperationalError, sqlite3.DatabaseError, sqlite3.InterfaceError) as e:
+            self._log_connection_error(e)
+            return False
+    
+    def _log_connection_error(self, error: Exception):
+        """记录连接错误"""
+        import sys
+        print(f"[SQLite] 连接验证失败: {error}", file=sys.stderr)
+    
+    def _create_connection(self):
+        """
+        创建数据库连接（支持加密）
+        
+        Returns:
+            SQLite 连接对象
+        """
+        if self._encryption_enabled:
+            try:
+                import sqlcipher3
+                conn = sqlcipher3.connect(self.db_path)
+            except ImportError:
+                try:
+                    from pysqlcipher3 import dbapi2
+                    conn = dbapi2.connect(self.db_path)
+                except ImportError:
+                    raise EncryptionError(
+                        "SQLCIPHER_UNAVAILABLE",
+                        "SQLCipher 不可用，请安装 sqlcipher3 或 pysqlcipher3"
+                    )
+            
+            conn.execute(f"PRAGMA key='{self._encryption_key}'")
+            conn.execute("PRAGMA cipher_compatibility=4")
+            
+            try:
+                conn.execute("SELECT count(*) FROM sqlite_master")
+            except Exception as e:
+                raise EncryptionError(
+                    "DECRYPTION_FAILED",
+                    f"数据库解密失败，请检查密钥是否正确: {e}"
+                )
+        else:
+            conn = sqlite3.connect(
+                self.db_path,
+                timeout=30.0,
+                check_same_thread=False
+            )
+        
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA cache_size=-64000")
+        conn.execute("PRAGMA busy_timeout=30000")
+        
+        return conn
     
     def _get_read_connection(self):
         """
         获取读连接（线程本地，无需锁）
         
         WAL 模式下，多个读连接可以并发执行
+        
+        增强：
+        - 连接有效性检测
+        - 自动重连机制
+        - 定期健康检查
         """
+        current_thread_id = threading.get_ident()
+        current_time = time.time()
+        
+        need_new_connection = False
+        
         if not hasattr(self._local, 'read_conn') or self._local.read_conn is None:
-            self._local.read_conn = sqlite3.connect(
-                self.db_path,
-                timeout=30.0,
-                check_same_thread=False
-            )
-            self._local.read_conn.row_factory = sqlite3.Row
-            self._local.read_conn.execute("PRAGMA journal_mode=WAL")
-            self._local.read_conn.execute("PRAGMA synchronous=NORMAL")
-            self._local.read_conn.execute("PRAGMA cache_size=-64000")
-            self._local.read_conn.execute("PRAGMA busy_timeout=30000")
+            need_new_connection = True
+        else:
+            last_check = self._last_connection_check.get(current_thread_id, 0)
+            if current_time - last_check > self.CONNECTION_HEALTH_CHECK_INTERVAL:
+                if not self._validate_connection(self._local.read_conn):
+                    try:
+                        self._local.read_conn.close()
+                    except Exception:
+                        pass
+                    self._local.read_conn = None
+                    need_new_connection = True
+                    print(f"[SQLite] 线程 {current_thread_id} 连接失效，正在重连...")
+                else:
+                    self._last_connection_check[current_thread_id] = current_time
+        
+        if need_new_connection:
+            self._local.read_conn = self._create_connection()
+            self._last_connection_check[current_thread_id] = current_time
+        
         return self._local.read_conn
     
     @contextmanager
@@ -120,7 +265,7 @@ class SQLiteStore:
             False: 数据库损坏
         """
         try:
-            conn = sqlite3.connect(self.db_path, timeout=5.0)
+            conn = self._create_connection()
             cursor = conn.cursor()
             result = cursor.execute("PRAGMA integrity_check").fetchone()
             conn.close()
@@ -130,6 +275,9 @@ class SQLiteStore:
             else:
                 print(f"[警告] 数据库完整性检查失败: {result}")
                 return False
+        except EncryptionError as e:
+            print(f"[错误] 加密数据库访问失败: {e}")
+            return False
         except sqlite3.DatabaseError as e:
             print(f"[错误] 数据库损坏: {e}")
             return False
@@ -168,17 +316,94 @@ class SQLiteStore:
             print(f"[错误] 从备份恢复失败: {e}")
             return False
     
-    def _create_backup(self):
-        """创建数据库备份"""
+    def _create_backup(self, force: bool = False):
+        """
+        创建数据库备份（支持多版本）
+        
+        Args:
+            force: 是否强制创建（忽略时间间隔）
+        
+        备份策略：
+        - 每小时自动备份一次
+        - 保留最近3个版本的备份
+        - 备份文件命名：memory.db.backup.1, memory.db.backup.2, memory.db.backup.3
+        """
         import shutil
         import os
         
+        current_time = time.time()
+        
+        if not force and current_time - self._last_backup_time < self.BACKUP_INTERVAL:
+            return
+        
         try:
-            if os.path.exists(self.db_path):
-                backup_path = self.db_path + self.BACKUP_SUFFIX
-                shutil.copy(self.db_path, backup_path)
+            if not os.path.exists(self.db_path):
+                return
+            
+            backup_dir = os.path.dirname(self.db_path) or "."
+            base_name = os.path.basename(self.db_path)
+            
+            oldest_backup = os.path.join(backup_dir, f"{base_name}.backup.{self.MAX_BACKUP_VERSIONS}")
+            if os.path.exists(oldest_backup):
+                os.remove(oldest_backup)
+            
+            for i in range(self.MAX_BACKUP_VERSIONS - 1, 0, -1):
+                old_backup = os.path.join(backup_dir, f"{base_name}.backup.{i}")
+                new_backup = os.path.join(backup_dir, f"{base_name}.backup.{i + 1}")
+                if os.path.exists(old_backup):
+                    shutil.move(old_backup, new_backup)
+            
+            latest_backup = os.path.join(backup_dir, f"{base_name}.backup.1")
+            shutil.copy2(self.db_path, latest_backup)
+            
+            main_backup = self.db_path + self.BACKUP_SUFFIX
+            shutil.copy2(self.db_path, main_backup)
+            
+            self._last_backup_time = current_time
+            print(f"[备份] 数据库备份完成: {latest_backup}")
+            
         except Exception as e:
             print(f"[警告] 创建备份失败: {e}")
+    
+    def _try_recover_from_backup_versions(self) -> bool:
+        """
+        尝试从多版本备份恢复
+        
+        按版本顺序尝试恢复，直到找到有效的备份
+        
+        Returns:
+            是否恢复成功
+        """
+        import shutil
+        import os
+        
+        backup_dir = os.path.dirname(self.db_path) or "."
+        base_name = os.path.basename(self.db_path)
+        
+        for version in range(1, self.MAX_BACKUP_VERSIONS + 1):
+            backup_path = os.path.join(backup_dir, f"{base_name}.backup.{version}")
+            
+            if not os.path.exists(backup_path):
+                continue
+            
+            try:
+                if os.path.exists(self.db_path):
+                    corrupt_backup = self.db_path + f".corrupt.{int(time.time())}"
+                    shutil.move(self.db_path, corrupt_backup)
+                    print(f"[备份] 损坏数据库已保存为: {corrupt_backup}")
+                
+                shutil.copy2(backup_path, self.db_path)
+                
+                if self._check_integrity():
+                    print(f"[恢复] 从备份版本 {version} 恢复成功")
+                    return True
+                else:
+                    print(f"[警告] 备份版本 {version} 也已损坏，尝试下一版本")
+                    
+            except Exception as e:
+                print(f"[错误] 从备份版本 {version} 恢复失败: {e}")
+        
+        return False
     
     def _init_database(self):
         """
@@ -187,9 +412,9 @@ class SQLiteStore:
         包含完整性检查和自动恢复：
         1. 检查数据库文件是否存在
         2. 检查数据库完整性
-        3. 损坏时尝试从备份恢复
+        3. 损坏时尝试从多版本备份恢复
         4. 创建表结构
-        5. 创建备份
+        5. 创建初始备份
         """
         import os
         
@@ -197,12 +422,12 @@ class SQLiteStore:
             self._integrity_checked = True
             
             if not self._check_integrity():
-                print("[警告] 数据库损坏，尝试从备份恢复...")
+                print("[警告] 数据库损坏，尝试从多版本备份恢复...")
                 
-                if self._try_recover_from_backup():
-                    if not self._check_integrity():
-                        print("[严重] 备份恢复后仍损坏，将重建数据库")
-                        self._rebuild_database()
+                if self._try_recover_from_backup_versions():
+                    print("[成功] 从备份恢复成功")
+                elif self._try_recover_from_backup():
+                    print("[成功] 从主备份恢复成功")
                 else:
                     print("[严重] 无可用备份，将重建数据库")
                     self._rebuild_database()
@@ -425,6 +650,9 @@ class SQLiteStore:
                 record.is_vectorized
             ))
             conn.commit()
+            
+            self._create_backup()
+            
             return cursor.lastrowid
     
     def add_batch(self, records: List[MemoryRecord]) -> List[int]:
@@ -756,7 +984,15 @@ class SQLiteStore:
             }
     
     def get_low_weight_memories(self, threshold: float = None, limit: int = 100) -> List[MemoryRecord]:
-        """获取低权重记忆（准备遗忘或压缩）"""
+        """
+        获取低权重记忆（准备遗忘或压缩）
+        
+        条件：
+        - 权重低于阈值
+        - 已向量化（is_vectorized=1，L2中的记录）
+        - 未归档
+        - 不在迁移中（is_vectorized != 3）
+        """
         if threshold is None:
             threshold = self.MIN_WEIGHT_THRESHOLD * 2
         
@@ -766,6 +1002,7 @@ class SQLiteStore:
             SELECT * FROM memories 
             WHERE weight < ?
             AND is_archived = 0
+            AND is_vectorized = 1
             ORDER BY weight ASC, last_access_time ASC
             LIMIT ?
         """, (threshold, limit))
@@ -779,7 +1016,9 @@ class SQLiteStore:
         条件：
         - 权重超过阈值
         - 最近有访问
-        - 未向量化（不在L2中）
+        - 未向量化（is_vectorized=0，L3中的记录）
+        - 未归档
+        - 不在迁移中（is_vectorized != 3）
         """
         if threshold is None:
             threshold = self.MAX_WEIGHT * 0.6
@@ -1046,6 +1285,7 @@ class SQLiteStore:
             is_vectorized: 向量化状态
                 - 0: 未向量化(L3)
                 - 1: 已向量化(L2)
+                - -1: 向量化失败（待重试）
                 - 2: 向量化失败
                 - 3: 迁移中
             limit: 返回数量限制
@@ -1063,6 +1303,61 @@ class SQLiteStore:
             LIMIT ?
         """, (is_vectorized, limit))
         return [self._row_to_record(row) for row in cursor.fetchall()]
+    
+    def get_failed_vectorizations(self, max_retries: int = 3, limit: int = 20) -> List[MemoryRecord]:
+        """
+        获取向量化失败的记录（带重试次数限制）
+        
+        Args:
+            max_retries: 最大重试次数
+            limit: 返回数量限制
+        
+        Returns:
+            可重试的失败记录列表
+        """
+        conn = self._get_read_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT * FROM memories 
+            WHERE is_vectorized = -1
+            AND is_archived = 0
+            AND (metadata IS NULL 
+                 OR json_extract(metadata, '$.vectorization_retries') IS NULL
+                 OR json_extract(metadata, '$.vectorization_retries') < ?)
+            ORDER BY created_time ASC
+            LIMIT ?
+        """, (max_retries, limit))
+        return [self._row_to_record(row) for row in cursor.fetchall()]
+    
+    def increment_vectorization_retry(self, record_id: int) -> int:
+        """
+        增加向量化重试计数
+        
+        Args:
+            record_id: 记录ID
+        
+        Returns:
+            当前重试次数
+        """
+        with self._get_write_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                UPDATE memories 
+                SET metadata = json_set(
+                    COALESCE(metadata, '{}'),
+                    '$.vectorization_retries',
+                    COALESCE(json_extract(metadata, '$.vectorization_retries'), 0) + 1
+                )
+                WHERE id = ?
+            """, (record_id,))
+            conn.commit()
+            
+            cursor.execute("""
+                SELECT json_extract(metadata, '$.vectorization_retries')
+                FROM memories WHERE id = ?
+            """, (record_id,))
+            result = cursor.fetchone()
+            return result[0] if result else 0
     
     def get_pending_compressions(self, limit: int = 20) -> List[MemoryRecord]:
         """获取待压缩的记录"""
@@ -1215,29 +1510,53 @@ class SQLiteStore:
         
         return result_ids
     
-    def batch_update_vector_status(self, updates: List[tuple], is_vectorized: int = 1):
+    def batch_update_vector_status(
+        self, 
+        updates: List[tuple], 
+        is_vectorized: int = 1,
+        batch_size: int = 100
+    ) -> Dict[str, int]:
         """
-        批量更新记录的向量化状态
+        批量更新记录的向量化状态（事务保护版）
         
         Args:
             updates: [(record_id, vector_id), ...] 列表
             is_vectorized: 向量化状态
+            batch_size: 分批提交大小（默认100）
+        
+        Returns:
+            {"updated": 更新数量, "batches": 批次数}
+        
+        事务保护：
+            - 使用 _get_write_connection 上下文管理器
+            - 异常时自动回滚
+            - 分批提交，避免单次事务过大
         """
         if not updates:
-            return
+            return {"updated": 0, "batches": 0}
         
-        with self._get_write_connection() as conn:
-            cursor = conn.cursor()
+        total_updated = 0
+        batch_count = 0
+        
+        for i in range(0, len(updates), batch_size):
+            batch = updates[i:i + batch_size]
             
-            data = [(vid, is_vectorized, rid) for rid, vid in updates]
-            
-            cursor.executemany("""
-                UPDATE memories 
-                SET vector_id = ?, is_vectorized = ?
-                WHERE id = ?
-            """, data)
-            
-            conn.commit()
+            with self._get_write_connection() as conn:
+                cursor = conn.cursor()
+                
+                data = [(vid, is_vectorized, rid) for rid, vid in batch]
+                
+                cursor.executemany("""
+                    UPDATE memories 
+                    SET vector_id = ?, is_vectorized = ?
+                    WHERE id = ?
+                """, data)
+                
+                conn.commit()
+                total_updated += cursor.rowcount
+                batch_count += 1
+        
+        return {"updated": total_updated, "batches": batch_count}
     
     def delete_by_vector_id(self, vector_id: str) -> bool:
         """根据ChromaDB ID删除SQLite记录（同步删除）"""

@@ -7,6 +7,34 @@ from collections import OrderedDict
 from typing import List, Optional
 
 
+class EmbeddingServiceError(Exception):
+    """EmbeddingService 异常基类"""
+    def __init__(self, code: str, message: str, init_error: str = None):
+        super().__init__(message)
+        self.code = code
+        self.init_error = init_error
+
+
+class EmbeddingNotAvailableError(EmbeddingServiceError):
+    """嵌入服务不可用异常"""
+    def __init__(self, init_error: str = None):
+        super().__init__(
+            code="EMBEDDING_NOT_AVAILABLE",
+            message="嵌入服务不可用：ONNX 模型未加载成功",
+            init_error=init_error
+        )
+
+
+class EmbeddingFallbackModeError(EmbeddingServiceError):
+    """嵌入服务降级模式异常"""
+    def __init__(self, init_error: str = None):
+        super().__init__(
+            code="EMBEDDING_FALLBACK_MODE",
+            message="嵌入服务处于降级模式，无法提供有效的向量检索",
+            init_error=init_error
+        )
+
+
 class EmbeddingService:
     """
     共享的 ONNX 嵌入服务
@@ -145,21 +173,28 @@ class EmbeddingService:
             self._dimension = config.embedding_dimension
         return self._dimension
     
-    def embed(self, texts: List[str], use_cache: bool = True) -> List[List[float]]:
+    def embed(self, texts: List[str], use_cache: bool = True, allow_fallback: bool = False) -> List[List[float]]:
         """
         生成文本嵌入向量
         
         Args:
             texts: 文本列表
             use_cache: 是否使用缓存
+            allow_fallback: 是否允许降级模式（默认 False，降级时抛出异常）
         
         Returns:
             嵌入向量列表
+        
+        Raises:
+            EmbeddingFallbackModeError: 降级模式且 allow_fallback=False
         """
         self._ensure_initialized()
         
         if not texts:
             return []
+        
+        if self._fallback_mode and not allow_fallback:
+            raise EmbeddingFallbackModeError(self._init_error)
         
         result = [None] * len(texts)
         uncached_indices = []
@@ -195,20 +230,27 @@ class EmbeddingService:
         
         return result
     
-    def embed_single(self, text: str, use_prefix: bool = False):
+    def embed_single(self, text: str, use_prefix: bool = False, allow_fallback: bool = False):
         """
         生成单个文本的嵌入向量
         
         Args:
             text: 文本
             use_prefix: 是否添加前缀（用于废话过滤器）
+            allow_fallback: 是否允许降级模式（默认 False，降级时抛出异常）
         
         Returns:
             嵌入向量 (numpy array)
+        
+        Raises:
+            EmbeddingFallbackModeError: 降级模式且 allow_fallback=False
         """
         import numpy as np
         
         self._ensure_initialized()
+        
+        if self._fallback_mode and not allow_fallback:
+            raise EmbeddingFallbackModeError(self._init_error)
         
         if self._fallback_mode:
             return self._generate_fallback_embedding(text)

@@ -87,6 +87,11 @@ class LLMCompressionStrategy(CompressionStrategy):
         current_time = time.time()
         
         if current_time < self._circuit_breaker["open_until"]:
+            half_open_window = 30
+            if current_time > self._circuit_breaker["open_until"] - half_open_window:
+                if self._probe_connection():
+                    self._log.info("CIRCUIT_BREAKER_HALF_OPEN_SUCCESS")
+                    return True
             return False
         
         check_interval = self._mem_config.async_processor.compressor_check_interval
@@ -132,6 +137,19 @@ class LLMCompressionStrategy(CompressionStrategy):
             return False
         except Exception as e:
             self._record_failure(str(e))
+            return False
+    
+    def _probe_connection(self) -> bool:
+        """
+        半开状态探测连接
+        
+        在熔断器即将恢复前进行轻量级探测
+        """
+        try:
+            if self._llm_client is None:
+                return False
+            return self._llm_client.check_connection()
+        except Exception:
             return False
     
     def _record_failure(self, error: str):
@@ -373,6 +391,8 @@ class AsyncMemoryProcessor:
         self._event_bus = get_event_bus()
         
         self._buffer_lock = threading.Lock()
+        self._memory_flow_lock = threading.Lock()
+        self._memory_flow_running = False
         self.batch_buffer: List[Dict] = []
         self.batch_size = self._mem_config.async_processor.batch_size
         
@@ -481,11 +501,14 @@ class AsyncMemoryProcessor:
         1. ChromaDB写入成功但SQLite更新失败导致的数据不一致
         2. L2→L3迁移中断导致的孤立记录（is_vectorized=2）
         3. L2→L3迁移崩溃导致的迁移中记录（is_vectorized=3）
+        4. 队列满时溢出到文件缓冲的数据
         
         防重复机制：
         - 添加向量前先搜索是否已存在相同文本（相似度>0.99）
         - 如果存在则更新SQLite状态，不重复添加
         """
+        self._recover_overflow_buffer()
+        
         if not self.sqlite:
             return
         
@@ -548,9 +571,7 @@ class AsyncMemoryProcessor:
             if success_count > 0 or skip_count > 0 or fail_count > 0:
                 print(f"[启动补偿] 完成: 成功={success_count}, 跳过={skip_count}, 失败={fail_count}")
             
-            orphan_vectors = self._check_and_clean_orphan_vectors()
-            if orphan_vectors > 0:
-                print(f"[启动补偿] 清理了 {orphan_vectors} 个孤立向量")
+            self._schedule_orphan_cleanup()
             
             self._sync_timestamps()
             
@@ -559,52 +580,93 @@ class AsyncMemoryProcessor:
         except Exception as e:
             print(f"[启动补偿] 检查失败: {e}")
     
-    def _check_and_clean_orphan_vectors(self) -> int:
+    def _check_and_clean_orphan_vectors(self, batch_limit: int = 100, offset: int = 0) -> Tuple[int, int]:
         """
-        检查并清理ChromaDB中的孤立向量
+        检查并清理ChromaDB中的孤立向量（增量处理版）
         
         孤立向量：ChromaDB中存在但SQLite中无对应记录
         
         优化策略：
-        1. 通过metadata中的sqlite_id快速定位
-        2. 分批处理，每批100条
+        1. 使用 offset 分批获取，避免全量加载
+        2. 通过metadata中的sqlite_id快速定位
         3. 无sqlite_id的旧数据通过vector_id反查
+        4. 返回已检查数量，支持增量继续
+        
+        Args:
+            batch_limit: 每次处理的最大数量（默认100）
+            offset: 起始偏移量（默认0）
+        
+        Returns:
+            (本次清理的孤立向量数量, 已检查的总数量)
+        
+        时间复杂度：
+            - 优化前: O(n) 获取全部ID + O(batch_limit) 检查
+            - 优化后: O(batch_limit) 分批获取 + O(batch_limit) 检查
         """
         if not self.sqlite:
-            return 0
+            return 0, 0
         
         try:
-            all_ids = self.vector_store.get_all_ids()
-            if not all_ids:
-                return 0
+            batch_ids = self.vector_store.get_ids_batch(limit=batch_limit, offset=offset)
+            if not batch_ids:
+                return 0, offset
             
             orphan_ids = []
-            batch_size = 100
             
-            for i in range(0, len(all_ids), batch_size):
-                batch_ids = all_ids[i:i + batch_size]
+            for vid in batch_ids:
+                metadata = self.vector_store.get_metadata(vid)
                 
-                for vid in batch_ids:
-                    metadata = self.vector_store.get_metadata(vid)
-                    
-                    if metadata and MemoryTags.SQLITE_ID in metadata:
-                        sqlite_id = metadata[MemoryTags.SQLITE_ID]
-                        record = self.sqlite.get(sqlite_id)
-                        if not record:
-                            orphan_ids.append(vid)
-                    else:
-                        record = self.sqlite.get_by_vector_id(vid)
-                        if not record:
-                            orphan_ids.append(vid)
+                if metadata and MemoryTags.SQLITE_ID in metadata:
+                    sqlite_id = metadata[MemoryTags.SQLITE_ID]
+                    record = self.sqlite.get(sqlite_id)
+                    if not record:
+                        orphan_ids.append(vid)
+                else:
+                    record = self.sqlite.get_by_vector_id(vid)
+                    if not record:
+                        orphan_ids.append(vid)
             
             if orphan_ids:
                 self.vector_store.delete(orphan_ids)
-                print(f"[清理孤立向量] 删除了 {len(orphan_ids)} 个孤立向量")
+                self._log.info("ORPHAN_VECTORS_CLEANED", 
+                              count=len(orphan_ids),
+                              checked=len(batch_ids),
+                              offset=offset)
             
-            return len(orphan_ids)
+            return len(orphan_ids), offset + len(batch_ids)
         except Exception as e:
-            print(f"[清理孤立向量] 失败: {e}")
-            return 0
+            self._log.error("ORPHAN_VECTORS_CLEAN_FAILED", error=str(e))
+            return 0, offset
+    
+    def _schedule_orphan_cleanup(self):
+        """
+        调度孤立向量清理任务（非阻塞）
+        
+        在后台线程中启动清理，不阻塞主流程
+        """
+        if not self.sqlite:
+            return
+        
+        def cleanup_task():
+            try:
+                total_cleaned = 0
+                batch_size = 100
+                max_batches = 10
+                
+                for _ in range(max_batches):
+                    cleaned = self._check_and_clean_orphan_vectors(batch_limit=batch_size)
+                    total_cleaned += cleaned
+                    if cleaned == 0:
+                        break
+                    time.sleep(0.1)
+                
+                if total_cleaned > 0:
+                    self._log.info("ORPHAN_CLEANUP_COMPLETE", total_cleaned=total_cleaned)
+            except Exception as e:
+                self._log.error("ORPHAN_CLEANUP_TASK_FAILED", error=str(e))
+        
+        cleanup_thread = threading.Thread(target=cleanup_task, daemon=True)
+        cleanup_thread.start()
     
     def _sync_timestamps(self):
         """
@@ -638,35 +700,82 @@ class AsyncMemoryProcessor:
         
         优雅关闭流程：
         1. 设置停止标志
-        2. 等待队列清空（最多30秒）
-        3. 等待后台线程结束（最多10秒）
-        4. 最后一次落盘
+        2. 主动处理队列中的剩余任务（最多30秒）
+        3. 强制保存缓冲区数据
+        4. 等待后台线程结束（最多10秒）
         5. 等待所有迁移操作完成
+        6. 记录未处理数据统计
         """
         self.running = False
         
         queue_timeout = 30
         start = time.time()
+        processed_during_shutdown = 0
+        
         while not self.pending_queue.empty() and time.time() - start < queue_timeout:
-            time.sleep(0.5)
+            try:
+                conv = self.pending_queue.get(timeout=1.0)
+                self._process_conversation(conv)
+                processed_during_shutdown += 1
+            except queue.Empty:
+                break
+            except Exception as e:
+                self._log.error("SHUTDOWN_PROCESS_ERROR", error=str(e))
         
         remaining = self.pending_queue.qsize()
+        
+        self._flush_buffer()
+        
         if remaining > 0:
-            self._log.warning("STOP_QUEUE_NOT_EMPTY", remaining=remaining)
+            self._save_remaining_to_overflow_buffer()
+            self._log.warning("STOP_QUEUE_REMAINING_SAVED", 
+                             remaining=remaining,
+                             processed=processed_during_shutdown)
         
         if self.thread:
             self.thread.join(timeout=10)
             if self.thread.is_alive():
                 self._log.warning("STOP_THREAD_TIMEOUT")
         
-        self._flush_buffer()
-        
         while self._tx_coordinator.is_migration_active():
             time.sleep(0.1)
         
         self._log.info("ASYNC_PROCESSOR_STOPPED", 
                        queue_remaining=remaining,
-                       buffer_remaining=len(self.batch_buffer))
+                       buffer_remaining=len(self.batch_buffer),
+                       processed_during_shutdown=processed_during_shutdown)
+    
+    def _save_remaining_to_overflow_buffer(self):
+        """
+        将队列中剩余的数据保存到溢出缓冲文件
+        
+        用于下次启动时恢复
+        """
+        import json
+        import os
+        
+        buffer_dir = os.path.join(os.path.dirname(__file__), "overflow_buffer")
+        os.makedirs(buffer_dir, exist_ok=True)
+        
+        buffer_file = os.path.join(buffer_dir, f"shutdown_{int(time.time())}.jsonl")
+        
+        saved_count = 0
+        try:
+            with open(buffer_file, "w", encoding="utf-8") as f:
+                while not self.pending_queue.empty():
+                    try:
+                        conv = self.pending_queue.get_nowait()
+                        f.write(json.dumps(conv, ensure_ascii=False) + "\n")
+                        saved_count += 1
+                    except queue.Empty:
+                        break
+            
+            if saved_count > 0:
+                self._log.info("SHUTDOWN_BUFFER_SAVED", 
+                              file=buffer_file, 
+                              count=saved_count)
+        except Exception as e:
+            self._log.error("SHUTDOWN_BUFFER_SAVE_FAILED", error=str(e))
     
     def add_conversation(self, user_input: str, assistant_response: str, metadata: Dict = None):
         """
@@ -716,24 +825,121 @@ class AsyncMemoryProcessor:
         try:
             self.pending_queue.put_nowait(conv_data)
         except queue.Full:
-            queue_config = self._get_queue_config()
-            action = getattr(queue_config, 'queue_full_action', 'drop_oldest')
-            
-            if action == "drop_oldest":
-                try:
-                    self.pending_queue.get_nowait()
-                    self._queue_dropped_count += 1
-                    self._log.warning("QUEUE_FULL_DROPPING_OLDEST", 
-                                      dropped_count=self._queue_dropped_count,
-                                      queue_size=self.pending_queue.qsize())
-                    self.pending_queue.put_nowait(conv_data)
-                except queue.Empty:
-                    self.pending_queue.put_nowait(conv_data)
-            else:
+            self._handle_queue_full(conv_data)
+    
+    def _handle_queue_full(self, conv_data: Dict):
+        """
+        处理队列满的情况
+        
+        策略：
+        1. 尝试写入本地文件缓冲
+        2. 如果文件缓冲也失败，根据配置决定丢弃策略
+        """
+        queue_config = self._get_queue_config()
+        action = getattr(queue_config, 'queue_full_action', 'drop_oldest')
+        
+        if self._write_to_overflow_buffer(conv_data):
+            self._log.info("QUEUE_FULL_BUFFERED_TO_FILE",
+                          queue_size=self.pending_queue.qsize())
+            return
+        
+        if action == "drop_oldest":
+            try:
+                self.pending_queue.get_nowait()
                 self._queue_dropped_count += 1
-                self._log.warning("QUEUE_FULL_REJECTED",
-                                  rejected_count=self._queue_dropped_count,
+                self._log.warning("QUEUE_FULL_DROPPING_OLDEST", 
+                                  dropped_count=self._queue_dropped_count,
                                   queue_size=self.pending_queue.qsize())
+                self.pending_queue.put_nowait(conv_data)
+            except queue.Empty:
+                self.pending_queue.put_nowait(conv_data)
+        else:
+            self._queue_dropped_count += 1
+            self._log.warning("QUEUE_FULL_REJECTED",
+                              rejected_count=self._queue_dropped_count,
+                              queue_size=self.pending_queue.qsize())
+    
+    def _write_to_overflow_buffer(self, conv_data: Dict) -> bool:
+        """
+        将溢出的对话数据写入本地文件缓冲
+        
+        Args:
+            conv_data: 对话数据
+        
+        Returns:
+            是否成功写入
+        """
+        import json
+        import os
+        
+        try:
+            buffer_dir = os.path.join(os.path.dirname(__file__), "overflow_buffer")
+            os.makedirs(buffer_dir, exist_ok=True)
+            
+            buffer_file = os.path.join(buffer_dir, f"overflow_{datetime.now().strftime('%Y%m%d')}.jsonl")
+            
+            with open(buffer_file, "a", encoding="utf-8") as f:
+                f.write(json.dumps(conv_data, ensure_ascii=False) + "\n")
+            
+            return True
+        except Exception as e:
+            self._log.error("OVERFLOW_BUFFER_WRITE_FAILED", error=str(e))
+            return False
+    
+    def _recover_overflow_buffer(self):
+        """
+        恢复溢出缓冲区中的数据
+        
+        启动时检查并重新处理溢出的对话数据
+        """
+        import json
+        import os
+        import glob
+        
+        try:
+            buffer_dir = os.path.join(os.path.dirname(__file__), "overflow_buffer")
+            if not os.path.exists(buffer_dir):
+                return
+            
+            buffer_files = glob.glob(os.path.join(buffer_dir, "overflow_*.jsonl"))
+            if not buffer_files:
+                return
+            
+            recovered_count = 0
+            for buffer_file in buffer_files:
+                try:
+                    with open(buffer_file, "r", encoding="utf-8") as f:
+                        for line in f:
+                            line = line.strip()
+                            if not line:
+                                continue
+                            try:
+                                conv_data = json.loads(line)
+                                try:
+                                    self.pending_queue.put_nowait(conv_data)
+                                    recovered_count += 1
+                                except queue.Full:
+                                    break
+                            except json.JSONDecodeError:
+                                continue
+                    
+                    if recovered_count > 0:
+                        self._log.info("OVERFLOW_BUFFER_RECOVERED", 
+                                      file=buffer_file,
+                                      count=recovered_count)
+                    
+                    os.remove(buffer_file)
+                    
+                except Exception as e:
+                    self._log.error("OVERFLOW_BUFFER_RECOVERY_FAILED", 
+                                   file=buffer_file,
+                                   error=str(e))
+            
+            if recovered_count > 0:
+                self._log.info("OVERFLOW_BUFFER_TOTAL_RECOVERED", count=recovered_count)
+                
+        except Exception as e:
+            self._log.error("OVERFLOW_BUFFER_RECOVERY_ERROR", error=str(e))
     
     def get_queue_stats(self) -> Dict[str, int]:
         """获取队列统计信息"""
@@ -832,13 +1038,15 @@ class AsyncMemoryProcessor:
     
     def _flush_buffer(self):
         """
-        将缓冲区数据原子化写入（批量优化版）
+        将缓冲区数据原子化写入（事务协调版）
         
-        流程（两阶段提交）：
+        流程（两阶段提交 + 事务日志）：
         1. 批量检查幂等性（文本哈希）
-        2. 批量写入SQLite（标记为待向量化）
-        3. 批量写入ChromaDB
-        4. 批量更新SQLite状态
+        2. 通过 TransactionCoordinator 执行事务：
+           - 准备阶段：批量写入SQLite（标记为待向量化）
+           - 提交阶段：批量写入ChromaDB
+           - 成功后：批量更新SQLite状态
+        3. 事务失败时自动回滚
         
         性能优化：
         - 使用批量哈希计算
@@ -848,7 +1056,8 @@ class AsyncMemoryProcessor:
         - ID预生成实现幂等性
         
         失败恢复：
-        - 启动时通过 _startup_recovery 重试未向量化的记录
+        - 事务状态持久化到 transactions 表
+        - 启动时通过 TransactionCoordinator.recover_pending_transactions 恢复
         - 使用文本哈希防止重复写入
         - 预生成vector_id确保重试幂等性
         
@@ -943,54 +1152,146 @@ class AsyncMemoryProcessor:
         if not texts_to_vectorize:
             return
         
-        try:
-            result_ids = self.vector_store.add(texts_to_vectorize, metadatas_to_vectorize, ids=vector_ids)
-            
-            if self.sqlite and sqlite_ids and result_ids:
-                self.sqlite.batch_update_vector_status(
-                    [(sid, vid) for sid, vid in zip(sqlite_ids, result_ids)],
-                    is_vectorized=1
-                )
-            
-            self._log.info("ATOMIC_WRITE_COMPLETE", count=len(texts_to_vectorize))
-            self._last_flush_time = time.time()
-            
-            self._event_bus.publish(
-                EventType.MEMORY_WRITTEN,
-                {"count": len(texts_to_vectorize)},
-                source="AsyncProcessor"
+        tx_data = {
+            "texts": texts_to_vectorize,
+            "metadatas": metadatas_to_vectorize,
+            "vector_ids": vector_ids,
+            "sqlite_ids": sqlite_ids
+        }
+        
+        def prepare_fn(data):
+            return {"prepared": True, "count": len(data["texts"])}
+        
+        def commit_fn(data):
+            result_ids = self.vector_store.add(
+                data["texts"], 
+                data["metadatas"], 
+                ids=data["vector_ids"]
             )
-            
-        except Exception as e:
-            self._log.error("CHROMADB_WRITE_FAILED", error=str(e))
-            
-            if self.sqlite and sqlite_ids:
-                for sid in sqlite_ids:
+            return {"result_ids": result_ids}
+        
+        def rollback_fn(data):
+            if self.sqlite and data.get("sqlite_ids"):
+                for sid in data["sqlite_ids"]:
                     self.sqlite.update_vector_status(sid, "", is_vectorized=-1)
+                self._log.info("TRANSACTION_ROLLBACK", count=len(data["sqlite_ids"]))
+        
+        tx_coordinator = get_transaction_coordinator()
+        if tx_coordinator and tx_coordinator._sqlite_store:
+            tx_coordinator.begin_migration("flush_buffer")
+            try:
+                result = tx_coordinator.execute_transaction(
+                    operation_type="flush_buffer",
+                    data=tx_data,
+                    prepare_fn=prepare_fn,
+                    commit_fn=commit_fn,
+                    rollback_fn=rollback_fn
+                )
+                
+                if result["success"]:
+                    commit_result = result.get("result", {})
+                    result_ids = commit_result.get("result_ids", [])
+                    
+                    if self.sqlite and sqlite_ids and result_ids:
+                        self.sqlite.batch_update_vector_status(
+                            [(sid, vid) for sid, vid in zip(sqlite_ids, result_ids)],
+                            is_vectorized=1
+                        )
+                    
+                    self._log.info("ATOMIC_WRITE_COMPLETE", 
+                                  count=len(texts_to_vectorize),
+                                  transaction_id=result["transaction_id"])
+                    self._last_flush_time = time.time()
+                    
+                    self._event_bus.publish(
+                        EventType.MEMORY_WRITTEN,
+                        {"count": len(texts_to_vectorize)},
+                        source="AsyncProcessor"
+                    )
+                else:
+                    self._log.error("TRANSACTION_FAILED", 
+                                   error=result.get("error"),
+                                   transaction_id=result["transaction_id"])
+            finally:
+                tx_coordinator.end_migration()
+        else:
+            try:
+                result_ids = self.vector_store.add(texts_to_vectorize, metadatas_to_vectorize, ids=vector_ids)
+                
+                if self.sqlite and sqlite_ids and result_ids:
+                    self.sqlite.batch_update_vector_status(
+                        [(sid, vid) for sid, vid in zip(sqlite_ids, result_ids)],
+                        is_vectorized=1
+                    )
+                
+                self._log.info("ATOMIC_WRITE_COMPLETE", count=len(texts_to_vectorize))
+                self._last_flush_time = time.time()
+                
+                self._event_bus.publish(
+                    EventType.MEMORY_WRITTEN,
+                    {"count": len(texts_to_vectorize)},
+                    source="AsyncProcessor"
+                )
+                
+            except Exception as e:
+                self._log.error("CHROMADB_WRITE_FAILED", error=str(e))
+                
+                if self.sqlite and sqlite_ids:
+                    for sid in sqlite_ids:
+                        self.sqlite.update_vector_status(sid, "", is_vectorized=-1)
     
     def _retry_failed_vectorizations(self):
-        """重试向量化失败的记录"""
+        """
+        重试向量化失败的记录
+        
+        增强：
+        - 重试次数限制（默认3次）
+        - 指数退避延迟
+        - 记录重试状态
+        """
         if not self.sqlite:
             return
         
         try:
-            unvectorized = self.sqlite.get_unvectorized(limit=20)
-            if not unvectorized:
+            max_retries = getattr(self._mem_config.async_processor, 'max_vectorization_retries', 3)
+            failed_records = self.sqlite.get_failed_vectorizations(max_retries=max_retries, limit=20)
+            
+            if not failed_records:
                 return
             
-            print(f"[重试] 发现 {len(unvectorized)} 条未向量化记录")
+            self._log.info("VECTOR_RETRY_START", count=len(failed_records))
             
-            for record in unvectorized:
+            success_count = 0
+            exhausted_count = 0
+            
+            for record in failed_records:
                 try:
                     vector_ids = self.vector_store.add([record.text], [record.metadata or {}])
                     if vector_ids:
                         self.sqlite.update_vector_status(record.id, vector_ids[0], is_vectorized=1)
-                        print(f"[重试成功] 记录 {record.id}")
+                        success_count += 1
+                        self._log.debug("VECTOR_RETRY_SUCCESS", record_id=record.id)
                 except Exception as e:
-                    print(f"[重试失败] 记录 {record.id}: {e}")
+                    retry_count = self.sqlite.increment_vectorization_retry(record.id)
+                    if retry_count >= max_retries:
+                        exhausted_count += 1
+                        self._log.warning("VECTOR_RETRY_EXHAUSTED", 
+                                         record_id=record.id, 
+                                         retries=retry_count,
+                                         error=str(e))
+                    else:
+                        self._log.debug("VECTOR_RETRY_FAILED", 
+                                       record_id=record.id,
+                                       retry=retry_count,
+                                       error=str(e))
+            
+            if success_count > 0 or exhausted_count > 0:
+                self._log.info("VECTOR_RETRY_COMPLETE", 
+                              success=success_count, 
+                              exhausted=exhausted_count)
                     
         except Exception as e:
-            print(f"重试向量化失败: {e}")
+            self._log.error("VECTOR_RETRY_ERROR", error=str(e))
     
     def _check_and_flush(self):
         """
@@ -1066,6 +1367,10 @@ class AsyncMemoryProcessor:
         """
         空闲时检查并执行记忆流动（统一入口）
         
+        并发安全：
+        - 使用 _memory_flow_lock 确保同一时间只有一个线程执行
+        - 通过 _memory_flow_running 标志避免重入
+        
         记忆流动机制（按顺序执行）：
         1. L2→L3：不常用、低权重的记忆从向量库移动到SQLite暂存
         2. L3压缩：对L3中的记忆进行压缩
@@ -1079,18 +1384,29 @@ class AsyncMemoryProcessor:
         if not config.sqlite_enabled or not self.sqlite:
             return
         
-        current_time = time.time()
-        
-        if self._idle_count < 5:
+        if self._memory_flow_running:
+            self._log.debug("MEMORY_FLOW_SKIPPED_RUNNING")
             return
         
-        compression_interval = self._mem_config.async_processor.compression_interval
-        forget_interval = self._mem_config.async_processor.forget_interval
-        
-        if current_time - self._last_compression_time < compression_interval:
+        acquired = self._memory_flow_lock.acquire(blocking=False)
+        if not acquired:
+            self._log.debug("MEMORY_FLOW_SKIPPED_LOCKED")
             return
         
         try:
+            self._memory_flow_running = True
+            
+            current_time = time.time()
+            
+            if self._idle_count < 5:
+                return
+            
+            compression_interval = self._mem_config.async_processor.compression_interval
+            forget_interval = self._mem_config.async_processor.forget_interval
+            
+            if current_time - self._last_compression_time < compression_interval:
+                return
+            
             self._log.debug("MEMORY_FLOW_STARTED")
             
             moved_to_l3 = self._move_l2_to_l3()
@@ -1104,6 +1420,8 @@ class AsyncMemoryProcessor:
             self._process_pending_compressions()
             
             merged = self._check_and_merge_l2()
+            
+            self._retry_failed_vectorizations()
             
             if self._idle_count >= 10 and current_time - self._last_forget_time >= forget_interval:
                 result = self.sqlite.decay_weights(config.memory_decay_days)
@@ -1135,6 +1453,9 @@ class AsyncMemoryProcessor:
             
         except Exception as e:
             self._log.error("MEMORY_FLOW_FAILED", error=str(e))
+        finally:
+            self._memory_flow_running = False
+            self._memory_flow_lock.release()
     
     def _move_l2_to_l3(self) -> int:
         """
@@ -1168,7 +1489,7 @@ class AsyncMemoryProcessor:
         
         cooldown_hours = self._mem_config.memory_flow.cooldown_hours
         
-        self._tx_coordinator.begin_migration()
+        self._tx_coordinator.begin_migration("l2_to_l3")
         try:
             threshold = config.memory_min_weight * self._mem_config.memory_flow.l2_move_threshold_multiplier
             
@@ -1323,7 +1644,9 @@ class AsyncMemoryProcessor:
                         
                         if record.metadata:
                             record.metadata.pop(MemoryTags.NEEDS_RECOMPRESSION, None)
-                            record.metadata.pop(MemoryTags.NEEDS_REVECTORIZATION, None)
+                            record.metadata = MemoryTagHelper.mark_needs_revectorization(
+                                record.metadata, reason="compressed"
+                            )
                         
                         tagger = _get_tag_classifier()
                         if tagger:
@@ -1392,7 +1715,7 @@ class AsyncMemoryProcessor:
         
         cooldown_hours = self._mem_config.memory_flow.cooldown_hours
         
-        self._tx_coordinator.begin_migration()
+        self._tx_coordinator.begin_migration("l3_to_l2")
         try:
             high_weight_records = self.sqlite.get_high_weight_memories(
                 limit=self._mem_config.memory_flow.max_l3_to_l2_batch
