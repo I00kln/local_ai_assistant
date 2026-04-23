@@ -121,14 +121,21 @@ class SQLiteStore:
         encryption_configured = getattr(config.sqlite_store, 'encryption_enabled', False)
         if encryption_configured:
             key = encryption_key or get_encryption_key()
-            if key and is_sqlcipher_available():
-                self._encryption_enabled = True
-                self._encryption_key = key
-                print("[安全] SQLite 加密已启用 (SQLCipher)")
-            elif encryption_configured and not key:
-                print("[警告] SQLite 加密已配置但未找到密钥，请设置 SQLITE_ENCRYPTION_KEY 环境变量")
-            elif encryption_configured and not is_sqlcipher_available():
-                print("[警告] SQLite 加密已配置但 SQLCipher 不可用，请安装: pip install sqlcipher3")
+            if not key:
+                raise RuntimeError(
+                    "SECURITY_VIOLATION: SQLite 加密已配置但未找到密钥。"
+                    "请设置 SQLITE_ENCRYPTION_KEY 环境变量。"
+                    "出于安全考虑，系统拒绝以明文模式启动。"
+                )
+            if not is_sqlcipher_available():
+                raise RuntimeError(
+                    "SECURITY_VIOLATION: SQLite 加密已配置但 SQLCipher 不可用。"
+                    "请执行: pip install sqlcipher3 或 pysqlcipher3。"
+                    "出于安全考虑，系统拒绝以明文模式启动。"
+                )
+            self._encryption_enabled = True
+            self._encryption_key = key
+            print("[安全] SQLite 加密已启用 (SQLCipher)")
         
         self._init_database()
     
@@ -259,22 +266,38 @@ class SQLiteStore:
         return self._local.read_conn
     
     @contextmanager
-    def _get_write_connection(self):
+    def _get_write_connection(self, timeout: float = 30.0):
         """
-        获取写连接（需要锁保护）
+        获取写连接
         
-        写操作需要互斥锁保护，确保数据一致性
+        WAL 模式优化：
+        - SQLite WAL 已配置 busy_timeout，可处理写入排队
+        - Python 级写锁用于保护连接状态一致性
+        - 添加超时机制防止死锁
+        
+        Args:
+            timeout: 写锁获取超时时间（秒）
+        
+        Yields:
+            SQLite 连接
         """
-        with self._write_lock:
-            conn = self._get_read_connection()
+        lock_acquired = self._write_lock.acquire(timeout=timeout)
+        if not lock_acquired:
+            raise sqlite3.OperationalError(
+                f"WRITE_LOCK_TIMEOUT: 无法在 {timeout} 秒内获取写锁"
+            )
+        
+        conn = self._get_read_connection()
+        try:
+            yield conn
+        except sqlite3.Error as e:
             try:
-                yield conn
-            except sqlite3.Error as e:
-                try:
-                    conn.rollback()
-                except:
-                    pass
-                raise
+                conn.rollback()
+            except Exception:
+                pass
+            raise
+        finally:
+            self._write_lock.release()
     
     def _retry_on_connection_error(self, func, *args, **kwargs):
         """
@@ -403,11 +426,27 @@ class SQLiteStore:
         - 每小时自动备份一次
         - 保留最近3个版本的备份
         - 备份文件命名：memory.db.backup.1, memory.db.backup.2, memory.db.backup.3
+        
+        防重复机制：
+        - 首次调用时检查现有备份文件时间戳
+        - 如果备份文件存在且未过期，跳过备份
         """
         import shutil
         import os
         
         current_time = time.time()
+        
+        if self._last_backup_time == 0:
+            backup_dir = os.path.dirname(self.db_path) or "."
+            base_name = os.path.basename(self.db_path)
+            latest_backup = os.path.join(backup_dir, f"{base_name}.backup.1")
+            
+            if os.path.exists(latest_backup):
+                backup_mtime = os.path.getmtime(latest_backup)
+                self._last_backup_time = backup_mtime
+                
+                if not force and current_time - backup_mtime < self.BACKUP_INTERVAL:
+                    return
         
         if not force and current_time - self._last_backup_time < self.BACKUP_INTERVAL:
             return
@@ -481,9 +520,27 @@ class SQLiteStore:
         
         return False
     
+    SCHEMA_VERSION = 1
+    
+    def _get_schema_version(self, conn) -> int:
+        """获取当前 Schema 版本"""
+        try:
+            result = conn.execute("PRAGMA user_version").fetchone()
+            return result[0] if result else 0
+        except Exception:
+            return 0
+    
+    def _set_schema_version(self, conn, version: int):
+        """设置 Schema 版本"""
+        conn.execute(f"PRAGMA user_version = {version}")
+    
     def _init_database(self):
         """
         初始化数据库表结构
+        
+        使用 user_version 管理 Schema 升级：
+        - 版本 0: 全新数据库，创建所有表
+        - 版本 1: 基础表结构 + FTS5 + 触发器
         
         包含完整性检查和自动恢复：
         1. 检查数据库文件是否存在
@@ -512,215 +569,12 @@ class SQLiteStore:
             with self._get_write_connection() as conn:
                 cursor = conn.cursor()
                 
-                cursor.execute("""
-                    CREATE TABLE IF NOT EXISTS memories (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        text TEXT NOT NULL,
-                        compressed_text TEXT,
-                        source TEXT DEFAULT 'user',
-                        weight REAL DEFAULT 1.0,
-                        access_count INTEGER DEFAULT 0,
-                        last_access_time TEXT,
-                        created_time TEXT,
-                        metadata TEXT,
-                        is_archived INTEGER DEFAULT 0,
-                        vector_id TEXT,
-                        is_vectorized INTEGER DEFAULT 0
-                    )
-                """)
+                current_version = self._get_schema_version(conn)
                 
-                try:
-                    cursor.execute("ALTER TABLE memories ADD COLUMN vector_id TEXT")
-                except sqlite3.OperationalError:
-                    pass
-                
-                try:
-                    cursor.execute("ALTER TABLE memories ADD COLUMN is_vectorized INTEGER DEFAULT 0")
-                except sqlite3.OperationalError:
-                    pass
-                
-                try:
-                    cursor.execute("ALTER TABLE memories ADD COLUMN text_hash TEXT")
-                except sqlite3.OperationalError:
-                    pass
-                
-                cursor.execute("""
-                    CREATE TABLE IF NOT EXISTS pending_queue (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        data TEXT NOT NULL,
-                        created_time TEXT NOT NULL,
-                        retry_count INTEGER DEFAULT 0,
-                        status TEXT DEFAULT 'pending'
-                    )
-                """)
-                
-                try:
-                    cursor.execute("CREATE INDEX IF NOT EXISTS idx_pending_queue_status ON pending_queue(status, created_time)")
-                except sqlite3.OperationalError:
-                    pass
-                
-                try:
-                    cursor.execute("""
-                        CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
-                            text,
-                            compressed_text,
-                            content='memories',
-                            content_rowid='id'
-                        )
-                    """)
-                except sqlite3.OperationalError:
-                    pass
-                
-                try:
-                    cursor.execute("""
-                        CREATE INDEX IF NOT EXISTS idx_weight 
-                        ON memories(weight DESC)
-                    """)
-                except sqlite3.OperationalError:
-                    pass
-                
-                try:
-                    cursor.execute("""
-                        CREATE INDEX IF NOT EXISTS idx_created_time 
-                        ON memories(created_time DESC)
-                    """)
-                except sqlite3.OperationalError:
-                    pass
-                
-                try:
-                    cursor.execute("""
-                        CREATE INDEX IF NOT EXISTS idx_last_access 
-                        ON memories(last_access_time DESC)
-                    """)
-                except sqlite3.OperationalError:
-                    pass
-                
-                try:
-                    cursor.execute("""
-                        CREATE INDEX IF NOT EXISTS idx_vector_id 
-                        ON memories(vector_id)
-                    """)
-                except sqlite3.OperationalError:
-                    pass
-                
-                try:
-                    cursor.execute("""
-                        CREATE INDEX IF NOT EXISTS idx_is_vectorized 
-                        ON memories(is_vectorized)
-                    """)
-                except sqlite3.OperationalError:
-                    pass
-                
-                try:
-                    cursor.execute("""
-                        CREATE INDEX IF NOT EXISTS idx_text_hash 
-                        ON memories(text_hash)
-                    """)
-                except sqlite3.OperationalError:
-                    pass
-                
-                try:
-                    cursor.execute("""
-                        CREATE INDEX IF NOT EXISTS idx_decay_candidate 
-                        ON memories(is_archived, created_time, weight)
-                    """)
-                except sqlite3.OperationalError:
-                    pass
-                
-                try:
-                    cursor.execute("""
-                        CREATE INDEX IF NOT EXISTS idx_forget_candidate 
-                        ON memories(is_archived, weight, is_vectorized)
-                    """)
-                except sqlite3.OperationalError:
-                    pass
-                
-                try:
-                    cursor.execute("""
-                        CREATE INDEX IF NOT EXISTS idx_weight_access 
-                        ON memories(weight DESC, last_access_time DESC)
-                    """)
-                except sqlite3.OperationalError:
-                    pass
-                
-                try:
-                    cursor.execute("""
-                        CREATE INDEX IF NOT EXISTS idx_vectorized_weight 
-                        ON memories(is_vectorized, weight DESC)
-                    """)
-                except sqlite3.OperationalError:
-                    pass
-                
-                try:
-                    cursor.execute("""
-                        CREATE INDEX IF NOT EXISTS idx_source_weight 
-                        ON memories(source, weight DESC)
-                    """)
-                except sqlite3.OperationalError:
-                    pass
-                
-                try:
-                    cursor.execute("""
-                        CREATE TRIGGER IF NOT EXISTS memories_ai AFTER INSERT ON memories BEGIN
-                            INSERT INTO memories_fts(rowid, text, compressed_text)
-                            VALUES (new.id, new.text, COALESCE(new.compressed_text, ''));
-                        END
-                    """)
-                except sqlite3.OperationalError:
-                    pass
-                
-                try:
-                    cursor.execute("""
-                        CREATE TRIGGER IF NOT EXISTS memories_ad AFTER DELETE ON memories BEGIN
-                            INSERT INTO memories_fts(memories_fts, rowid, text, compressed_text)
-                            VALUES('delete', old.id, old.text, COALESCE(old.compressed_text, ''));
-                        END
-                    """)
-                except sqlite3.OperationalError:
-                    pass
-                
-                try:
-                    cursor.execute("""
-                        CREATE TRIGGER IF NOT EXISTS memories_au AFTER UPDATE ON memories BEGIN
-                            INSERT INTO memories_fts(memories_fts, rowid, text, compressed_text)
-                            VALUES('delete', old.id, old.text, COALESCE(old.compressed_text, ''));
-                            INSERT INTO memories_fts(rowid, text, compressed_text)
-                            VALUES (new.id, new.text, COALESCE(new.compressed_text, ''));
-                        END
-                    """)
-                except sqlite3.OperationalError:
-                    pass
-                
-                try:
-                    cursor.execute("""
-                        CREATE TABLE IF NOT EXISTS conversations (
-                            id INTEGER PRIMARY KEY AUTOINCREMENT,
-                            session_id TEXT NOT NULL,
-                            user_input TEXT NOT NULL,
-                            assistant_response TEXT,
-                            source TEXT DEFAULT 'local',
-                            timestamp TEXT,
-                            metadata TEXT
-                        )
-                    """)
-                except sqlite3.OperationalError:
-                    pass
-                
-                try:
-                    cursor.execute("""
-                        CREATE INDEX IF NOT EXISTS idx_session_id 
-                        ON conversations(session_id)
-                    """)
-                except sqlite3.OperationalError:
-                    pass
-                
-                try:
-                    cursor.execute("""
-                        CREATE INDEX IF NOT EXISTS idx_conversation_time 
-                        ON conversations(timestamp DESC)
-                    """)
-                except sqlite3.OperationalError:
-                    pass
+                if current_version < 1:
+                    self._init_schema_v1(cursor)
+                    self._set_schema_version(conn, 1)
+                    print(f"[SQLite] Schema 升级至版本 1")
                 
                 conn.commit()
                 
@@ -730,6 +584,117 @@ class SQLiteStore:
         except sqlite3.DatabaseError as e:
             print(f"[严重] 数据库初始化失败: {e}")
             self._rebuild_database()
+    
+    def _init_schema_v1(self, cursor):
+        """
+        Schema 版本 1: 基础表结构
+        
+        包含：
+        - memories 表及索引
+        - pending_queue 表
+        - conversations 表
+        - FTS5 全文搜索
+        - 同步触发器
+        """
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS memories (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                text TEXT NOT NULL,
+                compressed_text TEXT,
+                source TEXT DEFAULT 'user',
+                weight REAL DEFAULT 1.0,
+                access_count INTEGER DEFAULT 0,
+                last_access_time TEXT,
+                created_time TEXT,
+                metadata TEXT,
+                is_archived INTEGER DEFAULT 0,
+                vector_id TEXT,
+                is_vectorized INTEGER DEFAULT 0,
+                text_hash TEXT
+            )
+        """)
+        
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_pending_queue_status ON pending_queue(status, created_time)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_weight ON memories(weight DESC)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_created_time ON memories(created_time DESC)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_last_access ON memories(last_access_time DESC)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_vector_id ON memories(vector_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_is_vectorized ON memories(is_vectorized)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_text_hash ON memories(text_hash)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_decay_candidate ON memories(is_archived, created_time, weight)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_forget_candidate ON memories(is_archived, weight, is_vectorized)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_weight_access ON memories(weight DESC, last_access_time DESC)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_vectorized_weight ON memories(is_vectorized, weight DESC)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_source_weight ON memories(source, weight DESC)")
+        
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS pending_queue (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                data TEXT NOT NULL,
+                created_time TEXT NOT NULL,
+                retry_count INTEGER DEFAULT 0,
+                status TEXT DEFAULT 'pending'
+            )
+        """)
+        
+        try:
+            cursor.execute("""
+                CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
+                    text,
+                    compressed_text,
+                    content='memories',
+                    content_rowid='id'
+                )
+            """)
+        except sqlite3.OperationalError as e:
+            if "already exists" not in str(e):
+                raise
+        
+        self._create_fts_triggers(cursor)
+        
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS conversations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                user_input TEXT NOT NULL,
+                assistant_response TEXT,
+                source TEXT DEFAULT 'local',
+                timestamp TEXT,
+                metadata TEXT
+            )
+        """)
+        
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_session_id ON conversations(session_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_conversation_time ON conversations(timestamp DESC)")
+    
+    def _create_fts_triggers(self, cursor):
+        """
+        创建 FTS5 同步触发器
+        
+        确保全文搜索索引与主表数据同步
+        """
+        cursor.execute("""
+            CREATE TRIGGER IF NOT EXISTS memories_ai AFTER INSERT ON memories BEGIN
+                INSERT INTO memories_fts(rowid, text, compressed_text)
+                VALUES (new.id, new.text, COALESCE(new.compressed_text, ''));
+            END
+        """)
+        
+        cursor.execute("""
+            CREATE TRIGGER IF NOT EXISTS memories_ad AFTER DELETE ON memories BEGIN
+                INSERT INTO memories_fts(memories_fts, rowid, text, compressed_text)
+                VALUES('delete', old.id, old.text, COALESCE(old.compressed_text, ''));
+            END
+        """)
+        
+        cursor.execute("""
+            CREATE TRIGGER IF NOT EXISTS memories_au AFTER UPDATE ON memories BEGIN
+                INSERT INTO memories_fts(memories_fts, rowid, text, compressed_text)
+                VALUES('delete', old.id, old.text, COALESCE(old.compressed_text, ''));
+                INSERT INTO memories_fts(rowid, text, compressed_text)
+                VALUES (new.id, new.text, COALESCE(new.compressed_text, ''));
+            END
+        """)
     
     def _rebuild_database(self):
         """

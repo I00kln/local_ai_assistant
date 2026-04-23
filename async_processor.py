@@ -75,7 +75,7 @@ class AsyncMemoryProcessor:
         if config.sqlite_enabled:
             try:
                 self.sqlite = get_sqlite_store()
-                self._tx_coordinator.set_stores(self.sqlite, self.vector_store)
+                self._tx_coordinator.set_stores(self.sqlite, self.vector_store, self._scheduler)
             except Exception as e:
                 self._log.error("SQLITE_INIT_FAILED", error=str(e))
         
@@ -1209,6 +1209,7 @@ class AsyncMemoryProcessor:
         增强功能：
         - 记录操作日志到 SQLite transactions 表（如果可用）
         - 崩溃后可通过 recover_pending_transactions 恢复
+        - 异常时回滚事务状态
         
         Args:
             texts: 文本列表
@@ -1236,67 +1237,67 @@ class AsyncMemoryProcessor:
             except Exception as e:
                 self._log.warning("FALLBACK_TX_LOG_FAILED", error=str(e))
         
-        sqlite_ids = []
-        vector_ids = []
-        texts_to_vectorize = []
-        metadatas_to_vectorize = []
-        
-        if self.sqlite:
-            text_hashes = [self.sqlite.compute_text_hash(text) for text in texts]
-            
-            existing_map = {}
-            for text_hash in text_hashes:
-                exists, existing_id = self.sqlite.exists_by_text_hash(text_hash)
-                if exists:
-                    existing_map[text_hash] = existing_id
-            
-            for i, (text, meta, text_hash) in enumerate(zip(texts, metadatas, text_hashes)):
-                deterministic_id = self.vector_store._generate_deterministic_id(text)
-                
-                if text_hash in existing_map:
-                    existing_id = existing_map[text_hash]
-                    record = self.sqlite.get(existing_id)
-                    if record and record.is_vectorized == 1:
-                        continue
-                    
-                    pre_generated_id = deterministic_id
-                    if not record or not record.vector_id:
-                        self.sqlite.update_vector_status(existing_id, pre_generated_id, is_vectorized=0)
-                    
-                    sqlite_ids.append(existing_id)
-                    vector_ids.append(pre_generated_id)
-                    texts_to_vectorize.append(text)
-                    meta_with_id = dict(meta) if meta else {}
-                    meta_with_id[MemoryTags.SQLITE_ID] = existing_id
-                    metadatas_to_vectorize.append(meta_with_id)
-                else:
-                    pre_generated_id = deterministic_id
-                    
-                    record = MemoryRecord(
-                        text=text,
-                        source=meta.get("source", "local") if meta else "local",
-                        metadata=meta,
-                        is_vectorized=0,
-                        vector_id=pre_generated_id
-                    )
-                    new_id = self.sqlite.add(record)
-                    sqlite_ids.append(new_id)
-                    vector_ids.append(pre_generated_id)
-                    texts_to_vectorize.append(text)
-                    meta_with_id = dict(meta) if meta else {}
-                    meta_with_id[MemoryTags.SQLITE_ID] = new_id
-                    metadatas_to_vectorize.append(meta_with_id)
-        else:
-            vector_ids = [str(uuid.uuid4()) for _ in texts]
-            texts_to_vectorize = texts
-            metadatas_to_vectorize = metadatas
-        
-        if not texts_to_vectorize:
-            if tx_recorded:
-                self._update_fallback_tx_state(tx_id, "committed", "empty_batch")
-            return
-        
         try:
+            sqlite_ids = []
+            vector_ids = []
+            texts_to_vectorize = []
+            metadatas_to_vectorize = []
+            
+            if self.sqlite:
+                text_hashes = [self.sqlite.compute_text_hash(text) for text in texts]
+                
+                existing_map = {}
+                for text_hash in text_hashes:
+                    exists, existing_id = self.sqlite.exists_by_text_hash(text_hash)
+                    if exists:
+                        existing_map[text_hash] = existing_id
+                
+                for i, (text, meta, text_hash) in enumerate(zip(texts, metadatas, text_hashes)):
+                    deterministic_id = self.vector_store._generate_deterministic_id(text)
+                    
+                    if text_hash in existing_map:
+                        existing_id = existing_map[text_hash]
+                        record = self.sqlite.get(existing_id)
+                        if record and record.is_vectorized == 1:
+                            continue
+                        
+                        pre_generated_id = deterministic_id
+                        if not record or not record.vector_id:
+                            self.sqlite.update_vector_status(existing_id, pre_generated_id, is_vectorized=0)
+                        
+                        sqlite_ids.append(existing_id)
+                        vector_ids.append(pre_generated_id)
+                        texts_to_vectorize.append(text)
+                        meta_with_id = dict(meta) if meta else {}
+                        meta_with_id[MemoryTags.SQLITE_ID] = existing_id
+                        metadatas_to_vectorize.append(meta_with_id)
+                    else:
+                        pre_generated_id = deterministic_id
+                        
+                        record = MemoryRecord(
+                            text=text,
+                            source=meta.get("source", "local") if meta else "local",
+                            metadata=meta,
+                            is_vectorized=0,
+                            vector_id=pre_generated_id
+                        )
+                        new_id = self.sqlite.add(record)
+                        sqlite_ids.append(new_id)
+                        vector_ids.append(pre_generated_id)
+                        texts_to_vectorize.append(text)
+                        meta_with_id = dict(meta) if meta else {}
+                        meta_with_id[MemoryTags.SQLITE_ID] = new_id
+                        metadatas_to_vectorize.append(meta_with_id)
+            else:
+                vector_ids = [str(uuid.uuid4()) for _ in texts]
+                texts_to_vectorize = texts
+                metadatas_to_vectorize = metadatas
+            
+            if not texts_to_vectorize:
+                if tx_recorded:
+                    self._update_fallback_tx_state(tx_id, "committed", "empty_batch")
+                return
+            
             result_ids = self.vector_store.add(texts_to_vectorize, metadatas_to_vectorize, ids=vector_ids)
             
             if self.sqlite and sqlite_ids and result_ids:
@@ -1319,10 +1320,10 @@ class AsyncMemoryProcessor:
             )
             
         except Exception as e:
-            self._log.error("CHROMADB_WRITE_FAILED", error=str(e))
+            self._log.error("FALLBACK_WRITE_FAILED", error=str(e))
             
             if tx_recorded:
-                self._update_fallback_tx_state(tx_id, "failed", str(e))
+                self._update_fallback_tx_state(tx_id, "rolled_back", str(e))
             
             if self.sqlite and sqlite_ids:
                 for sid in sqlite_ids:
@@ -1813,7 +1814,7 @@ class AsyncMemoryProcessor:
         if not self.sqlite:
             return 0
         
-        compression_weight_threshold = self._mem_config.memory_flow.l3_promotion_weight_threshold * self.sqlite.MAX_WEIGHT
+        compression_weight_threshold = self._mem_config.memory_flow.l3_promotion_weight_threshold * config.decay.max_weight
         
         try:
             unaccessed = self.sqlite.get_unaccessed_memories(

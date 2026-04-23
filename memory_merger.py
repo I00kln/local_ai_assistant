@@ -461,26 +461,39 @@ class MemoryMerger:
         """
         精确计算相似度矩阵（用于小规模数据）
         
-        时间复杂度: O(n²)
+        优化：
+        - 批量嵌入计算，减少单次调用开销
+        - 使用 NumPy 向量化操作
+        - 时间复杂度: O(n²) 但常数因子更小
         """
-        vectors = []
         valid_memories = []
+        texts = []
         
         for m in memories:
             text = m.get("text", "")
             if text:
-                try:
-                    vec = self._embedding_service.embed_single(text)
-                    vectors.append(vec)
-                    valid_memories.append(m)
-                except Exception:
-                    continue
+                texts.append(text)
+                valid_memories.append(m)
         
-        if len(vectors) < 2:
+        if len(texts) < 2:
             return [[m] for m in valid_memories]
         
-        vectors = np.array(vectors)
-        similarity_matrix = np.dot(vectors, vectors.T)
+        try:
+            vectors = self._embedding_service.embed(texts, use_cache=False)
+            vectors = np.array(vectors)
+        except Exception as e:
+            self._log.warning("BATCH_EMBED_FAILED", error=str(e))
+            return [[m] for m in valid_memories]
+        
+        norms = np.linalg.norm(vectors, axis=1, keepdims=True)
+        norms = np.maximum(norms, 1e-8)
+        normalized = vectors / norms
+        similarity_matrix = np.dot(normalized, normalized.T)
+        
+        thresholds = np.array([
+            self._get_dynamic_threshold(m.get("text", ""))
+            for m in valid_memories
+        ])
         
         groups = []
         used = set()
@@ -492,19 +505,15 @@ class MemoryMerger:
             group = [valid_memories[i]]
             used.add(i)
             
-            text_i = valid_memories[i].get("text", "")
-            threshold_i = self._get_dynamic_threshold(text_i)
+            threshold_i = thresholds[i]
             
             for j in range(i + 1, len(valid_memories)):
                 if j in used:
                     continue
                 
-                text_j = valid_memories[j].get("text", "")
-                threshold_j = self._get_dynamic_threshold(text_j)
+                effective_threshold = max(threshold_i, thresholds[j])
                 
-                effective_threshold = max(threshold_i, threshold_j)
-                
-                if similarity_matrix[i][j] >= effective_threshold:
+                if similarity_matrix[i, j] >= effective_threshold:
                     group.append(valid_memories[j])
                     used.add(j)
             

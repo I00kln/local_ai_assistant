@@ -130,6 +130,7 @@ class NonsenseFilter:
         self._embedding_service = None
         self._model_lock = threading.Lock()
         self._ready_event = threading.Event()
+        self._warmup_started = False
         
         self.nonsense_texts: List[str] = []
         self.nonsense_vectors: Optional[np.ndarray] = None
@@ -137,8 +138,6 @@ class NonsenseFilter:
         self._load_nonsense_library()
         
         self._exact_hashes = self._build_exact_hashes()
-        
-        self._start_vector_precompute_thread()
         
         self.length_threshold = 10
         self.density_threshold = 0.15
@@ -152,6 +151,17 @@ class NonsenseFilter:
             "vector_filtered": 0,
             "passed": 0
         }
+    
+    def warmup(self):
+        """
+        预热模型和向量计算
+        
+        应在系统启动时显式调用，而非在构造函数中自动启动后台线程
+        """
+        if self._warmup_started:
+            return
+        self._warmup_started = True
+        self._start_vector_precompute_thread()
     
     def _build_exact_hashes(self) -> set:
         """构建高频废话的MD5哈希集合"""

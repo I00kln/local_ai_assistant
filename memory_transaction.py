@@ -95,15 +95,16 @@ class TransactionCoordinator:
         self._transactions: Dict[str, TransactionRecord] = {}
         self._sqlite_store = None
         self._vector_store = None
-        self._migration_lock = threading.RLock()
+        self._scheduler = None
         self._migration_active = False
         self._migration_type: Optional[str] = None
         self._tx_table_initialized = False
     
-    def set_stores(self, sqlite_store, vector_store):
+    def set_stores(self, sqlite_store, vector_store, scheduler=None):
         """设置存储实例并初始化事务表"""
         self._sqlite_store = sqlite_store
         self._vector_store = vector_store
+        self._scheduler = scheduler
         self._init_transaction_table()
     
     def _init_transaction_table(self):
@@ -271,12 +272,11 @@ class TransactionCoordinator:
         """
         开始迁移操作
         
-        获取迁移锁，阻止检索操作访问正在迁移的数据
+        委托给 BackgroundScheduler 的统一锁管理
         
         Args:
             migration_type: 迁移类型 (flush_buffer, l2_to_l3, l3_to_l2, merge, etc.)
         """
-        self._migration_lock.acquire()
         self._migration_active = True
         self._migration_type = migration_type
         self._log.debug("MIGRATION_STARTED", migration_type=migration_type)
@@ -284,26 +284,30 @@ class TransactionCoordinator:
     def end_migration(self):
         """
         结束迁移操作
-        
-        释放迁移锁
         """
         migration_type = self._migration_type
         self._migration_active = False
         self._migration_type = None
-        self._migration_lock.release()
         self._log.debug("MIGRATION_ENDED", migration_type=migration_type)
     
     def is_migration_active(self) -> bool:
         """检查是否有迁移操作正在进行"""
+        if self._scheduler:
+            return self._scheduler.is_migration_active()
         return self._migration_active
     
     def get_migration_type(self) -> Optional[str]:
         """获取当前迁移类型"""
+        if self._scheduler:
+            task = self._scheduler.get_current_task()
+            return task.value if task else None
         return self._migration_type
     
     def wait_for_migration(self, timeout: float = 5.0) -> bool:
         """
         等待迁移完成
+        
+        委托给 BackgroundScheduler 的读锁机制
         
         Args:
             timeout: 超时时间（秒）
@@ -311,14 +315,15 @@ class TransactionCoordinator:
         Returns:
             是否成功获取锁
         """
-        return self._migration_lock.acquire(timeout=timeout)
+        if self._scheduler:
+            lock_context = self._scheduler.read_lock(timeout=timeout)
+            lock_context.__enter__()
+            return lock_context.is_locked()
+        return True
     
     def release_migration_wait(self):
         """释放迁移等待锁"""
-        try:
-            self._migration_lock.release()
-        except RuntimeError:
-            pass
+        pass
     
     def execute_transaction(
         self,

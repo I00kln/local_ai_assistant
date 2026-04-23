@@ -1,6 +1,7 @@
 # vector_store.py
 # L2 向量存储层 - ChromaDB 实现
 import os
+import json
 import time
 import threading
 from typing import List, Dict, Any, Optional, Tuple
@@ -9,6 +10,38 @@ from datetime import datetime
 from config import config
 from memory_tags import MemoryTags
 from models import MemoryRecord
+
+
+def _serialize_metadata(metadata: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    序列化 metadata 中的嵌套字典
+    
+    ChromaDB 不支持嵌套 dict 作为 metadata 值，
+    需要将所有 dict 类型序列化为 JSON 字符串
+    
+    Args:
+        metadata: 原始 metadata
+    
+    Returns:
+        序列化后的 metadata（所有嵌套 dict 转为 JSON 字符串）
+    """
+    if not metadata:
+        return metadata
+    
+    result = {}
+    for key, value in metadata.items():
+        if isinstance(value, dict):
+            result[key] = json.dumps(value, ensure_ascii=False)
+        elif isinstance(value, list):
+            try:
+                json.dumps(value)
+                result[key] = value
+            except (TypeError, ValueError):
+                result[key] = json.dumps(value, ensure_ascii=False)
+        else:
+            result[key] = value
+    
+    return result
 
 
 class ONNXEmbeddingFunction:
@@ -103,12 +136,31 @@ class VectorStore:
         self._prewarm_complete = False
         self._prewarm_error: Optional[str] = None
         self._prewarm_lock = threading.Lock()
+        self._warmup_started = False
         
         self._init_chroma()
         
         self.lock = threading.RLock()
         
         print(f"向量存储初始化完成: {persist_directory}")
+    
+    def warmup(self):
+        """
+        预热嵌入模型
+        
+        应在系统启动时显式调用，而非在构造函数中自动启动后台线程
+        """
+        if self._warmup_started:
+            return
+        self._warmup_started = True
+        
+        print("[向量存储] 正在后台预加载ONNX嵌入模型...")
+        prewarm_thread = threading.Thread(
+            target=self._prewarm_embedding,
+            daemon=True,
+            name="EmbeddingPrewarm"
+        )
+        prewarm_thread.start()
     
     def _init_chroma(self):
         """初始化ChromaDB客户端和集合"""
@@ -125,14 +177,6 @@ class VectorStore:
             )
             
             self.embedding_function = ONNXEmbeddingFunction()
-            
-            print("[向量存储] 正在后台预加载ONNX嵌入模型...")
-            prewarm_thread = threading.Thread(
-                target=self._prewarm_embedding,
-                daemon=True,
-                name="EmbeddingPrewarm"
-            )
-            prewarm_thread.start()
             
             self.collection = self.client.get_or_create_collection(
                 name=self.collection_name,
@@ -262,6 +306,8 @@ class VectorStore:
                 if MemoryTags.TIMESTAMP not in meta:
                     meta[MemoryTags.TIMESTAMP] = datetime.now().isoformat()
         
+        serialized_metadatas = [_serialize_metadata(meta) for meta in metadatas]
+        
         try:
             embeddings = self.embedding_function(texts)
             
@@ -270,14 +316,14 @@ class VectorStore:
                     self.collection.upsert(
                         documents=texts,
                         embeddings=embeddings,
-                        metadatas=metadatas,
+                        metadatas=serialized_metadatas,
                         ids=ids
                     )
                 else:
                     self.collection.add(
                         documents=texts,
                         embeddings=embeddings,
-                        metadatas=metadatas,
+                        metadatas=serialized_metadatas,
                         ids=ids
                     )
                 

@@ -338,6 +338,10 @@ class Config:
         self.async_processor.llm_timeout = int(os.environ.get("LLM_TIMEOUT", "30"))
         self.async_processor.circuit_breaker_threshold = int(os.environ.get("CIRCUIT_BREAKER_THRESHOLD", "5"))
         self.async_processor.circuit_breaker_reset_timeout = int(os.environ.get("CIRCUIT_BREAKER_RESET_TIMEOUT", "300"))
+        self.async_processor.dedup_batch_size = int(os.environ.get("DEDUP_BATCH_SIZE", "500"))
+        self.async_processor.dedup_max_records = int(os.environ.get("DEDUP_MAX_RECORDS", "1000"))
+        self.async_processor.orphan_cleanup_batch_size = int(os.environ.get("ORPHAN_CLEANUP_BATCH_SIZE", "100"))
+        self.async_processor.orphan_cleanup_interval = float(os.environ.get("ORPHAN_CLEANUP_INTERVAL", "0.1"))
     
     def _load_flow_config(self):
         """加载记忆流动配置"""
@@ -390,12 +394,18 @@ class Config:
         self.retrieval.similarity_threshold = float(os.environ.get("SIMILARITY_THRESHOLD", "0.90"))
         self.retrieval.l1_min_results = int(os.environ.get("L1_MIN_RESULTS", "2"))
         self.retrieval.l2_lower_threshold = float(os.environ.get("L2_LOWER_THRESHOLD", "0.80"))
-        self.retrieval.cloud_l1_threshold = float(os.environ.get("CLOUD_L1_THRESHOLD", "0.85"))
+        self.retrieval.cloud_l1_threshold = float(os.environ.get("CLOUD_L1_THRESHOLD", "0.70"))
         self.retrieval.cloud_l2_threshold = float(os.environ.get("CLOUD_L2_THRESHOLD", "0.75"))
         self.retrieval.cloud_l3_threshold = float(os.environ.get("CLOUD_L3_THRESHOLD", "0.70"))
-        self.retrieval.local_l1_threshold = float(os.environ.get("LOCAL_L1_THRESHOLD", "0.90"))
+        self.retrieval.local_l1_threshold = float(os.environ.get("LOCAL_L1_THRESHOLD", "0.75"))
         self.retrieval.local_l2_threshold = float(os.environ.get("LOCAL_L2_THRESHOLD", "0.80"))
         self.retrieval.local_l3_threshold = float(os.environ.get("LOCAL_L3_THRESHOLD", "0.75"))
+        self.retrieval.source_weight_l1 = float(os.environ.get("SOURCE_WEIGHT_L1", "1.2"))
+        self.retrieval.source_weight_l2 = float(os.environ.get("SOURCE_WEIGHT_L2", "1.0"))
+        self.retrieval.source_weight_l3 = float(os.environ.get("SOURCE_WEIGHT_L3", "0.8"))
+        self.retrieval.diversity_threshold = float(os.environ.get("DIVERSITY_THRESHOLD", "0.95"))
+        self.retrieval.recall_multiplier = int(os.environ.get("RECALL_MULTIPLIER", "3"))
+        self.retrieval.high_quality_threshold = float(os.environ.get("HIGH_QUALITY_THRESHOLD", "0.95"))
     
     def _load_vector_store_config(self):
         """加载向量存储配置"""

@@ -333,24 +333,49 @@ class BackgroundTaskScheduler:
             duration_ms=round(duration * 1000, 2)
         )
     
-    def read_lock(self):
+    def read_lock(self, timeout: float = 5.0):
         """
         获取读锁上下文管理器
         
         用于检索操作，等待迁移完成后执行
+        
+        Args:
+            timeout: 超时时间（秒），默认 5.0 秒
+        
+        Returns:
+            读锁上下文管理器
         """
-        return _ReadLockContext(self)
+        return _ReadLockContext(self, timeout)
     
-    def acquire_read(self) -> bool:
+    def acquire_read(self, timeout: float = 5.0) -> bool:
         """
         获取读锁
         
+        Args:
+            timeout: 超时时间（秒）
+        
         Returns:
-            是否成功获取
+            是否成功获取读锁
         """
+        deadline = time.time() + timeout
+        
         with self._write_waiting:
             while self._write_in_progress:
-                self._write_waiting.wait()
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    self._log.warning(
+                        "READ_LOCK_TIMEOUT",
+                        timeout=timeout
+                    )
+                    return False
+                
+                if not self._write_waiting.wait(timeout=min(remaining, 0.1)):
+                    if time.time() >= deadline:
+                        self._log.warning(
+                            "READ_LOCK_TIMEOUT",
+                            timeout=timeout
+                        )
+                        return False
             
             self._readers_count += 1
         
@@ -440,15 +465,24 @@ class BackgroundTaskScheduler:
 
 
 class _ReadLockContext:
-    """读锁上下文管理器"""
+    """
+    读锁上下文管理器
     
-    def __init__(self, scheduler: BackgroundTaskScheduler):
+    支持超时机制，超时后可选择降级执行
+    """
+    
+    def __init__(self, scheduler: BackgroundTaskScheduler, timeout: float = 5.0):
         self._scheduler = scheduler
+        self._timeout = timeout
         self._acquired = False
     
     def __enter__(self):
-        self._scheduler.acquire_read()
-        self._acquired = True
+        self._acquired = self._scheduler.acquire_read(self._timeout)
+        if not self._acquired:
+            self._scheduler._log.warning(
+                "READ_LOCK_FALLBACK",
+                message="读锁获取超时，降级为无锁搜索"
+            )
         return self
     
     def __exit__(self, exc_type, exc_val, exc_tb):
@@ -456,6 +490,10 @@ class _ReadLockContext:
             self._scheduler.release_read()
             self._acquired = False
         return False
+    
+    def is_locked(self) -> bool:
+        """检查是否成功获取读锁"""
+        return self._acquired
 
 
 _scheduler: Optional[BackgroundTaskScheduler] = None

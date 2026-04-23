@@ -4,6 +4,7 @@ from dataclasses import dataclass, field, asdict
 from typing import Optional, Dict, Any, List
 from datetime import datetime
 from enum import Enum
+import uuid
 
 
 class MessageSource(Enum):
@@ -62,7 +63,7 @@ class ConversationMetadata:
         if not self.timestamp:
             self.timestamp = datetime.now().isoformat()
         if not self.chunk_id:
-            self.chunk_id = f"chunk_{int(datetime.now().timestamp() * 1000)}"
+            self.chunk_id = f"chunk_{uuid.uuid4().hex[:12]}"
     
     def to_dict(self) -> Dict[str, Any]:
         """转换为字典"""
@@ -102,7 +103,7 @@ class MemoryMetadata:
         if not self.timestamp:
             self.timestamp = datetime.now().isoformat()
         if not self.chunk_id:
-            self.chunk_id = f"mem_{int(datetime.now().timestamp() * 1000)}"
+            self.chunk_id = f"mem_{uuid.uuid4().hex[:12]}"
     
     def to_dict(self) -> Dict[str, Any]:
         """转换为字典"""
