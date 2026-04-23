@@ -1,0 +1,76 @@
+{
+  "timestamp": "2026-04-23T15:25:42.298683",
+  "overall_status": "✅ PASS",
+  "summary": {
+    "pass": 3,
+    "warn": 0,
+    "fail": 0,
+    "skip": 3,
+    "error": 0
+  },
+  "elapsed_seconds": 3.77,
+  "checks": [
+    {
+      "name": "关键进程状态",
+      "status": "✅ PASS",
+      "value": {
+        "llama_status": "⏭️ SKIP",
+        "chroma_writable": true,
+        "onnx_available": true
+      },
+      "threshold": "所有关键进程可用",
+      "message": "llama: llama.cpp 未启用; ChromaDB: ChromaDB 目录可写; ONNX: ONNX 模型加载成功",
+      "details": {}
+    },
+    {
+      "name": "队列积压阈值",
+      "status": "⏭️ SKIP",
+      "value": 0,
+      "threshold": "< 100",
+      "message": "异步处理器未初始化",
+      "details": {
+        "max_threshold": 100
+      }
+    },
+    {
+      "name": "压缩成功率",
+      "status": "⏭️ SKIP",
+      "value": "0.0%",
+      "threshold": "> 80%",
+      "message": "无压缩统计数据",
+      "details": {
+        "total": 0,
+        "success": 0
+      }
+    },
+    {
+      "name": "检索延迟 P95",
+      "status": "⏭️ SKIP",
+      "value": "0.0ms",
+      "threshold": "< 200ms",
+      "message": "暂无检索延迟数据",
+      "details": {}
+    },
+    {
+      "name": "磁盘剩余空间",
+      "status": "✅ PASS",
+      "value": "67.4%",
+      "threshold": "> 10%",
+      "message": "磁盘空间充足: 67.4% >= 10.0%",
+      "details": {
+        "total_gb": "125.0",
+        "free_gb": "84.3"
+      }
+    },
+    {
+      "name": "SQLite 数据库完整性",
+      "status": "✅ PASS",
+      "value": "ok",
+      "threshold": "ok",
+      "message": "数据库完整性检查通过",
+      "details": {
+        "db_path": "D:\\local_ai_assistant\\memory.db"
+      }
+    }
+  ]
+}
