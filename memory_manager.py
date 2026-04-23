@@ -1,17 +1,17 @@
 # memory_manager.py
 # 三层记忆管理器 - 统一管理L1/L2/L3记忆层
-import os
 import threading
 import time
-from typing import List, Dict, Any, Optional, Tuple
-from datetime import datetime, timedelta
+from typing import List, Dict, Any, Optional
+from datetime import datetime
 from dataclasses import dataclass
 
 from config import config
 from vector_store import VectorStore, get_vector_store
-from sqlite_store import SQLiteStore, MemoryRecord, get_sqlite_store
+from sqlite_store import SQLiteStore, get_sqlite_store
 from event_bus import get_event_bus, EventType
 from memory_transaction import get_transaction_coordinator
+from memory_tags import MemoryTags, MemoryTagHelper
 from logger import get_logger
 
 
@@ -791,7 +791,6 @@ class MemoryManager:
         """保存所有层"""
         # ChromaDB自动持久化，无需额外操作
         # SQLite自动持久化，无需额外操作
-        pass
 
 
 # 全局实例

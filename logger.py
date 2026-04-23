@@ -1,12 +1,9 @@
 import logging
 import os
 import uuid
-import threading
-from datetime import datetime
 from typing import Optional, Dict, Any
 from logging.handlers import TimedRotatingFileHandler
 from contextvars import ContextVar
-from config import config
 
 
 _trace_id: ContextVar[str] = ContextVar('trace_id', default='')

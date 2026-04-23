@@ -23,6 +23,8 @@ from enum import Enum
 from collections import Counter
 import json
 
+from memory_tags import MemoryTags
+
 
 class TagCategory(Enum):
     """记忆分类标签"""

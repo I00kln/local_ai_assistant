@@ -12,7 +12,7 @@
 - config.local_assistant_prompt: 用于本地LLM直接回答用户问题
 """
 
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any
 from dataclasses import dataclass
 
 

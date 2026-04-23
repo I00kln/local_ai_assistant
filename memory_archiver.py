@@ -15,11 +15,10 @@
 
 import json
 import os
-import shutil
 import sqlite3
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Any
 from pathlib import Path

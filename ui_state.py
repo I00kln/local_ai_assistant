@@ -1,10 +1,9 @@
 # ui_state.py
 # UI状态管理器 - 统一管理界面状态
 import tkinter as tk
-from typing import Optional, Callable, Dict, Any, List
-from dataclasses import dataclass, field
+from typing import Callable, Dict, Any, List
+from dataclasses import dataclass
 from datetime import datetime
-from enum import Enum
 from contextlib import contextmanager
 from models import UIState
 

@@ -70,7 +70,6 @@ class EmbeddingService:
                 return
             
             try:
-                import numpy as np
                 from config import config
                 import onnxruntime as ort
                 from tokenizers import Tokenizer

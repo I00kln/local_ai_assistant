@@ -1,8 +1,7 @@
 # memory_tags.py
 # 记忆标签统一管理
-from typing import Optional, Dict, List, Any, Set
+from typing import Optional
 from datetime import datetime, timedelta
-
 
 class MemoryTags:
     """记忆元数据标签常量"""
@@ -83,7 +82,6 @@ class MemoryTags:
     # 时间戳
     TIMESTAMP = "timestamp"
 
-
 class MemoryTagHelper:
     """记忆标签操作辅助类"""
     
@@ -92,7 +90,6 @@ class MemoryTagHelper:
         """标记记忆为已压缩"""
         if metadata is None:
             metadata = {}
-        from datetime import datetime
         metadata[MemoryTags.COMPRESSED] = True
         metadata[MemoryTags.COMPRESSED_TIME] = datetime.now().isoformat()
         metadata[MemoryTags.COMPRESSED_STRATEGY] = strategy
@@ -122,7 +119,7 @@ class MemoryTagHelper:
         """标记记忆从L2移动到L3"""
         if metadata is None:
             metadata = {}
-        from datetime import datetime
+
         metadata[MemoryTags.MOVED_FROM_L2] = True
         metadata[MemoryTags.MOVED_FROM_L2_TIME] = datetime.now().isoformat()
         if MemoryTags.MOVED_FROM_L3 in metadata:
@@ -136,7 +133,7 @@ class MemoryTagHelper:
         """标记记忆从L3回流到L2"""
         if metadata is None:
             metadata = {}
-        from datetime import datetime
+
         metadata[MemoryTags.PROMOTED_TO_L2] = True
         metadata[MemoryTags.PROMOTED_TIME] = datetime.now().isoformat()
         metadata[MemoryTags.MOVED_FROM_L3] = True
@@ -154,7 +151,7 @@ class MemoryTagHelper:
         """标记记忆为待压缩"""
         if metadata is None:
             metadata = {}
-        from datetime import datetime
+
         metadata[MemoryTags.PENDING_COMPRESSION] = True
         metadata[MemoryTags.PENDING_SINCE] = datetime.now().isoformat()
         metadata[MemoryTags.RETRY_COUNT] = retry_count
@@ -294,8 +291,7 @@ class MemoryTagHelper:
         """
         if metadata is None:
             metadata = {}
-        
-        from datetime import datetime
+
         metadata[MemoryTags.FORGOTTEN] = True
         metadata[MemoryTags.FORGOTTEN_TIME] = datetime.now().isoformat()
         metadata[MemoryTags.FORGOTTEN_REASON] = reason
@@ -360,7 +356,7 @@ class MemoryTagHelper:
         if metadata is None:
             return False
         if metadata.get(MemoryTags.PROMOTED_TO_L2):
-            from datetime import datetime, timedelta
+
             promoted_time_str = metadata.get(MemoryTags.PROMOTED_TIME)
             if promoted_time_str:
                 try:
@@ -378,7 +374,7 @@ class MemoryTagHelper:
         if metadata is None:
             return False
         if metadata.get(MemoryTags.MOVED_FROM_L3):
-            from datetime import datetime, timedelta
+
             moved_time_str = metadata.get(MemoryTags.MOVED_FROM_L3_TIME)
             if moved_time_str:
                 try:
@@ -408,8 +404,7 @@ class MemoryTagHelper:
         """
         if metadata is None:
             metadata = {}
-        
-        from datetime import datetime
+
         metadata[MemoryTags.MERGED] = True
         metadata[MemoryTags.MERGED_AT] = datetime.now().isoformat()
         metadata[MemoryTags.MERGED_COUNT] = merged_count
@@ -473,8 +468,7 @@ class MemoryTagHelper:
         """
         if metadata is None:
             metadata = {}
-        
-        from datetime import datetime
+
         metadata[MemoryTags.UPGRADED_FROM_SQLITE_ONLY] = True
         metadata[MemoryTags.UPGRADED_TIME] = datetime.now().isoformat()
         return metadata
@@ -525,8 +519,7 @@ class MemoryTagHelper:
         """
         if metadata is None:
             metadata = {}
-        
-        from datetime import datetime
+
         metadata[MemoryTags.TAG_CORRECTED_AT] = datetime.now().isoformat()
         return metadata
     

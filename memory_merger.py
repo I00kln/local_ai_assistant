@@ -27,7 +27,7 @@ import threading
 import re
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Dict, List, Optional, Tuple, Any, Set
+from typing import Dict, List, Optional, Tuple, Any
 import numpy as np
 
 from memory_tags import MemoryTags, MemoryTagHelper

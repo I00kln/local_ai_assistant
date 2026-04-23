@@ -1,6 +1,6 @@
 # context_builder.py
 # 上下文构建器 - 使用三层记忆管理器
-from typing import List, Dict, Any, Tuple, Optional
+from typing import List, Dict, Tuple
 from config import config
 import re
 
@@ -9,7 +9,6 @@ SHORT_QUERY_STOPWORDS = {
     "明白", "知道了", "谢谢", "感谢", "不客气", "再见", "拜拜",
     "ok", "yes", "no", "hi", "hello", "hey"
 }
-
 
 class ContextBuilder:
     """上下文构建器：多级记忆检索 + 动态长度控制"""
@@ -101,8 +100,7 @@ class ContextBuilder:
         
         if query in SHORT_QUERY_STOPWORDS:
             return False
-        
-        import re
+
         if re.match(r'^[^\u4e00-\u9fa5a-zA-Z0-9]+$', query):
             return False
         
@@ -402,8 +400,7 @@ class ContextBuilder:
         Returns:
             "time_related" | "factual" | "casual" | "complex" | "default"
         """
-        import re
-        
+
         query_lower = query.lower()
         
         time_patterns = r"昨天|今天|上周|之前|刚才|什么时候|何时|when|yesterday|today|before"
@@ -486,7 +483,7 @@ class ContextBuilder:
         2. 包含专有名词（人名、地名、产品名）
         3. 包含关键动词（决定、选择、购买）
         """
-        import re
+
         score = 0.0
         
         number_patterns = r'\d+(?:\.\d+)?(?:元|美元|块|万|千|百|亿|%|％|度|kg|kg|ml|GB|MB|TB)?'
@@ -517,8 +514,7 @@ class ContextBuilder:
         2. 在截断边界处保留完整句子
         3. 追加关键信息摘要
         """
-        import re
-        
+
         max_chars = int(max_tokens / 2) - 20
         if max_chars <= 0:
             return text[:50] + "..."

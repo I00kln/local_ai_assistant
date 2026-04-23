@@ -7,9 +7,10 @@ import threading
 import time
 from datetime import datetime, timedelta
 from typing import List, Dict, Any, Optional, Tuple
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 from contextlib import contextmanager
 from config import config
+from memory_tags import MemoryTags
 
 
 @dataclass

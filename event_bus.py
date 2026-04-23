@@ -2,7 +2,7 @@ import threading
 import queue
 import weakref
 from typing import Dict, List, Callable, Any, Optional
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
 from logger import get_logger

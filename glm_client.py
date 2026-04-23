@@ -2,7 +2,6 @@
 # GLM (智谱AI) 客户端
 from typing import Dict, List, Optional
 import re
-import sys
 
 
 class GLMClient:

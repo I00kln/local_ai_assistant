@@ -9,7 +9,7 @@ from typing import List, Dict, Tuple, Optional
 from dataclasses import dataclass
 from datetime import datetime
 from config import config
-from memory_tags import MemoryTags, MemoryTagHelper
+from memory_tags import MemoryTagHelper
 
 
 @dataclass

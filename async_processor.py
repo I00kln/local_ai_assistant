@@ -2,16 +2,15 @@
 import threading
 import time
 import queue
-import hashlib
 import re
 from abc import ABC, abstractmethod
-from typing import List, Dict, Any, Set, Tuple, Optional
+from typing import List, Dict, Any, Tuple, Optional
 from datetime import datetime, timedelta
 from vector_store import VectorStore, get_vector_store
 from config import config, get_memory_config
 from memory_transaction import get_transaction_coordinator
 from event_bus import get_event_bus, EventType
-from nonsense_filter import get_nonsense_filter, FilterResult
+from nonsense_filter import get_nonsense_filter
 from sqlite_store import get_sqlite_store, MemoryRecord
 from logger import get_logger, set_trace_id
 from memory_tags import MemoryTags, MemoryTagHelper
@@ -37,18 +36,15 @@ class CompressionStrategy(ABC):
     @abstractmethod
     def compress(self, text: str) -> Optional[str]:
         """压缩文本，返回 None 表示无法压缩"""
-        pass
     
     @abstractmethod
     def is_available(self) -> bool:
         """检查策略是否可用"""
-        pass
     
     @property
     @abstractmethod
     def name(self) -> str:
         """策略名称"""
-        pass
 
 
 class LLMCompressionStrategy(CompressionStrategy):
@@ -464,7 +460,13 @@ class AsyncMemoryProcessor:
         overflow_count = event_data.get("overflow_count", 0)
         self._log.info("L1_OVERFLOW_RECEIVED", 
                       overflow_count=overflow_count,
-                      pending_queue_size=self.pending_queue.qsize())
+                      pending_queue_size=self.pending_queue.qsize(),
+                      buffer_size=len(self.batch_buffer))
+        
+        if len(self.batch_buffer) > 0:
+            self._log.debug("L1_OVERFLOW_FLUSHING_BUFFER",
+                           buffer_count=len(self.batch_buffer))
+            self._flush_buffer()
         
         if self.pending_queue.qsize() > 0:
             self._log.debug("L1_OVERFLOW_TRIGGERING_FLUSH",

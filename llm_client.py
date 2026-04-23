@@ -1,7 +1,7 @@
 # llm_client.py
 import requests
 import json
-from typing import Optional, Dict, Any, List
+from typing import Dict, List
 from config import config
 
 class LlamaClient:

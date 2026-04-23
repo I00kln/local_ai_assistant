@@ -3,7 +3,7 @@
 import os
 import time
 import threading
-from typing import List, Dict, Any, Optional, Callable
+from typing import List, Dict, Any, Optional
 from datetime import datetime
 
 from config import config
