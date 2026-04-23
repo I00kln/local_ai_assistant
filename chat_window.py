@@ -8,6 +8,7 @@ from typing import Optional, List, Dict, Any
 from config import config
 from models import UIState
 from ui_state import UIStateManager
+from logger import TraceContext, get_trace_id
 
 
 class ChatWindow:
@@ -527,91 +528,101 @@ class ChatWindow:
             self._safe_after(0, lambda: self.send_button.config(state=tk.NORMAL))
             return
         
-        try:
-            mode = "cloud_only" if (use_cloud and not use_local) else "local"
-            
-            memory_context, processed_input, retrieved_memories, has_memories = self.context_builder.build_context(
-                user_input, self.conversation_history, mode
-            )
-            
-            retrieval_metadata = self._build_retrieval_metadata(retrieved_memories, memory_context)
-            
-            if show_memory and retrieved_memories:
-                try:
-                    from sensitive_filter import get_sensitive_filter
-                    sensitive_filter = get_sensitive_filter()
-                    
-                    memory_lines = []
-                    for m in retrieved_memories[:5]:
-                        text = m.get('text', '')
-                        masked_text, _ = sensitive_filter.mask(text)
-                        memory_lines.append(
-                            f"  [{m.get('similarity', 0):.2f}][{m.get('source', '?')}] {masked_text[:50]}..."
-                        )
-                    memory_info = "\n".join(memory_lines)
-                except Exception:
-                    memory_info = "\n".join([
-                        f"  [{m.get('similarity', 0):.2f}][{m.get('source', '?')}] {m.get('text', '')[:50]}..."
-                        for m in retrieved_memories[:5]
-                    ])
+        with TraceContext("user_message"):
+            try:
+                mode = "cloud_only" if (use_cloud and not use_local) else "local"
                 
-                self._safe_after(0, lambda info=memory_info: self._append_message(
-                    "memory", f"检索到的记忆:\n{info}"
-                ))
-            
-            local_response = ""
-            final_response = ""
-            response_source = "assistant"
-            cloud_success = False
-            
-            if use_cloud and not use_local:
-                self._safe_after(0, lambda: self.state_manager.set_state(UIState.PROCESSING_CLOUD, "云端直连处理中"))
+                memory_context, processed_input, retrieved_memories, has_memories = self.context_builder.build_context(
+                    user_input, self.conversation_history, mode
+                )
                 
-                if has_memories and memory_context:
-                    messages = [
-                        {"role": "system", "content": "你是一个智能助手。请结合历史上下文回答用户问题。"},
-                        {"role": "user", "content": f"【历史上下文】\n{memory_context}\n\n【当前问题】\n{user_input}"}
-                    ]
-                else:
-                    messages = [
-                        {"role": "system", "content": "你是一个智能助手，请提供完整、详细、有帮助的回答。"},
-                        {"role": "user", "content": user_input}
-                    ]
+                retrieval_metadata = self._build_retrieval_metadata(retrieved_memories, memory_context)
                 
-                final_response = self.hybrid_client.cloud_client.chat(messages)
-                
-                if final_response:
-                    response_source = "cloud"
-                    cloud_success = True
-                else:
-                    final_response = "云端响应为空，请检查网络连接或API配置。"
-                    self._safe_after(0, lambda: self._append_message("system", "云端响应为空"))
-            
-            elif use_cloud and use_local:
-                if has_memories:
-                    self._safe_after(0, lambda: self.state_manager.set_state(UIState.PROCESSING_LOCAL, "本地压缩中"))
-                    
-                    messages = self._build_compression_messages(memory_context)
-                    compressed_memory = self.llm.chat(messages)
-                    
-                    if compressed_memory and show_local:
-                        self._safe_after(0, lambda resp=compressed_memory: self._append_message("assistant", f"[压缩记忆]\n{resp[:200]}..."))
-                    
-                    if compressed_memory:
-                        self._safe_after(0, lambda: self.state_manager.set_state(UIState.PROCESSING_CLOUD, "等待云端响应"))
+                if show_memory and retrieved_memories:
+                    try:
+                        from sensitive_filter import get_sensitive_filter
+                        sensitive_filter = get_sensitive_filter()
                         
-                        cloud_response = self.hybrid_client.process(
-                            user_input=user_input,
-                            compressed_memory=compressed_memory,
-                            metadata=retrieval_metadata
-                        )
+                        memory_lines = []
+                        for m in retrieved_memories[:5]:
+                            text = m.get('text', '')
+                            masked_text, _ = sensitive_filter.mask(text)
+                            memory_lines.append(
+                                f"  [{m.get('similarity', 0):.2f}][{m.get('source', '?')}] {masked_text[:50]}..."
+                            )
+                        memory_info = "\n".join(memory_lines)
+                    except Exception:
+                        memory_info = "\n".join([
+                            f"  [{m.get('similarity', 0):.2f}][{m.get('source', '?')}] {m.get('text', '')[:50]}..."
+                            for m in retrieved_memories[:5]
+                        ])
+                    
+                    self._safe_after(0, lambda info=memory_info: self._append_message(
+                        "memory", f"检索到的记忆:\n{info}"
+                    ))
+                
+                local_response = ""
+                final_response = ""
+                response_source = "assistant"
+                cloud_success = False
+                
+                if use_cloud and not use_local:
+                    self._safe_after(0, lambda: self.state_manager.set_state(UIState.PROCESSING_CLOUD, "云端直连处理中"))
+                    
+                    if has_memories and memory_context:
+                        messages = [
+                            {"role": "system", "content": "你是一个智能助手。请结合历史上下文回答用户问题。"},
+                            {"role": "user", "content": f"【历史上下文】\n{memory_context}\n\n【当前问题】\n{user_input}"}
+                        ]
+                    else:
+                        messages = [
+                            {"role": "system", "content": "你是一个智能助手，请提供完整、详细、有帮助的回答。"},
+                            {"role": "user", "content": user_input}
+                        ]
+                    
+                    final_response = self.hybrid_client.cloud_client.chat(messages)
+                    
+                    if final_response:
+                        response_source = "cloud"
+                        cloud_success = True
+                    else:
+                        final_response = "云端响应为空，请检查网络连接或API配置。"
+                        self._safe_after(0, lambda: self._append_message("system", "云端响应为空"))
+                
+                elif use_cloud and use_local:
+                    if has_memories:
+                        self._safe_after(0, lambda: self.state_manager.set_state(UIState.PROCESSING_LOCAL, "本地压缩中"))
                         
-                        if cloud_response:
-                            final_response = cloud_response
-                            response_source = "cloud"
-                            cloud_success = True
+                        messages = self._build_compression_messages(memory_context)
+                        compressed_memory = self.llm.chat(messages)
+                        
+                        if compressed_memory and show_local:
+                            self._safe_after(0, lambda resp=compressed_memory: self._append_message("assistant", f"[压缩记忆]\n{resp[:200]}..."))
+                        
+                        if compressed_memory:
+                            self._safe_after(0, lambda: self.state_manager.set_state(UIState.PROCESSING_CLOUD, "等待云端响应"))
+                            
+                            cloud_response = self.hybrid_client.process(
+                                user_input=user_input,
+                                compressed_memory=compressed_memory,
+                                metadata=retrieval_metadata
+                            )
+                            
+                            if cloud_response:
+                                final_response = cloud_response
+                                response_source = "cloud"
+                                cloud_success = True
+                            else:
+                                final_response = "云端响应为空"
                         else:
-                            final_response = "云端响应为空"
+                            self._safe_after(0, lambda: self.state_manager.set_state(UIState.PROCESSING_CLOUD, "直连云端"))
+                            final_response = self.hybrid_client.direct_chat(user_input)
+                            
+                            if final_response:
+                                response_source = "cloud"
+                                cloud_success = True
+                            else:
+                                self._safe_after(0, lambda: self._append_message("system", "云端响应为空"))
                     else:
                         self._safe_after(0, lambda: self.state_manager.set_state(UIState.PROCESSING_CLOUD, "直连云端"))
                         final_response = self.hybrid_client.direct_chat(user_input)
@@ -621,87 +632,79 @@ class ChatWindow:
                             cloud_success = True
                         else:
                             self._safe_after(0, lambda: self._append_message("system", "云端响应为空"))
+                
+                elif use_local:
+                    self._safe_after(0, lambda: self.state_manager.set_state(UIState.PROCESSING_LOCAL, "本地处理中"))
+                    
+                    messages = self._build_local_llm_messages(
+                        memory_context if has_memories else "", 
+                        processed_input if has_memories else user_input,
+                        apply_token_limit=True
+                    )
+                    local_response = self.llm.chat(messages)
+                    final_response = local_response
+                
                 else:
-                    self._safe_after(0, lambda: self.state_manager.set_state(UIState.PROCESSING_CLOUD, "直连云端"))
-                    final_response = self.hybrid_client.direct_chat(user_input)
-                    
-                    if final_response:
-                        response_source = "cloud"
-                        cloud_success = True
-                    else:
-                        self._safe_after(0, lambda: self._append_message("system", "云端响应为空"))
-            
-            elif use_local:
-                self._safe_after(0, lambda: self.state_manager.set_state(UIState.PROCESSING_LOCAL, "本地处理中"))
+                    final_response = "未启用任何AI服务，请在设置中启用本地AI或云端AI。"
+                    self._safe_after(0, lambda resp=final_response: self._append_message("system", resp))
                 
-                messages = self._build_local_llm_messages(
-                    memory_context if has_memories else "", 
-                    processed_input if has_memories else user_input,
-                    apply_token_limit=True
-                )
-                local_response = self.llm.chat(messages)
-                final_response = local_response
-            
-            else:
-                final_response = "未启用任何AI服务，请在设置中启用本地AI或云端AI。"
-                self._safe_after(0, lambda resp=final_response: self._append_message("system", resp))
-            
-            if not final_response:
-                final_response = "抱歉，处理过程中出现问题，请重试。"
-            
-            if response_source == "cloud":
-                self._safe_after(0, lambda resp=final_response: self._append_message(response_source, resp))
-            elif use_local and not use_cloud:
-                self._safe_after(0, lambda resp=final_response: self._append_message(response_source, resp))
-            
-            self.conversation_history.append({
-                "user": user_input,
-                "assistant": final_response,
-                "source": "cloud" if response_source == "cloud" else "local",
-                "timestamp": datetime.now().isoformat()
-            })
-            
-            if len(self.conversation_history) > 20:
-                self.conversation_history = self.conversation_history[-20:]
-            
-            should_store = False
-            if use_cloud and cloud_success:
-                should_store = True
-            
-            if should_store:
-                try:
-                    from sensitive_filter import get_sensitive_filter
-                    sensitive_filter = get_sensitive_filter()
-                    
-                    masked_user_input, user_detected = sensitive_filter.mask(user_input)
-                    masked_response, resp_detected = sensitive_filter.mask(final_response)
-                    
-                    if user_detected or resp_detected:
-                        self._log_sensitive_detection(user_detected, resp_detected)
-                except Exception:
-                    masked_user_input = user_input
-                    masked_response = final_response
+                if not final_response:
+                    final_response = "抱歉，处理过程中出现问题，请重试。"
                 
-                self.async_processor.add_conversation(masked_user_input, masked_response, {
-                    "context_used": len(memory_context) if memory_context else 0,
-                    "memories_retrieved": len(retrieved_memories),
-                    "source": "cloud" if cloud_success else "local",
-                    "sensitive_masked": True
+                if response_source == "cloud":
+                    self._safe_after(0, lambda resp=final_response: self._append_message(response_source, resp))
+                elif use_local and not use_cloud:
+                    self._safe_after(0, lambda resp=final_response: self._append_message(response_source, resp))
+                
+                self.conversation_history.append({
+                    "user": user_input,
+                    "assistant": final_response,
+                    "source": "cloud" if response_source == "cloud" else "local",
+                    "timestamp": datetime.now().isoformat()
                 })
+                
+                if len(self.conversation_history) > 20:
+                    self.conversation_history = self.conversation_history[-20:]
+                
+                should_store = False
+                if use_cloud and cloud_success:
+                    should_store = True
+                
+                if should_store:
+                    try:
+                        from sensitive_filter import get_sensitive_filter
+                        sensitive_filter = get_sensitive_filter()
+                        
+                        masked_user_input, user_detected = sensitive_filter.mask(user_input)
+                        masked_response, resp_detected = sensitive_filter.mask(final_response)
+                        
+                        if user_detected or resp_detected:
+                            self._log_sensitive_detection(user_detected, resp_detected)
+                    except Exception:
+                        masked_user_input = user_input
+                        masked_response = final_response
+                    
+                    self.async_processor.add_conversation(masked_user_input, masked_response, {
+                        "context_used": len(memory_context) if memory_context else 0,
+                        "memories_retrieved": len(retrieved_memories),
+                        "source": "cloud" if cloud_success else "local",
+                        "sensitive_masked": True,
+                        "trace_id": get_trace_id()
+                    })
+                
+                self._safe_after(0, lambda: self.state_manager.set_state(UIState.IDLE))
+                
+            except Exception as e:
+                error_msg = str(e)
+                self._safe_after(0, lambda msg=error_msg: self._append_message("system", f"错误: 处理消息时出错: {msg}"))
+                self._safe_after(0, lambda: self.state_manager.set_state(UIState.ERROR, "处理出错"))
             
-            self._safe_after(0, lambda: self.state_manager.set_state(UIState.IDLE))
-            
-        except Exception as e:
-            error_msg = str(e)
-            self._safe_after(0, lambda msg=error_msg: self._append_message("system", f"错误: 处理消息时出错: {msg}"))
-            self._safe_after(0, lambda: self.state_manager.set_state(UIState.ERROR, "处理出错"))
-        
-        finally:
-            if not self._closing:
-                self._safe_after(0, lambda: self.send_button.config(state=tk.NORMAL))
-                l2_count = len(self.memory.vector_store) if self.memory and self.memory.vector_store else 0
-                l3_count = len(self.memory.sqlite) if self.memory and self.memory.sqlite else 0
-                self._safe_after(0, lambda l2=l2_count, l3=l3_count: self.state_manager.set_memory_counts(l2, l3))
+            finally:
+                if not self._closing:
+                    self._safe_after(0, lambda: self.send_button.config(state=tk.NORMAL))
+                    l2_count = len(self.memory.vector_store) if self.memory and self.memory.vector_store else 0
+                    l3_count = len(self.memory.sqlite) if self.memory and self.memory.sqlite else 0
+                    self._safe_after(0, lambda l2=l2_count, l3=l3_count: self.state_manager.set_memory_counts(l2, l3))
     
     def _append_message(self, role: str, content: str):
         """向对话区域添加消息"""

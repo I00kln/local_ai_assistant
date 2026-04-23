@@ -11,7 +11,7 @@ from config import config
 
 _trace_id: ContextVar[str] = ContextVar('trace_id', default='')
 _span_id: ContextVar[str] = ContextVar('span_id', default='')
-_trace_context: ContextVar[Dict[str, Any]] = ContextVar('trace_context', default_factory=dict)
+_trace_context: ContextVar[Dict[str, Any]] = ContextVar('trace_context', default={})
 
 
 def generate_trace_id() -> str:

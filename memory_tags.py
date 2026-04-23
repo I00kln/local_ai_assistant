@@ -1,5 +1,8 @@
 # memory_tags.py
 # 记忆标签统一管理
+from typing import Optional, Dict, List, Any, Set
+from datetime import datetime, timedelta
+
 
 class MemoryTags:
     """记忆元数据标签常量"""

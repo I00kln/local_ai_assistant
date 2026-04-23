@@ -100,7 +100,16 @@ class MemoryManager:
             })
             
             if len(self.conversation_history) > self.max_l1_size:
+                overflow_count = len(self.conversation_history) - self.max_l1_size
                 self.conversation_history = self.conversation_history[-self.max_l1_size:]
+                self._event_bus.publish(EventType.L1_OVERFLOW, {
+                    "overflow_count": overflow_count,
+                    "current_size": len(self.conversation_history),
+                    "max_size": self.max_l1_size
+                })
+                self._log.debug("L1_OVERFLOW_PUBLISHED", 
+                               overflow_count=overflow_count,
+                               current_size=len(self.conversation_history))
     
     def search(self, query: str, top_k: int = None, include_l3: bool = True, threshold: float = None, include_l1: bool = True) -> List[MemorySearchResult]:
         """

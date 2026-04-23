@@ -13,7 +13,7 @@ from memory_transaction import get_transaction_coordinator
 from event_bus import get_event_bus, EventType
 from nonsense_filter import get_nonsense_filter, FilterResult
 from sqlite_store import get_sqlite_store, MemoryRecord
-from logger import get_logger
+from logger import get_logger, set_trace_id
 from memory_tags import MemoryTags, MemoryTagHelper
 from memory_merger import get_merger
 
@@ -388,6 +388,7 @@ class AsyncMemoryProcessor:
         self._idle_count = 0
         
         self.sqlite = None
+        self._merger = None
         if config.sqlite_enabled:
             try:
                 self.sqlite = get_sqlite_store()
@@ -409,6 +410,12 @@ class AsyncMemoryProcessor:
             from config import AsyncProcessorConfig
             return AsyncProcessorConfig()
     
+    def _get_merger(self):
+        """获取合并器实例（懒加载）"""
+        if self._merger is None:
+            self._merger = get_merger()
+        return self._merger
+    
     def start(self):
         """启动后台处理线程"""
         if self.running:
@@ -423,6 +430,8 @@ class AsyncMemoryProcessor:
         
         compression_thread = threading.Thread(target=self._compression_loop, daemon=True)
         compression_thread.start()
+        
+        self._event_bus.subscribe(EventType.L1_OVERFLOW, self._handle_l1_overflow)
         
         self._log.info("ASYNC_PROCESSOR_STARTED")
     
@@ -441,6 +450,25 @@ class AsyncMemoryProcessor:
                 self._check_memory_flow()
             except Exception as e:
                 self._log.error("COMPRESSION_LOOP_ERROR", error=str(e))
+    
+    def _handle_l1_overflow(self, event_data: Dict):
+        """
+        处理 L1 内存溢出事件
+        
+        当 MemoryManager 的 L1 缓存超过阈值时触发，
+        提前处理队列中的待处理记忆，减少延迟
+        
+        Args:
+            event_data: 包含 overflow_count, current_size, max_size
+        """
+        overflow_count = event_data.get("overflow_count", 0)
+        self._log.info("L1_OVERFLOW_RECEIVED", 
+                      overflow_count=overflow_count,
+                      pending_queue_size=self.pending_queue.qsize())
+        
+        if self.pending_queue.qsize() > 0:
+            self._log.debug("L1_OVERFLOW_TRIGGERING_FLUSH",
+                           pending_count=self.pending_queue.qsize())
     
     def _startup_recovery(self):
         """
@@ -677,7 +705,8 @@ class AsyncMemoryProcessor:
             "timestamp": datetime.now().isoformat(),
             "user": user_input,
             "assistant": assistant_response,
-            "metadata": metadata or {}
+            "metadata": metadata or {},
+            "trace_id": (metadata or {}).get("trace_id")
         }
         
         self._queue_total_count += 1
@@ -720,6 +749,9 @@ class AsyncMemoryProcessor:
             try:
                 try:
                     conv = self.pending_queue.get(timeout=config.async_update_interval)
+                    trace_id = conv.get("trace_id")
+                    if trace_id:
+                        set_trace_id(trace_id)
                     self._process_conversation(conv)
                     self._idle_count = 0
                 except queue.Empty:
@@ -1442,7 +1474,7 @@ class AsyncMemoryProcessor:
             moved_records: 回流的记忆列表
         """
         try:
-            merger = get_merger()
+            merger = self._get_merger()
             
             result = merger.merge_on_l3_to_l2(
                 moved_records,
@@ -1479,7 +1511,7 @@ class AsyncMemoryProcessor:
         不影响原有压缩、归档、遗忘逻辑。
         """
         try:
-            merger = get_merger()
+            merger = self._get_merger()
             
             result = merger.check_and_merge_l2(
                 self.vector_store,

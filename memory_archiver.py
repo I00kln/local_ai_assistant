@@ -422,14 +422,14 @@ class MemoryArchiver:
         self._running = True
         
         def archive_loop():
+            from sqlite_store import get_sqlite_store
+            from vector_store import get_vector_store
+            
+            sqlite = get_sqlite_store()
+            vector = get_vector_store()
+            
             while self._running:
                 try:
-                    from sqlite_store import get_sqlite_store
-                    from vector_store import get_vector_store
-                    
-                    sqlite = get_sqlite_store()
-                    vector = get_vector_store()
-                    
                     self.archive_memories(sqlite, vector)
                     
                 except Exception as e:
