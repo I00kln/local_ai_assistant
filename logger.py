@@ -1,9 +1,112 @@
 import logging
 import os
+import uuid
+import threading
 from datetime import datetime
-from typing import Optional
+from typing import Optional, Dict, Any
 from logging.handlers import TimedRotatingFileHandler
+from contextvars import ContextVar
 from config import config
+
+
+_trace_id: ContextVar[str] = ContextVar('trace_id', default='')
+_span_id: ContextVar[str] = ContextVar('span_id', default='')
+_trace_context: ContextVar[Dict[str, Any]] = ContextVar('trace_context', default_factory=dict)
+
+
+def generate_trace_id() -> str:
+    """生成新的 TraceID"""
+    return uuid.uuid4().hex[:16]
+
+
+def generate_span_id() -> str:
+    """生成新的 SpanID"""
+    return uuid.uuid4().hex[:8]
+
+
+def get_trace_id() -> str:
+    """获取当前 TraceID，如果不存在则创建"""
+    tid = _trace_id.get()
+    if not tid:
+        tid = generate_trace_id()
+        _trace_id.set(tid)
+    return tid
+
+
+def set_trace_id(trace_id: str) -> str:
+    """设置 TraceID"""
+    _trace_id.set(trace_id)
+    return trace_id
+
+
+def get_span_id() -> str:
+    """获取当前 SpanID"""
+    return _span_id.get()
+
+
+def set_span_id(span_id: str = None) -> str:
+    """设置 SpanID"""
+    if span_id is None:
+        span_id = generate_span_id()
+    _span_id.set(span_id)
+    return span_id
+
+
+def get_trace_context() -> Dict[str, Any]:
+    """获取追踪上下文"""
+    return _trace_context.get()
+
+
+def set_trace_context(key: str, value: Any):
+    """设置追踪上下文字段"""
+    ctx = _trace_context.get().copy()
+    ctx[key] = value
+    _trace_context.set(ctx)
+
+
+def clear_trace_context():
+    """清除追踪上下文"""
+    _trace_id.set('')
+    _span_id.set('')
+    _trace_context.set({})
+
+
+class TraceContext:
+    """
+    追踪上下文管理器
+    
+    Usage:
+        with TraceContext("operation_name"):
+            logger.info("EVENT", key=value)
+    """
+    
+    def __init__(self, operation: str = None, parent_trace_id: str = None):
+        self.operation = operation
+        self.parent_trace_id = parent_trace_id
+        self._old_trace_id = None
+        self._old_span_id = None
+        self._old_context = None
+    
+    def __enter__(self):
+        self._old_trace_id = _trace_id.get()
+        self._old_span_id = _span_id.get()
+        self._old_context = _trace_context.get().copy()
+        
+        if self.parent_trace_id:
+            _trace_id.set(self.parent_trace_id)
+        else:
+            _trace_id.set(generate_trace_id())
+        
+        _span_id.set(generate_span_id())
+        _trace_context.set({"operation": self.operation} if self.operation else {})
+        
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        _trace_id.set(self._old_trace_id)
+        _span_id.set(self._old_span_id)
+        _trace_context.set(self._old_context)
+        return False
 
 
 class StructuredLogger:
@@ -18,6 +121,8 @@ class StructuredLogger:
     - CRITICAL: 严重错误
     
     支持结构化输出：
+    - trace_id: 追踪ID（跨组件链路追踪）
+    - span_id: SpanID（子操作标识）
     - event: 事件名称
     - 关键字段: 如 userId, recordId 等
     - 决策路径: 如 primaryAttempt, fallbackUsed
@@ -74,9 +179,27 @@ class StructuredLogger:
     
     def _format_message(self, event: str, **kwargs) -> str:
         """格式化结构化日志消息"""
-        parts = [f"[{event}]"]
+        trace_id = get_trace_id()
+        span_id = get_span_id()
+        trace_context = get_trace_context()
+        
+        parts = []
+        
+        if trace_id:
+            parts.append(f"[{trace_id}]")
+        
+        if span_id:
+            parts.append(f"[{span_id}]")
+        
+        parts.append(f"[{event}]")
+        
+        for key, value in trace_context.items():
+            if key not in kwargs:
+                parts.append(f"{key}={value}")
+        
         for key, value in kwargs.items():
             parts.append(f"{key}={value}")
+        
         return " | ".join(parts)
     
     def debug(self, event: str, **kwargs):
@@ -98,6 +221,19 @@ class StructuredLogger:
     def critical(self, event: str, **kwargs):
         """严重错误级别日志"""
         self.logger.critical(self._format_message(event, **kwargs))
+    
+    def with_trace(self, trace_id: str = None, **context) -> 'TraceLogger':
+        """
+        创建带追踪上下文的日志器
+        
+        Args:
+            trace_id: 指定 TraceID（可选）
+            **context: 上下文字段
+        
+        Returns:
+            TraceLogger 实例
+        """
+        return TraceLogger(self, trace_id, context)
     
     def set_level(self, level: str):
         """
@@ -162,6 +298,64 @@ class StructuredLogger:
                 handler.setLevel(new_level)
         
         self.info("CONSOLE_LOG_LEVEL_CHANGED", new_level=level.upper())
+
+
+class TraceLogger:
+    """
+    带追踪上下文的日志器
+    
+    自动在所有日志中添加 TraceID 和上下文字段
+    """
+    
+    def __init__(self, logger: StructuredLogger, trace_id: str = None, context: Dict[str, Any] = None):
+        self._logger = logger
+        self._trace_id = trace_id or generate_trace_id()
+        self._context = context or {}
+        self._span_id = generate_span_id()
+    
+    def _log(self, level: str, event: str, **kwargs):
+        """内部日志方法"""
+        old_trace_id = _trace_id.get()
+        old_span_id = _span_id.get()
+        old_context = _trace_context.get().copy()
+        
+        try:
+            _trace_id.set(self._trace_id)
+            _span_id.set(self._span_id)
+            
+            ctx = self._context.copy()
+            ctx.update(_trace_context.get())
+            _trace_context.set(ctx)
+            
+            method = getattr(self._logger, level)
+            method(event, **kwargs)
+        finally:
+            _trace_id.set(old_trace_id)
+            _span_id.set(old_span_id)
+            _trace_context.set(old_context)
+    
+    def debug(self, event: str, **kwargs):
+        self._log('debug', event, **kwargs)
+    
+    def info(self, event: str, **kwargs):
+        self._log('info', event, **kwargs)
+    
+    def warning(self, event: str, **kwargs):
+        self._log('warning', event, **kwargs)
+    
+    def error(self, event: str, **kwargs):
+        self._log('error', event, **kwargs)
+    
+    def critical(self, event: str, **kwargs):
+        self._log('critical', event, **kwargs)
+    
+    @property
+    def trace_id(self) -> str:
+        return self._trace_id
+    
+    @property
+    def span_id(self) -> str:
+        return self._span_id
 
 
 _logger: Optional[StructuredLogger] = None

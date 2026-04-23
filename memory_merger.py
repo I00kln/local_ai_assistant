@@ -50,13 +50,35 @@ class MergeConfig:
 
 
 @dataclass
+class ConflictRecord:
+    """冲突记录"""
+    texts: List[str] = field(default_factory=list)
+    conflict_type: str = ""
+    conflict_detail: str = ""
+    timestamp: str = ""
+
+
+@dataclass
 class MergeStats:
     """合并统计"""
     total_merged: int = 0
     total_groups: int = 0
     total_conflicts: int = 0
+    conflict_details: List[ConflictRecord] = field(default_factory=list)
     last_merge_time: Optional[str] = None
     by_trigger: Dict[str, int] = field(default_factory=dict)
+    
+    def add_conflict(self, texts: List[str], conflict_type: str, conflict_detail: str):
+        """添加冲突记录"""
+        self.total_conflicts += 1
+        self.conflict_details.append(ConflictRecord(
+            texts=texts[:3],
+            conflict_type=conflict_type,
+            conflict_detail=conflict_detail,
+            timestamp=datetime.now().isoformat()
+        ))
+        if len(self.conflict_details) > 100:
+            self.conflict_details = self.conflict_details[-100:]
 
 
 class MergeConflictError(Exception):
@@ -189,6 +211,7 @@ class MemoryMerger:
         - 时间冲突（"明天去北京" vs "后天去北京"）
         - 地点冲突（"去北京" vs "去上海"）
         - 数值冲突（"100块" vs "200块"）
+        - 语义冲突（"不喜欢甜食" vs "喜欢蛋糕"）
         
         Returns:
             (是否有冲突, 冲突描述)
@@ -232,7 +255,48 @@ class MemoryMerger:
         if len(all_numbers) > 1 and len(set(all_numbers)) > 1:
             return True, f"数值冲突: {', '.join(set(all_numbers))}"
         
+        semantic_conflict = self._detect_semantic_conflicts(texts)
+        if semantic_conflict:
+            return True, semantic_conflict
+        
         return False, ""
+    
+    def _detect_semantic_conflicts(self, texts: List[str]) -> str:
+        """
+        检测语义冲突
+        
+        检测否定词对：
+        - "不喜欢" vs "喜欢"
+        - "没去" vs "去"
+        - "不是" vs "是"
+        
+        Returns:
+            冲突描述，无冲突返回空字符串
+        """
+        NEGATION_PAIRS = [
+            (r"不(.{1,4})", r"\1"),
+            (r"没(.{1,4})", r"\1"),
+            (r"非(.{1,4})", r"\1"),
+            (r"无(.{1,4})", r"\1"),
+        ]
+        
+        for neg_pattern, pos_pattern in NEGATION_PAIRS:
+            neg_matches = set()
+            pos_matches = set()
+            
+            for text in texts:
+                neg = re.findall(neg_pattern, text)
+                neg_matches.update(n.strip() for n in neg if n.strip())
+                
+                pos = re.findall(pos_pattern, text)
+                pos_matches.update(p.strip() for p in pos if p.strip())
+            
+            conflicts = neg_matches & pos_matches
+            if conflicts:
+                conflict_words = list(conflicts)[:3]
+                return f"语义冲突: 否定词对 [{', '.join(conflict_words)}]"
+        
+        return ""
     
     def should_trigger_merge(
         self, 
@@ -366,16 +430,26 @@ class MemoryMerger:
             merged_memories = []
             deleted_ids = []
             merged_count = 0
-            conflict_count = 0
             
             for group in large_groups[:self.config.max_merge_batch]:
                 texts = [m.get("text", "") for m in group]
                 has_conflict, conflict_desc = self._detect_conflicts(texts)
                 
                 if has_conflict:
-                    conflict_count += 1
+                    conflict_type = "unknown"
+                    if "时间冲突" in conflict_desc:
+                        conflict_type = "time"
+                    elif "地点冲突" in conflict_desc:
+                        conflict_type = "location"
+                    elif "数值冲突" in conflict_desc:
+                        conflict_type = "number"
+                    elif "语义冲突" in conflict_desc:
+                        conflict_type = "semantic"
+                    
+                    self.stats.add_conflict(texts, conflict_type, conflict_desc)
                     self._log.info(
                         "MERGE_CONFLICT_DETECTED",
+                        conflict_type=conflict_type,
                         conflict=conflict_desc,
                         texts=texts[:3]
                     )
@@ -389,7 +463,6 @@ class MemoryMerger:
             
             self.stats.total_merged += merged_count
             self.stats.total_groups += len(large_groups)
-            self.stats.total_conflicts += conflict_count
             self.stats.last_merge_time = datetime.now().isoformat()
             self.stats.by_trigger[trigger] = self.stats.by_trigger.get(trigger, 0) + merged_count
             
@@ -397,7 +470,7 @@ class MemoryMerger:
                 "MEMORY_MERGE_COMPLETE",
                 merged_count=merged_count,
                 groups=len(large_groups),
-                conflicts=conflict_count,
+                conflicts=self.stats.total_conflicts,
                 trigger=trigger
             )
             
@@ -406,7 +479,7 @@ class MemoryMerger:
                 "groups": len(large_groups),
                 "merged_memories": merged_memories,
                 "deleted_ids": deleted_ids,
-                "conflicts": conflict_count
+                "conflicts": self.stats.total_conflicts
             }
     
     def _merge_group(self, group: List[Dict]) -> Optional[Dict]:
@@ -414,19 +487,20 @@ class MemoryMerger:
         合并一组相似记忆
         
         策略：
-        1. 检查 protected/high_density 记忆，跳过合并
-        2. 按优先级排序选择主记录
-        3. 合并权重（取最大值）
-        4. 智能合并文本
-        5. 深度合并元数据
-        6. 清除压缩状态（合并后需重新压缩）
-        7. 重新标记 semantic_tag
+        1. 过滤 protected/high_density 记忆（不参与合并但保留）
+        2. 剩余可合并记录不足2条时跳过
+        3. 按优先级排序选择主记录
+        4. 合并权重（取最大值）
+        5. 智能合并文本
+        6. 深度合并元数据
+        7. 清除压缩状态（合并后需重新压缩）
+        8. 重新标记 semantic_tag
         
         优先级规则：
-        - protected: 100 (不参与合并)
+        - protected: 100 (不参与合并，从组中过滤)
         - forgotten: 0 (最低，可被合并/删除)
         - important: 80
-        - high_density: 70 (不参与合并)
+        - high_density: 70 (不参与合并，从组中过滤)
         - preserve: 60
         - compressed: 40
         - 普通: 20
@@ -438,10 +512,16 @@ class MemoryMerger:
             m for m in group 
             if MemoryTagHelper.should_skip_merge(m.get("metadata", {}))
         ]
+        mergeable = [
+            m for m in group 
+            if not MemoryTagHelper.should_skip_merge(m.get("metadata", {}))
+        ]
+        
         if skip_memories:
             self._log.info(
                 "MERGE_SKIP_PROTECTED",
                 skip_count=len(skip_memories),
+                mergeable_count=len(mergeable),
                 group_size=len(group),
                 reasons=[
                     "protected" if m.get("metadata", {}).get(MemoryTags.PROTECTED) 
@@ -449,6 +529,8 @@ class MemoryMerger:
                     for m in skip_memories
                 ]
             )
+        
+        if len(mergeable) < 2:
             return None
         
         def get_sort_key(m):
@@ -456,7 +538,7 @@ class MemoryMerger:
             created_time = m.get("created_time", "9999-99-99T99:99:99")
             return (-priority, created_time)
         
-        sorted_group = sorted(group, key=get_sort_key)
+        sorted_group = sorted(mergeable, key=get_sort_key)
         
         primary = sorted_group[0]
         primary_priority = MemoryTagHelper.get_merge_priority(primary.get("metadata", {}))
@@ -465,7 +547,8 @@ class MemoryMerger:
             "MERGE_PRIMARY_SELECTED",
             primary_id=primary.get("id"),
             priority=primary_priority,
-            group_size=len(group)
+            mergeable_count=len(mergeable),
+            skipped_count=len(skip_memories)
         )
         
         merged_text = self._smart_merge_texts([m.get("text", "") for m in sorted_group])
@@ -478,9 +561,9 @@ class MemoryMerger:
         )
         
         merged_metadata[MemoryTags.MERGED] = True
-        merged_metadata["merged_count"] = len(group)
-        merged_metadata["merged_from_ids"] = [m.get("id") for m in sorted_group if m.get("id")]
-        merged_metadata["merged_from_priorities"] = [
+        merged_metadata[MemoryTags.MERGED_COUNT] = len(mergeable)
+        merged_metadata[MemoryTags.MERGED_FROM_IDS] = [m.get("id") for m in sorted_group if m.get("id")]
+        merged_metadata[MemoryTags.MERGED_FROM_PRIORITIES] = [
             MemoryTagHelper.get_merge_priority(m.get("metadata", {})) 
             for m in sorted_group
         ]
@@ -498,7 +581,7 @@ class MemoryMerger:
         for key in compression_keys:
             merged_metadata.pop(key, None)
         
-        merged_metadata["needs_recompression"] = True
+        merged_metadata[MemoryTags.NEEDS_RECOMPRESSION] = True
         
         if primary_priority >= 60:
             for tag in [MemoryTags.IMPORTANT, MemoryTags.PRESERVE]:
@@ -511,13 +594,13 @@ class MemoryMerger:
             for m in sorted_group
         )
         if has_forgotten_member:
-            merged_metadata["had_forgotten_member"] = True
+            merged_metadata[MemoryTags.HAD_FORGOTTEN_MEMBER] = True
         
         try:
             from tag_classifier import get_tag_classifier
             tagger = get_tag_classifier()
             new_tag = tagger.tag_memory(merged_text)
-            merged_metadata["semantic_tag"] = new_tag.to_dict()
+            merged_metadata[MemoryTags.SEMANTIC_TAG] = new_tag.to_dict()
         except Exception:
             pass
         
@@ -546,16 +629,22 @@ class MemoryMerger:
         
         策略：
         1. 保留所有非冲突的键值对
-        2. 冲突时保留第一个出现的值
-        3. 数组类型合并去重
-        4. 记录合并来源
-        5. semantic_tag 使用专门的合并策略
+        2. 时间戳字段冲突时保留最新值
+        3. 其他标量冲突时保留第一个出现的值
+        4. 数组类型合并去重
+        5. 记录合并来源
+        6. semantic_tag 使用专门的合并策略
         """
         if not metadata_list:
             return {}
         
         if len(metadata_list) == 1:
             return dict(metadata_list[0])
+        
+        TIMESTAMP_KEYS = {
+            "timestamp", "created_time", "updated_time", "merged_at",
+            "last_access_time", "compressed_time", "forgotten_time"
+        }
         
         merged = {}
         seen_keys = {}
@@ -565,28 +654,33 @@ class MemoryMerger:
             if not isinstance(metadata, dict):
                 continue
             
-            if "semantic_tag" in metadata:
+            if MemoryTags.SEMANTIC_TAG in metadata:
                 try:
                     from tag_classifier import MemoryTag
-                    tag = MemoryTag.from_dict(metadata["semantic_tag"])
+                    tag = MemoryTag.from_dict(metadata[MemoryTags.SEMANTIC_TAG])
                     semantic_tags_to_merge.append(tag)
                 except Exception:
                     pass
             
             for key, value in metadata.items():
-                if key == "semantic_tag":
+                if key == MemoryTags.SEMANTIC_TAG:
                     continue
                 
                 if key in seen_keys:
-                    if isinstance(merged[key], list) and isinstance(value, list):
+                    if key in TIMESTAMP_KEYS:
+                        if isinstance(value, str) and isinstance(merged[key], str):
+                            try:
+                                if value > merged[key]:
+                                    merged[key] = value
+                            except Exception:
+                                pass
+                    elif isinstance(merged[key], list) and isinstance(value, list):
                         combined = merged[key] + value
                         merged[key] = list(set(str(x) for x in combined))
                     elif isinstance(merged[key], list):
                         merged[key] = list(set(str(x) for x in merged[key] + [str(value)]))
                     elif isinstance(value, list):
                         merged[key] = list(set(str(x) for x in [str(merged[key])] + value))
-                    else:
-                        pass
                 else:
                     seen_keys[key] = i
                     if isinstance(value, list):
@@ -599,10 +693,10 @@ class MemoryMerger:
                 from tag_classifier import get_tag_classifier
                 tagger = get_tag_classifier()
                 merged_tag = tagger.merge_tags(semantic_tags_to_merge)
-                merged["semantic_tag"] = merged_tag.to_dict()
+                merged[MemoryTags.SEMANTIC_TAG] = merged_tag.to_dict()
             except Exception:
                 if semantic_tags_to_merge:
-                    merged["semantic_tag"] = semantic_tags_to_merge[0].to_dict()
+                    merged[MemoryTags.SEMANTIC_TAG] = semantic_tags_to_merge[0].to_dict()
         
         return merged
     
@@ -781,14 +875,16 @@ class MemoryMerger:
         原子化应用合并结果到存储
         
         流程：
-        1. 获取所有待删除记录的 vector_id
-        2. 更新主记录（标记需要重新向量化）
-        3. 删除旧记录
-        4. 同步清理向量库
+        1. 备份主记录原始状态（用于回滚）
+        2. 收集所有待删除记录的 vector_id
+        3. 更新主记录（标记需要重新向量化）
+        4. 删除旧记录
+        5. 同步清理向量库（失败不影响一致性，孤立向量会在启动补偿中清理）
         
         事务保护：
         - 使用 TransactionCoordinator 确保原子性
         - 失败时回滚已完成的操作
+        - 向量删除失败不触发回滚（孤立向量可被启动补偿清理）
         
         Args:
             result: 合并结果
@@ -813,77 +909,136 @@ class MemoryMerger:
                 primary_id = original_ids[0]
                 other_ids = original_ids[1:]
                 
+                primary_backup = sqlite_store.get(primary_id)
+                
                 vector_ids_to_delete = []
+                records_to_delete_backup = []
                 
                 for oid in other_ids:
                     rec = sqlite_store.get(oid)
-                    if rec and rec.vector_id:
-                        vector_ids_to_delete.append(rec.vector_id)
+                    if rec:
+                        records_to_delete_backup.append({
+                            "id": rec.id,
+                            "text": rec.text,
+                            "metadata": dict(rec.metadata) if rec.metadata else {},
+                            "vector_id": rec.vector_id
+                        })
+                        if rec.vector_id:
+                            vector_ids_to_delete.append(rec.vector_id)
                 
                 vector_ids_to_delete.extend(merged.get("vector_ids_to_delete", []))
                 
-                existing = sqlite_store.get(primary_id)
-                if existing:
-                    existing.text = merged["text"]
-                    
-                    existing.metadata = self._deep_merge_metadata([
-                        existing.metadata or {},
-                        merged.get("metadata", {})
-                    ])
-                    existing.metadata["merged_at"] = datetime.now().isoformat()
-                    
-                    primary_priority = merged.get("primary_priority", 20)
-                    existing.metadata["merged_primary_priority"] = primary_priority
-                    
-                    existing.compressed_text = None
-                    
-                    compression_keys = [
-                        MemoryTags.COMPRESSED,
-                        MemoryTags.COMPRESSED_TIME,
-                        MemoryTags.COMPRESSED_STRATEGY,
-                        MemoryTags.ORIGINAL_LENGTH,
-                        MemoryTags.HAS_COMPRESSED_VERSION,
-                        MemoryTags.PENDING_COMPRESSION,
-                        MemoryTags.PENDING_SINCE,
-                        MemoryTags.RETRY_COUNT
-                    ]
-                    for key in compression_keys:
-                        existing.metadata.pop(key, None)
-                    
-                    existing.metadata["needs_revectorization"] = True
-                    existing.metadata["needs_recompression"] = True
-                    
-                    existing.is_vectorized = 0
-                    existing.vector_id = ""
-                    
-                    sqlite_store.add(existing)
-                    
-                    self._log.info(
-                        "MERGE_UPDATE_PRIMARY",
-                        primary_id=primary_id,
-                        new_text_length=len(merged["text"]),
-                        needs_revectorization=True,
-                        needs_recompression=True,
-                        primary_priority=primary_priority
-                    )
+                merge_failed = False
                 
-                for oid in other_ids:
-                    sqlite_store.delete_memory(oid)
-                
-                if vector_ids_to_delete:
-                    try:
-                        vector_store.delete(ids=vector_ids_to_delete)
+                try:
+                    existing = sqlite_store.get(primary_id)
+                    if existing:
+                        existing.text = merged["text"]
+                        
+                        existing.metadata = self._deep_merge_metadata([
+                            existing.metadata or {},
+                            merged.get("metadata", {})
+                        ])
+                        existing.metadata[MemoryTags.MERGED_AT] = datetime.now().isoformat()
+                        
+                        primary_priority = merged.get("primary_priority", 20)
+                        existing.metadata[MemoryTags.MERGED_PRIMARY_PRIORITY] = primary_priority
+                        
+                        existing.compressed_text = None
+                        
+                        compression_keys = [
+                            MemoryTags.COMPRESSED,
+                            MemoryTags.COMPRESSED_TIME,
+                            MemoryTags.COMPRESSED_STRATEGY,
+                            MemoryTags.ORIGINAL_LENGTH,
+                            MemoryTags.HAS_COMPRESSED_VERSION,
+                            MemoryTags.PENDING_COMPRESSION,
+                            MemoryTags.PENDING_SINCE,
+                            MemoryTags.RETRY_COUNT
+                        ]
+                        for key in compression_keys:
+                            existing.metadata.pop(key, None)
+                        
+                        existing.metadata[MemoryTags.NEEDS_REVECTORIZATION] = True
+                        existing.metadata[MemoryTags.NEEDS_RECOMPRESSION] = True
+                        
+                        existing.is_vectorized = 0
+                        existing.vector_id = ""
+                        
+                        sqlite_store.add(existing)
+                        
                         self._log.info(
-                            "MERGE_DELETE_VECTORS",
-                            count=len(vector_ids_to_delete),
-                            primary_id=primary_id
+                            "MERGE_UPDATE_PRIMARY",
+                            primary_id=primary_id,
+                            new_text_length=len(merged["text"]),
+                            needs_revectorization=True,
+                            needs_recompression=True,
+                            primary_priority=primary_priority
                         )
-                    except Exception as e:
-                        self._log.error(
-                            "MERGE_DELETE_VECTORS_FAILED",
-                            error=str(e),
-                            vector_ids=vector_ids_to_delete
-                        )
+                    
+                    for oid in other_ids:
+                        sqlite_store.delete_memory(oid)
+                    
+                    if vector_ids_to_delete:
+                        try:
+                            vector_store.delete(ids=vector_ids_to_delete)
+                            self._log.info(
+                                "MERGE_DELETE_VECTORS",
+                                count=len(vector_ids_to_delete),
+                                primary_id=primary_id
+                            )
+                        except Exception as e:
+                            self._log.warning(
+                                "MERGE_DELETE_VECTORS_FAILED",
+                                error=str(e),
+                                vector_ids=vector_ids_to_delete,
+                                note="孤立向量将在启动补偿中清理"
+                            )
+                            
+                except Exception as e:
+                    merge_failed = True
+                    self._log.error(
+                        "MERGE_OPERATION_FAILED",
+                        primary_id=primary_id,
+                        error=str(e)
+                    )
+                    
+                    if primary_backup:
+                        try:
+                            sqlite_store.add(primary_backup)
+                            self._log.info("MERGE_ROLLBACK_PRIMARY", primary_id=primary_id)
+                        except Exception as rb_e:
+                            self._log.error(
+                                "MERGE_ROLLBACK_FAILED",
+                                primary_id=primary_id,
+                                error=str(rb_e)
+                            )
+                    
+                    for rec_backup in records_to_delete_backup:
+                        try:
+                            from sqlite_store import MemoryRecord
+                            restored = sqlite_store.get(rec_backup["id"])
+                            if not restored:
+                                restored = MemoryRecord(
+                                    text=rec_backup["text"],
+                                    metadata=rec_backup["metadata"],
+                                    vector_id=rec_backup["vector_id"],
+                                    is_vectorized=1 if rec_backup["vector_id"] else 0
+                                )
+                                restored.id = rec_backup["id"]
+                                sqlite_store.add(restored)
+                                self._log.info(
+                                    "MERGE_ROLLBACK_DELETED_RECORD",
+                                    record_id=rec_backup["id"]
+                                )
+                        except Exception as rb_e:
+                            self._log.error(
+                                "MERGE_ROLLBACK_RECORD_FAILED",
+                                record_id=rec_backup["id"],
+                                error=str(rb_e)
+                            )
+                    
+                    raise
                         
         except Exception as e:
             self._log.error("APPLY_MERGE_FAILED", error=str(e))

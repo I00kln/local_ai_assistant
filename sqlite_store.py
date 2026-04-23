@@ -905,7 +905,7 @@ class SQLiteStore:
                     if "important" in tags:
                         tags.remove("important")
                 
-                metadata["tags"] = tags
+                metadata[MemoryTags.TAGS] = tags
                 
                 cursor.execute("""
                     UPDATE memories SET metadata = ? WHERE id = ?

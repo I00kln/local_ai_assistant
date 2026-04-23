@@ -884,8 +884,8 @@ class TagCorrectionManager:
                     if not record.metadata:
                         record.metadata = {}
                     
-                    record.metadata["semantic_tag"] = new_tag.to_dict()
-                    record.metadata["tag_corrected_at"] = datetime.now().isoformat()
+                    record.metadata[MemoryTags.SEMANTIC_TAG] = new_tag.to_dict()
+                    record.metadata[MemoryTags.TAG_CORRECTED_AT] = datetime.now().isoformat()
                     
                     sqlite_store.add(record)
                     
@@ -1083,7 +1083,7 @@ class TagClassifier:
                 record = sqlite_store.get(memory_id)
                 if record and record.metadata:
                     old_tag = MemoryTag.from_dict(
-                        record.metadata.get("semantic_tag", {})
+                        record.metadata.get(MemoryTags.SEMANTIC_TAG, {})
                     )
             
             success = self._correction_manager.correct_tag(
@@ -1114,7 +1114,7 @@ class TagClassifier:
         if not metadata:
             return MemoryTag()
         
-        tag_data = metadata.get("semantic_tag", {})
+        tag_data = metadata.get(MemoryTags.SEMANTIC_TAG, {})
         return MemoryTag.from_dict(tag_data)
     
     def update_metadata_with_tag(
@@ -1135,7 +1135,7 @@ class TagClassifier:
         if metadata is None:
             metadata = {}
         
-        metadata["semantic_tag"] = tag.to_dict()
+        metadata[MemoryTags.SEMANTIC_TAG] = tag.to_dict()
         
         return metadata
     

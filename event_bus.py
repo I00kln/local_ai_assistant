@@ -1,7 +1,8 @@
 import threading
 import queue
+import weakref
 from typing import Dict, List, Callable, Any, Optional
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 from logger import get_logger
@@ -27,6 +28,16 @@ class Event:
     source: str
 
 
+@dataclass
+class SubscriberInfo:
+    """订阅者信息"""
+    handler_ref: Any
+    source: str
+    subscribed_at: datetime
+    call_count: int = 0
+    error_count: int = 0
+
+
 EventHandler = Callable[[Event], None]
 
 
@@ -42,6 +53,11 @@ class EventBus:
     - 使用 RLock 保护订阅者列表
     - 事件处理在锁外执行，避免死锁
     - 使用 queue.Queue + 后台线程处理异步事件
+    
+    内存安全：
+    - 使用弱引用存储订阅者
+    - 自动清理已销毁的订阅者
+    - 订阅者生命周期追踪
     """
     
     _instance: Optional['EventBus'] = None
@@ -61,7 +77,7 @@ class EventBus:
         
         self._initialized = True
         self._log = get_logger()
-        self._subscribers: Dict[EventType, List[EventHandler]] = {}
+        self._subscribers: Dict[EventType, List[SubscriberInfo]] = {}
         self._subscribers_lock = threading.RLock()
         self._event_queue: queue.Queue = queue.Queue()
         self._running = True
@@ -86,22 +102,60 @@ class EventBus:
             except Exception as e:
                 self._log.error("EVENT_PROCESS_ERROR", error=str(e))
     
-    def subscribe(self, event_type: EventType, handler: EventHandler):
+    def _create_handler_ref(self, handler: EventHandler) -> Any:
+        """
+        创建处理器引用
+        
+        优先使用弱引用，如果处理器不支持则使用强引用
+        """
+        try:
+            if hasattr(handler, '__self__'):
+                return weakref.WeakMethod(handler)
+            else:
+                return weakref.ref(handler)
+        except TypeError:
+            return handler
+    
+    def _get_handler(self, ref: Any) -> Optional[EventHandler]:
+        """从引用中获取处理器"""
+        if isinstance(ref, weakref.ref):
+            handler = ref()
+            return handler if handler is not None else None
+        elif callable(ref):
+            return ref
+        return None
+    
+    def subscribe(self, event_type: EventType, handler: EventHandler, source: str = "unknown"):
         """
         订阅事件
         
         Args:
             event_type: 事件类型
             handler: 事件处理函数
+            source: 订阅者来源（用于追踪）
         """
         with self._subscribers_lock:
             if event_type not in self._subscribers:
                 self._subscribers[event_type] = []
-            if handler not in self._subscribers[event_type]:
-                self._subscribers[event_type].append(handler)
-                self._log.debug("EVENT_SUBSCRIBED", 
-                               event_type=event_type.value, 
-                               handler=handler.__name__)
+            
+            handler_ref = self._create_handler_ref(handler)
+            
+            for info in self._subscribers[event_type]:
+                existing = self._get_handler(info.handler_ref)
+                if existing == handler:
+                    return
+            
+            info = SubscriberInfo(
+                handler_ref=handler_ref,
+                source=source,
+                subscribed_at=datetime.now()
+            )
+            self._subscribers[event_type].append(info)
+            
+            self._log.debug("EVENT_SUBSCRIBED", 
+                           event_type=event_type.value, 
+                           handler=getattr(handler, '__name__', str(handler)),
+                           source=source)
     
     def unsubscribe(self, event_type: EventType, handler: EventHandler):
         """
@@ -113,10 +167,31 @@ class EventBus:
         """
         with self._subscribers_lock:
             if event_type in self._subscribers:
-                try:
-                    self._subscribers[event_type].remove(handler)
-                except ValueError:
-                    pass
+                to_remove = []
+                for i, info in enumerate(self._subscribers[event_type]):
+                    existing = self._get_handler(info.handler_ref)
+                    if existing is None or existing == handler:
+                        to_remove.append(i)
+                
+                for i in reversed(to_remove):
+                    self._subscribers[event_type].pop(i)
+    
+    def _cleanup_dead_subscribers(self, event_type: EventType):
+        """清理已销毁的订阅者"""
+        if event_type not in self._subscribers:
+            return
+        
+        to_remove = []
+        for i, info in enumerate(self._subscribers[event_type]):
+            handler = self._get_handler(info.handler_ref)
+            if handler is None:
+                to_remove.append(i)
+        
+        for i in reversed(to_remove):
+            removed = self._subscribers[event_type].pop(i)
+            self._log.debug("SUBSCRIBER_CLEANED_UP",
+                           event_type=event_type.value,
+                           source=removed.source)
     
     def publish(self, event_type: EventType, data: Dict[str, Any], source: str = "unknown"):
         """
@@ -136,15 +211,23 @@ class EventBus:
         
         handlers = []
         with self._subscribers_lock:
-            handlers = self._subscribers.get(event_type, []).copy()
+            self._cleanup_dead_subscribers(event_type)
+            
+            for info in self._subscribers.get(event_type, []):
+                handler = self._get_handler(info.handler_ref)
+                if handler:
+                    handlers.append((handler, info))
         
-        for handler in handlers:
+        for handler, info in handlers:
             try:
                 handler(event)
+                info.call_count += 1
             except Exception as e:
+                info.error_count += 1
                 self._log.error("EVENT_HANDLER_ERROR",
                                event_type=event_type.value,
-                               handler=handler.__name__,
+                               handler=getattr(handler, '__name__', str(handler)),
+                               source=info.source,
                                error=str(e))
         
         self._log.debug("EVENT_PUBLISHED",
@@ -184,15 +267,44 @@ class EventBus:
     def get_subscriber_count(self, event_type: EventType) -> int:
         """获取事件订阅者数量"""
         with self._subscribers_lock:
+            self._cleanup_dead_subscribers(event_type)
             return len(self._subscribers.get(event_type, []))
+    
+    def get_subscriber_stats(self) -> Dict[str, Any]:
+        """
+        获取订阅者统计信息
+        
+        Returns:
+            各事件的订阅者统计
+        """
+        stats = {}
+        with self._subscribers_lock:
+            for event_type, infos in self._subscribers.items():
+                self._cleanup_dead_subscribers(event_type)
+                stats[event_type.value] = {
+                    "count": len(infos),
+                    "subscribers": [
+                        {
+                            "source": info.source,
+                            "subscribed_at": info.subscribed_at.isoformat(),
+                            "call_count": info.call_count,
+                            "error_count": info.error_count
+                        }
+                        for info in infos
+                    ]
+                }
+        return stats
 
 
 _event_bus: Optional[EventBus] = None
+_event_bus_lock = threading.Lock()
 
 
 def get_event_bus() -> EventBus:
-    """获取全局事件总线实例"""
+    """获取全局事件总线实例（线程安全单例）"""
     global _event_bus
     if _event_bus is None:
-        _event_bus = EventBus()
+        with _event_bus_lock:
+            if _event_bus is None:
+                _event_bus = EventBus()
     return _event_bus

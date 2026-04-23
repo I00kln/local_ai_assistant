@@ -47,13 +47,38 @@ class MemoryTags:
     MERGED_AT = "merged_at"
     MERGED_COUNT = "merged_count"
     MERGED_FROM_IDS = "merged_from_ids"
+    MERGED_FROM_PRIORITIES = "merged_from_priorities"
+    MERGED_PRIMARY_PRIORITY = "merged_primary_priority"
+    HAD_FORGOTTEN_MEMBER = "had_forgotten_member"
     NEEDS_RECOMPRESSION = "needs_recompression"
     NEEDS_REVECTORIZATION = "needs_revectorization"
+    
+    # 语义标签相关
+    SEMANTIC_TAG = "semantic_tag"
+    TAG_CORRECTED_AT = "tag_corrected_at"
+    TAGS = "tags"
+    
+    # 向量化相关
+    SQLITE_ID = "sqlite_id"
+    IS_SQLITE_ONLY = "is_sqlite_only"
+    
+    # 过滤相关
+    NONSENSE_FILTER_RESULT = "nonsense_filter_result"
+    
+    # 升级相关
+    UPGRADED_FROM_SQLITE_ONLY = "upgraded_from_sqlite_only"
+    UPGRADED_TIME = "upgraded_time"
+    
+    # 高密度原因
+    HIGH_DENSITY_REASON = "high_density_reason"
     
     # 来源标签
     SOURCE_L1 = "L1"
     SOURCE_L2 = "L2"
     SOURCE_L3 = "L3"
+    
+    # 时间戳
+    TIMESTAMP = "timestamp"
 
 
 class MemoryTagHelper:
@@ -315,7 +340,7 @@ class MemoryTagHelper:
             metadata = {}
         
         metadata[MemoryTags.HIGH_DENSITY] = True
-        metadata["high_density_reason"] = reason
+        metadata[MemoryTags.HIGH_DENSITY_REASON] = reason
         
         return metadata
     
@@ -361,3 +386,255 @@ class MemoryTagHelper:
                 except Exception:
                     pass
         return False
+    
+    @staticmethod
+    def mark_merged(metadata: dict, merged_count: int, merged_from_ids: list,
+                    merged_from_priorities: list = None, needs_recompression: bool = True) -> dict:
+        """
+        标记记忆为已合并
+        
+        Args:
+            metadata: 记忆元数据
+            merged_count: 合并的记忆数量
+            merged_from_ids: 被合并的记忆ID列表
+            merged_from_priorities: 被合并记忆的优先级列表
+            needs_recompression: 是否需要重新压缩
+        
+        Returns:
+            更新后的元数据
+        """
+        if metadata is None:
+            metadata = {}
+        
+        from datetime import datetime
+        metadata[MemoryTags.MERGED] = True
+        metadata[MemoryTags.MERGED_AT] = datetime.now().isoformat()
+        metadata[MemoryTags.MERGED_COUNT] = merged_count
+        metadata[MemoryTags.MERGED_FROM_IDS] = merged_from_ids
+        
+        if merged_from_priorities:
+            metadata[MemoryTags.MERGED_FROM_PRIORITIES] = merged_from_priorities
+        
+        if needs_recompression:
+            metadata[MemoryTags.NEEDS_RECOMPRESSION] = True
+        
+        return metadata
+    
+    @staticmethod
+    def mark_needs_revectorization(metadata: dict, reason: str = "merged") -> dict:
+        """
+        标记需要重新向量化
+        
+        Args:
+            metadata: 记忆元数据
+            reason: 原因
+        
+        Returns:
+            更新后的元数据
+        """
+        if metadata is None:
+            metadata = {}
+        
+        metadata[MemoryTags.NEEDS_REVECTORIZATION] = True
+        return metadata
+    
+    @staticmethod
+    def mark_needs_recompression(metadata: dict, reason: str = "merged") -> dict:
+        """
+        标记需要重新压缩
+        
+        Args:
+            metadata: 记忆元数据
+            reason: 原因
+        
+        Returns:
+            更新后的元数据
+        """
+        if metadata is None:
+            metadata = {}
+        
+        metadata[MemoryTags.NEEDS_RECOMPRESSION] = True
+        return metadata
+    
+    @staticmethod
+    def mark_upgraded(metadata: dict, from_type: str = "sqlite_only") -> dict:
+        """
+        标记记忆升级来源
+        
+        Args:
+            metadata: 记忆元数据
+            from_type: 升级来源类型
+        
+        Returns:
+            更新后的元数据
+        """
+        if metadata is None:
+            metadata = {}
+        
+        from datetime import datetime
+        metadata[MemoryTags.UPGRADED_FROM_SQLITE_ONLY] = True
+        metadata[MemoryTags.UPGRADED_TIME] = datetime.now().isoformat()
+        return metadata
+    
+    @staticmethod
+    def set_semantic_tag(metadata: dict, tag_dict: dict) -> dict:
+        """
+        设置语义标签
+        
+        Args:
+            metadata: 记忆元数据
+            tag_dict: 语义标签字典
+        
+        Returns:
+            更新后的元数据
+        """
+        if metadata is None:
+            metadata = {}
+        
+        metadata[MemoryTags.SEMANTIC_TAG] = tag_dict
+        return metadata
+    
+    @staticmethod
+    def get_semantic_tag(metadata: dict) -> dict:
+        """
+        获取语义标签
+        
+        Args:
+            metadata: 记忆元数据
+        
+        Returns:
+            语义标签字典，不存在则返回空字典
+        """
+        if metadata is None:
+            return {}
+        return metadata.get(MemoryTags.SEMANTIC_TAG, {})
+    
+    @staticmethod
+    def mark_tag_corrected(metadata: dict) -> dict:
+        """
+        标记标签已修正
+        
+        Args:
+            metadata: 记忆元数据
+        
+        Returns:
+            更新后的元数据
+        """
+        if metadata is None:
+            metadata = {}
+        
+        from datetime import datetime
+        metadata[MemoryTags.TAG_CORRECTED_AT] = datetime.now().isoformat()
+        return metadata
+    
+    @staticmethod
+    def set_nonsense_filter_result(metadata: dict, result: str) -> dict:
+        """
+        设置垃圾过滤结果
+        
+        Args:
+            metadata: 记忆元数据
+            result: 过滤结果 (normal/nonsense)
+        
+        Returns:
+            更新后的元数据
+        """
+        if metadata is None:
+            metadata = {}
+        
+        metadata[MemoryTags.NONSENSE_FILTER_RESULT] = result
+        return metadata
+    
+    @staticmethod
+    def get_nonsense_filter_result(metadata: dict, default: str = "normal") -> str:
+        """
+        获取垃圾过滤结果
+        
+        Args:
+            metadata: 记忆元数据
+            default: 默认值
+        
+        Returns:
+            过滤结果
+        """
+        if metadata is None:
+            return default
+        return metadata.get(MemoryTags.NONSENSE_FILTER_RESULT, default)
+    
+    @staticmethod
+    def set_sqlite_id(metadata: dict, sqlite_id: int) -> dict:
+        """
+        设置 SQLite ID
+        
+        Args:
+            metadata: 记忆元数据
+            sqlite_id: SQLite 记录 ID
+        
+        Returns:
+            更新后的元数据
+        """
+        if metadata is None:
+            metadata = {}
+        
+        metadata[MemoryTags.SQLITE_ID] = sqlite_id
+        return metadata
+    
+    @staticmethod
+    def get_sqlite_id(metadata: dict) -> Optional[int]:
+        """
+        获取 SQLite ID
+        
+        Args:
+            metadata: 记忆元数据
+        
+        Returns:
+            SQLite ID，不存在则返回 None
+        """
+        if metadata is None:
+            return None
+        return metadata.get(MemoryTags.SQLITE_ID)
+    
+    @staticmethod
+    def is_sqlite_only(metadata: dict) -> bool:
+        """
+        检查是否仅存储在 SQLite（未向量化）
+        
+        Args:
+            metadata: 记忆元数据
+        
+        Returns:
+            是否仅 SQLite 存储
+        """
+        if metadata is None:
+            return False
+        return metadata.get(MemoryTags.IS_SQLITE_ONLY, False) is True
+    
+    @staticmethod
+    def clear_compression_state(metadata: dict) -> dict:
+        """
+        清除压缩相关状态
+        
+        Args:
+            metadata: 记忆元数据
+        
+        Returns:
+            更新后的元数据
+        """
+        if metadata is None:
+            return {}
+        
+        compression_keys = [
+            MemoryTags.COMPRESSED,
+            MemoryTags.COMPRESSED_TIME,
+            MemoryTags.COMPRESSED_STRATEGY,
+            MemoryTags.ORIGINAL_LENGTH,
+            MemoryTags.HAS_COMPRESSED_VERSION,
+            MemoryTags.PENDING_COMPRESSION,
+            MemoryTags.PENDING_SINCE,
+            MemoryTags.RETRY_COUNT
+        ]
+        
+        for key in compression_keys:
+            metadata.pop(key, None)
+        
+        return metadata

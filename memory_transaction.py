@@ -7,6 +7,7 @@ from datetime import datetime
 from dataclasses import dataclass
 from enum import Enum
 from logger import get_logger
+from memory_tags import MemoryTags
 
 
 class TransactionState(Enum):
@@ -419,6 +420,10 @@ class TransactionCoordinator:
         1. SQLite 事务表中的 PREPARING 状态事务
         2. SQLite 中 is_vectorized=2 的记录（旧兼容）
         
+        恢复策略：
+        - add_memory 操作：尝试重新向量化
+        - 其他操作：标记为需要手动干预
+        
         Returns:
             恢复的记录数
         """
@@ -426,16 +431,28 @@ class TransactionCoordinator:
             return 0
         
         recovered = 0
+        failed = 0
         
         pending_txs = self._get_pending_transactions_from_db()
         for tx_record in pending_txs:
             self._log.info("TRANSACTION_RECOVERY_PENDING", 
                           transaction_id=tx_record.transaction_id,
+                          operation_type=tx_record.operation_type,
                           state=tx_record.state.value)
             
-            self._update_transaction_state(tx_record.transaction_id, TransactionState.FAILED,
-                                          "Recovered on startup - requires manual intervention")
-            recovered += 1
+            if tx_record.operation_type == "add_memory":
+                recovery_result = self._recover_add_memory_transaction(tx_record)
+                if recovery_result:
+                    recovered += 1
+                else:
+                    failed += 1
+            else:
+                self._update_transaction_state(
+                    tx_record.transaction_id, 
+                    TransactionState.FAILED,
+                    "Unknown operation type - requires manual intervention"
+                )
+                failed += 1
         
         try:
             pending_records = self._sqlite_store.get_unvectorized(limit=50)
@@ -467,13 +484,89 @@ class TransactionCoordinator:
                                    record_id=record.id,
                                    error=str(e))
             
-            if recovered > 0:
-                self._log.info("TRANSACTION_RECOVERY_COMPLETE", count=recovered)
+            if recovered > 0 or failed > 0:
+                self._log.info("TRANSACTION_RECOVERY_COMPLETE", 
+                              recovered=recovered, 
+                              failed=failed)
             
         except Exception as e:
             self._log.error("TRANSACTION_RECOVERY_ERROR", error=str(e))
         
         return recovered
+    
+    def _recover_add_memory_transaction(self, tx_record: TransactionRecord) -> bool:
+        """
+        恢复 add_memory 类型的事务
+        
+        Args:
+            tx_record: 事务记录
+        
+        Returns:
+            是否恢复成功
+        """
+        data = tx_record.data
+        text = data.get("text", "")
+        metadata = data.get("metadata", {})
+        
+        if not text:
+            self._update_transaction_state(
+                tx_record.transaction_id,
+                TransactionState.FAILED,
+                "Missing text data"
+            )
+            return False
+        
+        try:
+            existing = self._vector_store.search(text, n_results=1)
+            if existing and existing[0].get("similarity", 0) > 0.99:
+                existing_id = existing[0].get("id")
+                sqlite_id = metadata.get(MemoryTags.SQLITE_ID)
+                if sqlite_id:
+                    self._sqlite_store.update_vector_status(
+                        sqlite_id, existing_id, is_vectorized=1
+                    )
+                self._update_transaction_state(
+                    tx_record.transaction_id,
+                    TransactionState.COMMITTED
+                )
+                self._log.info("TRANSACTION_RECOVERY_REUSE_VECTOR",
+                              transaction_id=tx_record.transaction_id)
+                return True
+            
+            vector_ids = self._vector_store.add([text], [metadata])
+            
+            if vector_ids:
+                sqlite_id = metadata.get(MemoryTags.SQLITE_ID)
+                if sqlite_id:
+                    self._sqlite_store.update_vector_status(
+                        sqlite_id, vector_ids[0], is_vectorized=1
+                    )
+                
+                self._update_transaction_state(
+                    tx_record.transaction_id,
+                    TransactionState.COMMITTED
+                )
+                self._log.info("TRANSACTION_RECOVERY_SUCCESS",
+                              transaction_id=tx_record.transaction_id)
+                return True
+            else:
+                self._update_transaction_state(
+                    tx_record.transaction_id,
+                    TransactionState.FAILED,
+                    "Vector store returned empty result"
+                )
+                return False
+                
+        except Exception as e:
+            self._update_transaction_state(
+                tx_record.transaction_id,
+                TransactionState.FAILED,
+                f"Recovery failed: {str(e)}"
+            )
+            self._log.error("TRANSACTION_RECOVERY_EXCEPTION",
+                           transaction_id=tx_record.transaction_id,
+                           error=str(e))
+            return False
     
     def get_transaction_status(self, transaction_id: str) -> Optional[TransactionRecord]:
         """获取事务状态"""

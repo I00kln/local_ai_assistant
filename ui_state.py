@@ -5,6 +5,7 @@ from typing import Optional, Callable, Dict, Any, List
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
+from contextlib import contextmanager
 from models import UIState
 
 
@@ -21,6 +22,16 @@ class StatusMessage:
             self.timestamp = datetime.now().strftime("%H:%M:%S")
 
 
+BACKGROUND_STATES = {
+    UIState.BACKGROUND_COMPRESSING,
+    UIState.BACKGROUND_DEDUPING,
+    UIState.PROCESSING_LOCAL,
+    UIState.PROCESSING_CLOUD,
+    UIState.PROCESSING_HYBRID,
+    UIState.INITIALIZING
+}
+
+
 class UIStateManager:
     """
     UI状态管理器
@@ -30,6 +41,7 @@ class UIStateManager:
     - 状态变更通知
     - 后台任务状态显示
     - 状态历史记录
+    - 异常自动恢复（上下文管理器）
     """
     
     def __init__(self, status_label: tk.Label = None, memory_label: tk.Label = None):
@@ -90,6 +102,61 @@ class UIStateManager:
             status_text = self._get_status_text(previous_state)
             self._update_status_label(status_text)
     
+    @contextmanager
+    def temp_state(self, state: UIState, message: str = None, on_error: str = None):
+        """
+        临时状态上下文管理器
+        
+        自动在异常时恢复状态
+        
+        Args:
+            state: 临时状态
+            message: 状态消息
+            on_error: 错误时的额外消息
+        
+        Usage:
+            with ui_state.temp_state(UIState.PROCESSING_LOCAL):
+                ... # 异常时自动恢复状态
+        """
+        self.push_state(state, message)
+        try:
+            yield
+        except Exception as e:
+            error_msg = on_error or f"操作失败: {str(e)}"
+            self.add_status_message(error_msg, level="error")
+            raise
+        finally:
+            self.pop_state()
+    
+    @contextmanager
+    def background_task_context(self, task_id: str, task_name: str, state: UIState = None):
+        """
+        后台任务上下文管理器
+        
+        自动管理任务生命周期和状态
+        
+        Args:
+            task_id: 任务ID
+            task_name: 任务名称
+            state: 可选的状态（默认不改变状态）
+        
+        Usage:
+            with ui_state.background_task_context("compress", "压缩中"):
+                ... # 异常时自动清理任务
+        """
+        self.start_background_task(task_id, task_name)
+        if state:
+            self.push_state(state, task_name)
+        try:
+            yield
+        except Exception as e:
+            self.add_status_message(f"{task_name}失败: {str(e)}", level="error")
+            raise
+        finally:
+            self.end_background_task(task_id)
+            if state:
+                self.pop_state()
+    
     def start_background_task(self, task_id: str, task_name: str):
         """
         启动后台任务
@@ -111,6 +178,14 @@ class UIStateManager:
         if task_id in self._background_tasks:
             del self._background_tasks[task_id]
             self._update_background_status()
+    
+    def clear_all_background_tasks(self):
+        """清除所有后台任务并恢复状态"""
+        self._background_tasks.clear()
+        while self._state_stack:
+            self.pop_state()
+        if self._current_state in BACKGROUND_STATES:
+            self.set_state(UIState.IDLE)
     
     def set_memory_counts(self, l2_count: int, l3_count: int):
         """
@@ -195,7 +270,7 @@ class UIStateManager:
     def _update_background_status(self):
         """更新后台任务状态"""
         if not self._background_tasks:
-            if self._current_state in [UIState.BACKGROUND_COMPRESSING, UIState.BACKGROUND_DEDUPING]:
+            if self._current_state in BACKGROUND_STATES:
                 self.pop_state()
         else:
             task_names = list(self._background_tasks.values())

@@ -1,11 +1,13 @@
 # vector_store.py
 # L2 向量存储层 - ChromaDB 实现
 import os
+import time
 import threading
 from typing import List, Dict, Any, Optional, Callable
 from datetime import datetime
 
 from config import config
+from memory_tags import MemoryTags
 
 
 class ONNXEmbeddingFunction:
@@ -78,6 +80,7 @@ class VectorStore:
     - 自动持久化
     - 线程安全
     - 内置去重
+    - 异步预热（不阻塞主线程）
     """
     
     def __init__(self, collection_name: str = "memories", persist_directory: str = None):
@@ -94,13 +97,14 @@ class VectorStore:
         self.persist_directory = persist_directory
         self.collection_name = collection_name
         
-        # 确保目录存在
         os.makedirs(persist_directory, exist_ok=True)
         
-        # 初始化ChromaDB
+        self._prewarm_complete = False
+        self._prewarm_error: Optional[str] = None
+        self._prewarm_lock = threading.Lock()
+        
         self._init_chroma()
         
-        # 线程锁（虽然ChromaDB内部线程安全，但用于保护批量操作）
         self.lock = threading.RLock()
         
         print(f"向量存储初始化完成: {persist_directory}")
@@ -111,7 +115,6 @@ class VectorStore:
             import chromadb
             from chromadb.config import Settings
             
-            # 创建持久化客户端
             self.client = chromadb.PersistentClient(
                 path=self.persist_directory,
                 settings=Settings(
@@ -120,14 +123,16 @@ class VectorStore:
                 )
             )
             
-            # 创建自定义嵌入函数
             self.embedding_function = ONNXEmbeddingFunction()
             
-            # 预加载ONNX模型（避免首次使用时延迟）
-            print("[向量存储] 正在预加载ONNX嵌入模型...")
-            self.embedding_function._ensure_initialized()
+            print("[向量存储] 正在后台预加载ONNX嵌入模型...")
+            prewarm_thread = threading.Thread(
+                target=self._prewarm_embedding,
+                daemon=True,
+                name="EmbeddingPrewarm"
+            )
+            prewarm_thread.start()
             
-            # 获取或创建集合（带优化的 HNSW 参数）
             self.collection = self.client.get_or_create_collection(
                 name=self.collection_name,
                 metadata={
@@ -144,6 +149,53 @@ class VectorStore:
             raise ImportError("请安装 chromadb: pip install chromadb")
         except Exception as e:
             raise RuntimeError(f"ChromaDB初始化失败: {e}")
+    
+    def _prewarm_embedding(self):
+        """
+        后台预热嵌入模型
+        
+        在独立线程中执行，不阻塞主线程
+        记录预热状态，便于后续检查
+        """
+        try:
+            self.embedding_function._ensure_initialized()
+            with self._prewarm_lock:
+                self._prewarm_complete = True
+            print("[向量存储] ONNX 嵌入模型预热完成")
+        except Exception as e:
+            with self._prewarm_lock:
+                self._prewarm_error = str(e)
+            print(f"[向量存储] ONNX 嵌入模型预热失败: {e}")
+    
+    def is_prewarm_complete(self) -> bool:
+        """检查预热是否完成"""
+        with self._prewarm_lock:
+            return self._prewarm_complete
+    
+    def get_prewarm_error(self) -> Optional[str]:
+        """获取预热错误信息"""
+        with self._prewarm_lock:
+            return self._prewarm_error
+    
+    def wait_for_prewarm(self, timeout: float = 30.0) -> bool:
+        """
+        等待预热完成
+        
+        Args:
+            timeout: 超时时间（秒）
+        
+        Returns:
+            是否预热成功
+        """
+        start_time = time.time()
+        while time.time() - start_time < timeout:
+            with self._prewarm_lock:
+                if self._prewarm_complete:
+                    return True
+                if self._prewarm_error:
+                    return False
+            time.sleep(0.1)
+        return False
     
     def add(
         self, 
@@ -177,13 +229,13 @@ class VectorStore:
         
         if metadatas is None:
             metadatas = [{
-                "timestamp": datetime.now().isoformat(),
+                MemoryTags.TIMESTAMP: datetime.now().isoformat(),
                 "type": "memory"
             } for _ in texts]
         else:
             for meta in metadatas:
-                if "timestamp" not in meta:
-                    meta["timestamp"] = datetime.now().isoformat()
+                if MemoryTags.TIMESTAMP not in meta:
+                    meta[MemoryTags.TIMESTAMP] = datetime.now().isoformat()
         
         try:
             embeddings = self.embedding_function(texts)
@@ -451,8 +503,8 @@ class VectorStore:
             
             timestamps = []
             for meta in (results.get("metadatas") or []):
-                if meta and "timestamp" in meta:
-                    timestamps.append(meta["timestamp"])
+                if meta and MemoryTags.TIMESTAMP in meta:
+                    timestamps.append(meta[MemoryTags.TIMESTAMP])
             
             oldest = min(timestamps) if timestamps else None
             newest = max(timestamps) if timestamps else None

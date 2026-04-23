@@ -358,7 +358,7 @@ class MemoryManager:
         """
         应用时间衰减因子（使用统一的时间衰减函数）
         """
-        timestamp_str = result.metadata.get("timestamp", "")
+        timestamp_str = result.metadata.get(MemoryTags.TIMESTAMP, "")
         decay = self._calculate_time_decay(timestamp_str, time_context)
         return result.similarity * decay
     
@@ -425,7 +425,7 @@ class MemoryManager:
                         source="L1",
                         similarity=similarity,
                         weight=1.0,
-                        metadata={"timestamp": conv.get("timestamp", "")}
+                        metadata={MemoryTags.TIMESTAMP: conv.get("timestamp", "")}
                     ))
         
         results.sort(key=lambda x: x.similarity, reverse=True)
@@ -488,8 +488,8 @@ class MemoryManager:
                     metadata={
                         "id": record.id,
                         "access_count": record.access_count,
-                        "timestamp": record.created_time,
-                        "is_sqlite_only": is_sqlite_only
+                        MemoryTags.TIMESTAMP: record.created_time,
+                        MemoryTags.IS_SQLITE_ONLY: is_sqlite_only
                     }
                 ))
             
@@ -567,7 +567,7 @@ class MemoryManager:
         if result.source != "L3":
             return
         
-        if result.metadata.get("is_sqlite_only", False):
+        if result.metadata.get(MemoryTags.IS_SQLITE_ONLY, False):
             return
         
         record_id = result.metadata.get("id")
@@ -576,7 +576,7 @@ class MemoryManager:
         
         try:
             self.vector_store.add([result.text], [{
-                "timestamp": datetime.now().isoformat(),
+                MemoryTags.TIMESTAMP: datetime.now().isoformat(),
                 "type": "backfill",
                 "source": "L3",
                 "original_id": record_id
@@ -672,7 +672,7 @@ class MemoryManager:
             
             record.metadata = MemoryTagHelper.unmark_forgotten(record.metadata)
             
-            record.metadata["needs_revectorization"] = True
+            record.metadata[MemoryTags.NEEDS_REVECTORIZATION] = True
             
             self.sqlite.add(record)
             

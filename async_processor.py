@@ -400,8 +400,6 @@ class AsyncMemoryProcessor:
             RuleBasedCompressionStrategy(self._mem_config)
         ])
         self._compressor_warning_shown = False
-        
-        self._event_bus.subscribe(EventType.MEMORY_WRITTEN, self._handle_memory_written)
     
     def _get_queue_config(self):
         """获取队列配置"""
@@ -411,10 +409,6 @@ class AsyncMemoryProcessor:
             from config import AsyncProcessorConfig
             return AsyncProcessorConfig()
     
-    def _handle_memory_written(self, event):
-        """处理记忆写入事件"""
-        pass
-        
     def start(self):
         """启动后台处理线程"""
         if self.running:
@@ -563,8 +557,8 @@ class AsyncMemoryProcessor:
                 for vid in batch_ids:
                     metadata = self.vector_store.get_metadata(vid)
                     
-                    if metadata and "sqlite_id" in metadata:
-                        sqlite_id = metadata["sqlite_id"]
+                    if metadata and MemoryTags.SQLITE_ID in metadata:
+                        sqlite_id = metadata[MemoryTags.SQLITE_ID]
                         record = self.sqlite.get(sqlite_id)
                         if not record:
                             orphan_ids.append(vid)
@@ -672,7 +666,7 @@ class AsyncMemoryProcessor:
                 return
             
             metadata = metadata or {}
-            metadata["nonsense_filter_result"] = filter_result.storage_type
+            metadata[MemoryTags.NONSENSE_FILTER_RESULT] = filter_result.storage_type
             
             if filter_result.storage_type == "sqlite_only":
                 metrics.record_filter_result("sqlite_only")
@@ -757,10 +751,10 @@ class AsyncMemoryProcessor:
         metadata = {
             "type": "conversation",
             "source": source,
-            "timestamp": conv["timestamp"]
+            MemoryTags.TIMESTAMP: conv["timestamp"]
         }
         
-        nonsense_result = conv_metadata.get("nonsense_filter_result", "normal")
+        nonsense_result = conv_metadata.get(MemoryTags.NONSENSE_FILTER_RESULT, "normal")
         if nonsense_result == "sqlite_only":
             self._store_to_sqlite_only(conversation_memory, metadata)
             return
@@ -873,7 +867,7 @@ class AsyncMemoryProcessor:
                     vector_ids.append(pre_generated_id)
                     texts_to_vectorize.append(text)
                     meta_with_id = dict(meta) if meta else {}
-                    meta_with_id["sqlite_id"] = existing_id
+                    meta_with_id[MemoryTags.SQLITE_ID] = existing_id
                     metadatas_to_vectorize.append(meta_with_id)
                 else:
                     pre_generated_id = str(uuid.uuid4())
@@ -905,7 +899,7 @@ class AsyncMemoryProcessor:
                     vector_ids.append(record.vector_id)
                     texts_to_vectorize.append(record.text)
                     meta_with_id = dict(record.metadata) if record.metadata else {}
-                    meta_with_id["sqlite_id"] = new_id
+                    meta_with_id[MemoryTags.SQLITE_ID] = new_id
                     metadatas_to_vectorize.append(meta_with_id)
         else:
             vector_ids = [str(uuid.uuid4()) for _ in texts]
@@ -1214,7 +1208,7 @@ class AsyncMemoryProcessor:
         3. metadata中标记为已压缩且未标记需要重新压缩
         """
         needs_recompression = False
-        if record.metadata and record.metadata.get("needs_recompression"):
+        if record.metadata and record.metadata.get(MemoryTags.NEEDS_RECOMPRESSION):
             needs_recompression = True
         
         if record.compressed_text and not needs_recompression:
@@ -1294,8 +1288,8 @@ class AsyncMemoryProcessor:
                         )
                         
                         if record.metadata:
-                            record.metadata.pop("needs_recompression", None)
-                            record.metadata.pop("needs_revectorization", None)
+                            record.metadata.pop(MemoryTags.NEEDS_RECOMPRESSION, None)
+                            record.metadata.pop(MemoryTags.NEEDS_REVECTORIZATION, None)
                         
                         tagger = _get_tag_classifier()
                         if tagger:
@@ -1554,8 +1548,8 @@ class AsyncMemoryProcessor:
                         
                         if not record.metadata:
                             record.metadata = {}
-                        record.metadata["upgraded_from_sqlite_only"] = True
-                        record.metadata["upgraded_time"] = datetime.now().isoformat()
+                        record.metadata[MemoryTags.UPGRADED_FROM_SQLITE_ONLY] = True
+                        record.metadata[MemoryTags.UPGRADED_TIME] = datetime.now().isoformat()
                         self.sqlite.add(record)
                         
                         upgraded_count += 1
@@ -1669,8 +1663,8 @@ class AsyncMemoryProcessor:
                             record.metadata, strategy_name, original_length
                         )
                         if record.metadata:
-                            record.metadata.pop("needs_recompression", None)
-                            record.metadata.pop("needs_revectorization", None)
+                            record.metadata.pop(MemoryTags.NEEDS_RECOMPRESSION, None)
+                            record.metadata.pop(MemoryTags.NEEDS_REVECTORIZATION, None)
                         self.sqlite.add(record)
                         compressed_count += 1
                         

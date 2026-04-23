@@ -1,8 +1,19 @@
 # token_utils.py
 # Token估算工具函数
 
+from typing import Tuple, Optional
+
 _tiktoken_available = False
 _encoder = None
+
+DEFAULT_MAX_TOKENS = {
+    "gpt-4": 8192,
+    "gpt-4-turbo": 128000,
+    "gpt-3.5-turbo": 4096,
+    "claude-3": 200000,
+    "gemini-1.5": 1000000,
+    "default": 4096
+}
 
 try:
     import tiktoken
@@ -39,6 +50,103 @@ def estimate_tokens(text: str, use_tiktoken: bool = True) -> int:
             pass
     
     return _estimate_tokens_fallback(text)
+
+
+def estimate_tokens_with_limit(
+    text: str, 
+    max_tokens: int = None,
+    model: str = None,
+    use_tiktoken: bool = True
+) -> Tuple[int, bool, int]:
+    """
+    估算文本的token数量并检查是否超限
+    
+    Args:
+        text: 输入文本
+        max_tokens: 最大token限制（优先使用）
+        model: 模型名称（用于获取默认限制）
+        use_tiktoken: 是否尝试使用tiktoken
+    
+    Returns:
+        (token数量, 是否超限, 最大限制)
+    """
+    if not text:
+        return 0, False, max_tokens or DEFAULT_MAX_TOKENS.get(model, DEFAULT_MAX_TOKENS["default"])
+    
+    tokens = estimate_tokens(text, use_tiktoken)
+    
+    if max_tokens is None:
+        max_tokens = DEFAULT_MAX_TOKENS.get(model, DEFAULT_MAX_TOKENS["default"])
+    
+    exceeds = tokens > max_tokens
+    
+    return tokens, exceeds, max_tokens
+
+
+def truncate_to_token_limit(
+    text: str, 
+    max_tokens: int,
+    use_tiktoken: bool = True,
+    suffix: str = "..."
+) -> str:
+    """
+    将文本截断到指定token限制内
+    
+    Args:
+        text: 输入文本
+        max_tokens: 最大token限制
+        use_tiktoken: 是否尝试使用tiktoken
+        suffix: 截断后缀
+    
+    Returns:
+        截断后的文本
+    """
+    if not text:
+        return text
+    
+    tokens, exceeds, _ = estimate_tokens_with_limit(text, max_tokens, use_tiktoken=use_tiktoken)
+    
+    if not exceeds:
+        return text
+    
+    if use_tiktoken and _tiktoken_available and _encoder:
+        try:
+            encoded = _encoder.encode(text)
+            truncated = encoded[:max_tokens - len(suffix)]
+            return _encoder.decode(truncated) + suffix
+        except Exception:
+            pass
+    
+    estimated_chars_per_token = len(text) / max(tokens, 1)
+    target_chars = int((max_tokens - len(suffix)) * estimated_chars_per_token)
+    
+    return text[:target_chars] + suffix
+
+
+def check_text_fits_model(
+    text: str, 
+    model: str,
+    buffer_tokens: int = 100
+) -> Tuple[bool, int, int]:
+    """
+    检查文本是否适合指定模型的上下文限制
+    
+    Args:
+        text: 输入文本
+        model: 模型名称
+        buffer_tokens: 保留的缓冲token数（用于响应）
+    
+    Returns:
+        (是否适合, 当前token数, 最大允许token数)
+    """
+    max_tokens = DEFAULT_MAX_TOKENS.get(model, DEFAULT_MAX_TOKENS["default"])
+    effective_max = max_tokens - buffer_tokens
+    
+    tokens = estimate_tokens(text)
+    
+    fits = tokens <= effective_max
+    
+    return fits, tokens, effective_max
 
 
 def _estimate_tokens_fallback(text: str) -> int:
