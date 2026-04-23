@@ -232,7 +232,22 @@ class BackgroundTaskScheduler:
         start_time = time.time()
         task_type = task.task_type
         
-        self._begin_migration(task_type)
+        try:
+            self._begin_migration(task_type)
+        except TimeoutError as e:
+            duration_ms = (time.time() - start_time) * 1000
+            self._log.error(
+                "TASK_MIGRATION_TIMEOUT",
+                task_type=task_type.value,
+                error=str(e),
+                duration_ms=round(duration_ms, 2)
+            )
+            return TaskResult(
+                task_type=task_type,
+                success=False,
+                error=str(e),
+                duration_ms=duration_ms
+            )
         
         try:
             result = task.callback(*task.args, **task.kwargs)
@@ -280,15 +295,34 @@ class BackgroundTaskScheduler:
         finally:
             self._end_migration()
     
-    def _begin_migration(self, task_type: TaskType):
+    def _begin_migration(self, task_type: TaskType, timeout: float = 30.0):
         """
         开始迁移操作
         
         获取写锁，阻止所有读操作
+        
+        Args:
+            task_type: 任务类型
+            timeout: 等待读者完成的最大超时时间（秒），默认 30 秒
+        
+        Raises:
+            TimeoutError: 等待读者超时
         """
+        deadline = time.time() + timeout
+        
         with self._write_waiting:
             while self._readers_count > 0:
-                self._write_waiting.wait()
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    self._log.error(
+                        "MIGRATION_WAIT_READERS_TIMEOUT",
+                        task_type=task_type.value,
+                        readers_count=self._readers_count,
+                        timeout=timeout
+                    )
+                    raise TimeoutError(f"等待读者完成超时 ({timeout}秒)，当前读者数: {self._readers_count}")
+                
+                self._write_waiting.wait(timeout=min(remaining, 0.5))
             
             self._write_in_progress = True
             self._migration_active = True
@@ -369,13 +403,7 @@ class BackgroundTaskScheduler:
                     )
                     return False
                 
-                if not self._write_waiting.wait(timeout=min(remaining, 0.1)):
-                    if time.time() >= deadline:
-                        self._log.warning(
-                            "READ_LOCK_TIMEOUT",
-                            timeout=timeout
-                        )
-                        return False
+                self._write_waiting.wait(timeout=min(remaining, 0.1))
             
             self._readers_count += 1
         

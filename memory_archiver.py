@@ -441,6 +441,24 @@ class MemoryArchiver:
         self._thread = threading.Thread(target=archive_loop, daemon=True)
         self._thread.start()
         print(f"[归档] 自动归档已启动，间隔 {interval_hours} 小时")
+        
+        self._register_lifecycle()
+    
+    def _register_lifecycle(self):
+        """注册到生命周期管理器"""
+        try:
+            from lifecycle_manager import get_lifecycle_manager, ServicePriority
+            lifecycle = get_lifecycle_manager()
+            lifecycle.register(
+                name="memory_archiver",
+                cleanup_fn=self.stop_auto_archive,
+                priority=ServicePriority.BACKGROUND,
+                timeout=3.0,
+                is_running=lambda: self._running,
+                stop_fn=lambda: setattr(self, '_running', False)
+            )
+        except Exception:
+            pass
     
     def stop_auto_archive(self):
         """停止自动归档"""

@@ -2,6 +2,8 @@
 # 三层记忆管理器 - 统一管理L1/L2/L3记忆层
 import threading
 import time
+import json
+import re
 from typing import List, Dict, Any, Optional
 from datetime import datetime
 from dataclasses import dataclass
@@ -135,7 +137,6 @@ class MemoryManager:
         Returns:
             搜索结果列表（已去重、已应用时间衰减、已过滤阈值）
         """
-        import time
         from metrics import get_metrics_collector
         
         start_time = time.perf_counter()
@@ -271,6 +272,213 @@ class MemoryManager:
         
         return filtered_results[:top_k]
     
+    def search_by_tag(
+        self,
+        category: str = None,
+        importance: str = None,
+        sentiment: str = None,
+        time_sensitive: bool = None,
+        top_k: int = 50
+    ) -> List[MemorySearchResult]:
+        """
+        按标签过滤搜索
+        
+        Args:
+            category: 分类标签（work, life, study, health, finance, tech, entertainment, travel, relationship, other）
+            importance: 重要性标签（high, medium, low）
+            sentiment: 情感标签（positive, negative, neutral）
+            time_sensitive: 是否时间敏感
+            top_k: 返回结果数量
+        
+        Returns:
+            匹配的记忆列表
+        """
+        
+        results: List[MemorySearchResult] = []
+        
+        scheduler = get_background_scheduler()
+        with scheduler.read_lock(timeout=5.0) as lock_context:
+            if not lock_context.is_locked():
+                self._log.warning("TAG_SEARCH_LOCK_FALLBACK")
+            
+            l3_records = self.sqlite.get_recent_memories(limit=top_k * 3)
+            
+            for record in l3_records:
+                metadata = record.metadata if hasattr(record, 'metadata') else {}
+                if isinstance(metadata, str):
+                    try:
+                        metadata = json.loads(metadata)
+                    except json.JSONDecodeError:
+                        continue
+                
+                tag_data = metadata.get(MemoryTags.SEMANTIC_TAG, {})
+                if isinstance(tag_data, str):
+                    try:
+                        tag_data = json.loads(tag_data)
+                    except json.JSONDecodeError:
+                        continue
+                
+                if not tag_data:
+                    continue
+                
+                if category and tag_data.get("category") != category:
+                    continue
+                if importance and tag_data.get("importance") != importance:
+                    continue
+                if sentiment and tag_data.get("sentiment") != sentiment:
+                    continue
+                if time_sensitive is not None and tag_data.get("time_sensitive") != time_sensitive:
+                    continue
+                
+                results.append(MemorySearchResult(
+                    text=record.text if hasattr(record, 'text') else "",
+                    source="L3",
+                    similarity=1.0,
+                    weight=record.weight if hasattr(record, 'weight') else 1.0,
+                    metadata=metadata
+                ))
+                
+                if len(results) >= top_k:
+                    break
+        
+        return results
+    
+    def rerank_results(
+        self,
+        query: str,
+        results: List[MemorySearchResult],
+        use_llm: bool = False,
+        llm_client = None
+    ) -> List[MemorySearchResult]:
+        """
+        记忆重排
+        
+        对检索结果进行二次排序，解决语义相似但逻辑无关的问题
+        
+        Args:
+            query: 当前查询
+            results: 原始检索结果
+            use_llm: 是否使用 LLM 进行深度重排
+            llm_client: LLM 客户端（可选）
+        
+        Returns:
+            重排后的结果列表
+        """
+        if not results:
+            return results
+        
+        reranked = self._rule_based_rerank(query, results)
+        
+        if use_llm and llm_client and len(reranked) > 3:
+            reranked = self._llm_rerank(query, reranked, llm_client)
+        
+        return reranked
+    
+    def _rule_based_rerank(
+        self,
+        query: str,
+        results: List[MemorySearchResult]
+    ) -> List[MemorySearchResult]:
+        """
+        规则重排
+        
+        基于关键词匹配、时间衰减、来源权重进行重排
+        """
+        
+        query_lower = query.lower()
+        query_keywords = set(re.findall(r'[\u4e00-\u9fa5]+|[a-zA-Z]+', query_lower))
+        
+        for result in results:
+            boost = 0.0
+            
+            text_lower = result.text.lower()
+            text_keywords = set(re.findall(r'[\u4e00-\u9fa5]+|[a-zA-Z]+', text_lower))
+            
+            keyword_overlap = len(query_keywords & text_keywords)
+            if keyword_overlap > 0:
+                boost += min(keyword_overlap * 0.1, 0.3)
+            
+            if result.source == "L1":
+                boost += 0.15
+            elif result.source == "L2":
+                boost += 0.1
+            
+            if result.metadata:
+                importance = result.metadata.get("importance", "medium")
+                if importance == "high":
+                    boost += 0.1
+                elif importance == "medium":
+                    boost += 0.05
+            
+            result.rrf_score = result.rrf_score * (1 + boost)
+        
+        return sorted(results, key=lambda x: x.rrf_score, reverse=True)
+    
+    def _llm_rerank(
+        self,
+        query: str,
+        results: List[MemorySearchResult],
+        llm_client
+    ) -> List[MemorySearchResult]:
+        """
+        LLM 深度重排
+        
+        使用 LLM 判断候选记忆与查询的相关性
+        """
+        
+        try:
+            from prompts import get_prompt_manager
+            
+            prompt_manager = get_prompt_manager()
+            
+            candidates = [
+                {
+                    "id": str(i),
+                    "text": r.text[:200],
+                    "score": r.similarity
+                }
+                for i, r in enumerate(results[:10])
+            ]
+            
+            messages = prompt_manager.get_rerank_prompt(query, candidates)
+            
+            response = llm_client.chat(messages, max_tokens=500)
+            
+            scores = self._parse_rerank_response(response)
+            
+            if scores:
+                for result in results:
+                    idx = results.index(result)
+                    if str(idx) in scores:
+                        result.rrf_score = scores[str(idx)]
+            
+            return sorted(results, key=lambda x: x.rrf_score, reverse=True)
+            
+        except Exception as e:
+            self._log.warning("LLM_RERANK_FAILED", error=str(e))
+            return results
+    
+    def _parse_rerank_response(self, response: str) -> Dict[str, float]:
+        """
+        解析 LLM 重排响应
+        
+        Args:
+            response: LLM 响应文本
+        
+        Returns:
+            {id: score} 字典
+        """
+        
+        try:
+            json_match = re.search(r'\[[\s\S]*\]', response)
+            if json_match:
+                data = json.loads(json_match.group())
+                return {str(item.get("id", "")): item.get("score", 0) for item in data}
+        except (json.JSONDecodeError, TypeError):
+            pass
+        
+        return {}
+    
     def _detect_time_context(self, query: str) -> Dict[str, Any]:
         """
         检测查询中的时间上下文
@@ -282,7 +490,6 @@ class MemoryManager:
                 "decay_factor": float
             }
         """
-        import re
         
         query_lower = query.lower()
         

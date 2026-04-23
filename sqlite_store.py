@@ -138,6 +138,22 @@ class SQLiteStore:
             print("[安全] SQLite 加密已启用 (SQLCipher)")
         
         self._init_database()
+        
+        self._register_lifecycle()
+    
+    def _register_lifecycle(self):
+        """注册到生命周期管理器"""
+        try:
+            from lifecycle_manager import get_lifecycle_manager, ServicePriority
+            lifecycle = get_lifecycle_manager()
+            lifecycle.register(
+                name="sqlite_store",
+                cleanup_fn=self.close,
+                priority=ServicePriority.LOW,
+                timeout=3.0
+            )
+        except Exception:
+            pass
     
     def _validate_connection(self, conn) -> bool:
         """

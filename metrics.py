@@ -55,19 +55,31 @@ class MetricsCollector:
         self._embedding_latencies: deque = deque(maxlen=500)
         self._compression_latencies: deque = deque(maxlen=200)
         self._queue_wait_times: deque = deque(maxlen=500)
+        self._model_load_latencies: deque = deque(maxlen=100)
+        self._db_query_latencies: deque = deque(maxlen=1000)
+        self._vector_search_latencies: deque = deque(maxlen=500)
+        self._transaction_latencies: deque = deque(maxlen=200)
         
         self._data_versions: Dict[str, int] = {
             "retrieval": 0,
             "embedding": 0,
             "compression": 0,
-            "queue": 0
+            "queue": 0,
+            "model_load": 0,
+            "db_query": 0,
+            "vector_search": 0,
+            "transaction": 0
         }
         
         self._percentile_cache: Dict[str, PercentileCache] = {
             "retrieval": PercentileCache(),
             "embedding": PercentileCache(),
             "compression": PercentileCache(),
-            "queue": PercentileCache()
+            "queue": PercentileCache(),
+            "model_load": PercentileCache(),
+            "db_query": PercentileCache(),
+            "vector_search": PercentileCache(),
+            "transaction": PercentileCache()
         }
         
         self._compression_attempts: int = 0
@@ -132,6 +144,30 @@ class MetricsCollector:
         with self._lock:
             self._queue_wait_times.append(wait_ms)
             self._data_versions["queue"] += 1
+    
+    def record_model_load_latency(self, duration_ms: float):
+        """记录模型加载耗时"""
+        with self._lock:
+            self._model_load_latencies.append(duration_ms)
+            self._data_versions["model_load"] += 1
+    
+    def record_db_query_latency(self, duration_ms: float):
+        """记录数据库查询延迟"""
+        with self._lock:
+            self._db_query_latencies.append(duration_ms)
+            self._data_versions["db_query"] += 1
+    
+    def record_vector_search_latency(self, duration_ms: float):
+        """记录向量检索延迟"""
+        with self._lock:
+            self._vector_search_latencies.append(duration_ms)
+            self._data_versions["vector_search"] += 1
+    
+    def record_transaction_latency(self, duration_ms: float):
+        """记录事务提交延迟"""
+        with self._lock:
+            self._transaction_latencies.append(duration_ms)
+            self._data_versions["transaction"] += 1
     
     def _calculate_percentiles(self, data: deque, cache_key: str) -> Dict[str, float]:
         """
@@ -225,6 +261,22 @@ class MetricsCollector:
                 "queue": {
                     "wait_time_ms": self._calculate_percentiles(self._queue_wait_times, "queue"),
                 },
+                
+                "model_load": {
+                    "latency_ms": self._calculate_percentiles(self._model_load_latencies, "model_load"),
+                },
+                
+                "db_query": {
+                    "latency_ms": self._calculate_percentiles(self._db_query_latencies, "db_query"),
+                },
+                
+                "vector_search": {
+                    "latency_ms": self._calculate_percentiles(self._vector_search_latencies, "vector_search"),
+                },
+                
+                "transaction": {
+                    "latency_ms": self._calculate_percentiles(self._transaction_latencies, "transaction"),
+                },
             }
     
     def get_summary(self) -> str:
@@ -256,6 +308,22 @@ class MetricsCollector:
             "【嵌入计算】",
             f"  延迟 P50: {metrics['embedding']['latency_ms']['p50']:.1f}ms",
             f"  延迟 P95: {metrics['embedding']['latency_ms']['p95']:.1f}ms",
+            "",
+            "【模型加载】",
+            f"  延迟 P50: {metrics['model_load']['latency_ms']['p50']:.1f}ms",
+            f"  延迟 P95: {metrics['model_load']['latency_ms']['p95']:.1f}ms",
+            "",
+            "【数据库查询】",
+            f"  延迟 P50: {metrics['db_query']['latency_ms']['p50']:.1f}ms",
+            f"  延迟 P95: {metrics['db_query']['latency_ms']['p95']:.1f}ms",
+            "",
+            "【向量检索】",
+            f"  延迟 P50: {metrics['vector_search']['latency_ms']['p50']:.1f}ms",
+            f"  延迟 P95: {metrics['vector_search']['latency_ms']['p95']:.1f}ms",
+            "",
+            "【事务提交】",
+            f"  延迟 P50: {metrics['transaction']['latency_ms']['p50']:.1f}ms",
+            f"  延迟 P95: {metrics['transaction']['latency_ms']['p95']:.1f}ms",
         ]
         
         return "\n".join(lines)

@@ -3,6 +3,9 @@ import threading
 import time
 import queue
 import re
+import json
+import os
+import glob
 from typing import List, Dict, Any, Tuple, Optional
 from datetime import datetime, timedelta
 from vector_store import VectorStore, get_vector_store
@@ -118,23 +121,21 @@ class AsyncMemoryProcessor:
         
         self._event_bus.subscribe(EventType.L1_OVERFLOW, self._handle_l1_overflow)
         
+        try:
+            from lifecycle_manager import get_lifecycle_manager, ServicePriority
+            lifecycle = get_lifecycle_manager()
+            lifecycle.register(
+                name="async_processor",
+                cleanup_fn=self.stop,
+                priority=ServicePriority.HIGH,
+                timeout=5.0,
+                is_running=lambda: self.running,
+                stop_fn=lambda: setattr(self, 'running', False)
+            )
+        except Exception:
+            pass
+        
         self._log.info("ASYNC_PROCESSOR_STARTED")
-    
-    def stop(self, timeout: float = 10.0):
-        """
-        停止后台处理线程
-        
-        Args:
-            timeout: 等待超时时间（秒）
-        """
-        self.running = False
-        
-        self._scheduler.stop()
-        
-        if self.thread and self.thread.is_alive():
-            self.thread.join(timeout=timeout)
-        
-        self._log.info("ASYNC_PROCESSOR_STOPPED")
     
     def _compression_loop(self):
         """
@@ -451,19 +452,25 @@ class AsyncMemoryProcessor:
         except Exception as e:
             print(f"[同步时间戳] 失败: {e}")
     
-    def stop(self):
+    def stop(self, timeout: float = 10.0):
         """
         停止后台处理
         
         优雅关闭流程：
         1. 设置停止标志
-        2. 主动处理队列中的剩余任务（最多30秒）
-        3. 强制保存缓冲区数据
-        4. 等待后台线程结束（最多10秒）
-        5. 等待所有迁移操作完成
-        6. 记录未处理数据统计
+        2. 停止后台调度器
+        3. 主动处理队列中的剩余任务（最多30秒）
+        4. 强制保存缓冲区数据
+        5. 等待后台线程结束（最多 timeout 秒）
+        6. 等待所有迁移操作完成
+        7. 记录未处理数据统计
+        
+        Args:
+            timeout: 等待后台线程的超时时间（秒）
         """
         self.running = False
+        
+        self._scheduler.stop()
         
         queue_timeout = 30
         start = time.time()
@@ -490,7 +497,7 @@ class AsyncMemoryProcessor:
                              processed=processed_during_shutdown)
         
         if self.thread:
-            self.thread.join(timeout=10)
+            self.thread.join(timeout=timeout)
             if self.thread.is_alive():
                 self._log.warning("STOP_THREAD_TIMEOUT")
         
@@ -508,8 +515,6 @@ class AsyncMemoryProcessor:
         
         用于下次启动时恢复
         """
-        import json
-        import os
         
         buffer_dir = os.path.join(os.path.dirname(__file__), "overflow_buffer")
         os.makedirs(buffer_dir, exist_ok=True)
@@ -685,8 +690,6 @@ class AsyncMemoryProcessor:
         Returns:
             是否成功写入
         """
-        import json
-        import os
         
         try:
             buffer_dir = os.path.join(os.path.dirname(__file__), "overflow_buffer")
@@ -741,10 +744,6 @@ class AsyncMemoryProcessor:
                     )
             except Exception as e:
                 self._log.error("SQLITE_PENDING_RECOVERY_FAILED", error=str(e))
-        
-        import json
-        import os
-        import glob
         
         try:
             buffer_dir = os.path.join(os.path.dirname(__file__), "overflow_buffer")
@@ -867,8 +866,6 @@ class AsyncMemoryProcessor:
             except Exception:
                 pass
         
-        import os
-        import glob
         try:
             buffer_dir = os.path.join(os.path.dirname(__file__), "overflow_buffer")
             if os.path.exists(buffer_dir):
@@ -1808,7 +1805,6 @@ class AsyncMemoryProcessor:
         - 非高密度内容
         - 非受保护记忆
         """
-        import time
         from metrics import get_metrics_collector
         
         if not self.sqlite:

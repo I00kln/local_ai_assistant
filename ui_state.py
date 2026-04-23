@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from contextlib import contextmanager
 from models import UIState
+from logger import get_logger
 
 
 @dataclass
@@ -41,11 +42,17 @@ class UIStateManager:
     - 后台任务状态显示
     - 状态历史记录
     - 异常自动恢复（上下文管理器）
+    
+    线程安全：
+    - 所有 UI 更新通过 window.after() 调度到主线程
+    - 支持从任意线程安全调用
     """
     
-    def __init__(self, status_label: tk.Label = None, memory_label: tk.Label = None):
+    def __init__(self, status_label: tk.Label = None, memory_label: tk.Label = None, window: tk.Tk = None):
+        self._log = get_logger()
         self.status_label = status_label
         self.memory_label = memory_label
+        self.window = window
         
         self._current_state = UIState.IDLE
         self._state_stack: List[UIState] = []
@@ -56,6 +63,27 @@ class UIStateManager:
         self._memory_count = 0
         self._l2_count = 0
         self._l3_count = 0
+    
+    def set_window(self, window: tk.Tk):
+        """设置窗口引用（用于线程安全 UI 更新）"""
+        self.window = window
+    
+    def _safe_ui_update(self, update_func: Callable):
+        """
+        安全的 UI 更新
+        
+        确保在主线程中执行 UI 操作
+        
+        Args:
+            update_func: UI 更新函数
+        """
+        if self.window:
+            try:
+                self.window.after(0, update_func)
+            except tk.TclError:
+                pass
+        else:
+            update_func()
     
     @property
     def current_state(self) -> UIState:
@@ -89,17 +117,42 @@ class UIStateManager:
         Args:
             state: 临时状态
             message: 状态消息
+        
+        安全机制：
+        - 最大栈深度限制为 10，防止无限 push
+        - 超过限制时自动丢弃最旧的状态
         """
+        MAX_STACK_DEPTH = 10
+        
+        if len(self._state_stack) >= MAX_STACK_DEPTH:
+            self._state_stack.pop(0)
+        
         self._state_stack.append(self._current_state)
         self.set_state(state, message)
     
     def pop_state(self):
-        """弹出状态，恢复之前的状态"""
+        """
+        弹出状态，恢复之前的状态
+        
+        安全机制：
+        - 如果栈为空，自动恢复到 IDLE 状态
+        """
         if self._state_stack:
             previous_state = self._state_stack.pop()
             self._current_state = previous_state
             status_text = self._get_status_text(previous_state)
             self._update_status_label(status_text)
+        else:
+            self.set_state(UIState.IDLE)
+    
+    def reset_state_stack(self):
+        """
+        重置状态栈
+        
+        清空所有压入的状态，恢复到 IDLE
+        """
+        self._state_stack.clear()
+        self.set_state(UIState.IDLE)
     
     @contextmanager
     def temp_state(self, state: UIState, message: str = None, on_error: str = None):
@@ -250,21 +303,27 @@ class UIStateManager:
         return f"状态: {base_text}"
     
     def _update_status_label(self, text: str):
-        """更新状态标签"""
-        if self.status_label:
-            try:
-                self.status_label.config(text=text)
-            except tk.TclError:
-                pass
+        """更新状态标签（线程安全）"""
+        def do_update():
+            if self.status_label:
+                try:
+                    self.status_label.config(text=text)
+                except tk.TclError:
+                    pass
+        
+        self._safe_ui_update(do_update)
     
     def _update_memory_label(self):
-        """更新记忆数量标签"""
-        if self.memory_label:
-            try:
-                total = self._l2_count + self._l3_count
-                self.memory_label.config(text=f"记忆数: L2={self._l2_count}, L3={self._l3_count}")
-            except tk.TclError:
-                pass
+        """更新记忆数量标签（线程安全）"""
+        def do_update():
+            if self.memory_label:
+                try:
+                    total = self._l2_count + self._l3_count
+                    self.memory_label.config(text=f"记忆数: L2={self._l2_count}, L3={self._l3_count}")
+                except tk.TclError:
+                    pass
+        
+        self._safe_ui_update(do_update)
     
     def _update_background_status(self):
         """更新后台任务状态"""
@@ -283,7 +342,9 @@ class UIStateManager:
                 try:
                     callback(data)
                 except Exception as e:
-                    print(f"回调执行失败: {e}")
+                    self._log.warning("CALLBACK_EXECUTION_FAILED",
+                                     event=event,
+                                     error=str(e))
     
     def get_full_status(self) -> Dict[str, Any]:
         """获取完整状态信息"""

@@ -3,6 +3,7 @@
 from typing import List, Dict, Tuple
 from config import config
 from memory_tags import MemoryConstants
+from logger import get_logger
 import re
 
 SHORT_QUERY_STOPWORDS = {
@@ -24,6 +25,7 @@ class ContextBuilder:
         self.l1_min_results = config.l1_min_results
         self.l2_default_threshold = config.similarity_threshold
         self.l2_lower_threshold = config.l2_lower_threshold
+        self._log = get_logger()
     
     def get_thresholds(self, mode: str = "local") -> Dict[str, float]:
         """
@@ -220,7 +222,10 @@ class ContextBuilder:
                 })
             return formatted_results
         except Exception as e:
-            print(f"L2搜索失败: {e}")
+            self._log.warning("L2_SEARCH_FALLBACK",
+                             error=str(e),
+                             query_preview=query[:50] if query else "",
+                             fallback="L3_FTS5")
             return []
     
     def _search_l3(self, query: str, threshold: float = 0.8) -> List[Dict]:
@@ -258,7 +263,9 @@ class ContextBuilder:
             
             return formatted_results
         except Exception as e:
-            print(f"L3搜索失败: {e}")
+            self._log.warning("L3_SEARCH_FAILED",
+                             error=str(e),
+                             query_preview=query[:50] if query else "")
             return []
     
     def _merge_results(self, existing: List[Dict], new_results: List[Dict]) -> List[Dict]:

@@ -2,6 +2,9 @@
 # Token估算工具函数
 
 from typing import Tuple
+from collections import OrderedDict
+import hashlib
+import threading
 
 _tiktoken_available = False
 _encoder = None
@@ -15,6 +18,10 @@ DEFAULT_MAX_TOKENS = {
     "default": 4096
 }
 
+_TOKEN_CACHE_MAX_SIZE = 500
+_token_cache: OrderedDict = OrderedDict()
+_token_cache_lock = threading.Lock()
+
 try:
     import tiktoken
     _tiktoken_available = True
@@ -23,7 +30,54 @@ except ImportError:
     pass
 
 
-def estimate_tokens(text: str, use_tiktoken: bool = True) -> int:
+def _get_cache_key(text: str) -> str:
+    """生成缓存键"""
+    return hashlib.md5(text.encode('utf-8')).hexdigest()
+
+
+def _cache_get(text: str) -> Tuple[bool, int]:
+    """
+    从缓存获取 token 数
+    
+    Returns:
+        (是否命中, token数)
+    """
+    key = _get_cache_key(text)
+    with _token_cache_lock:
+        if key in _token_cache:
+            _token_cache.move_to_end(key)
+            return True, _token_cache[key]
+    return False, 0
+
+
+def _cache_set(text: str, tokens: int):
+    """设置缓存"""
+    key = _get_cache_key(text)
+    with _token_cache_lock:
+        if key in _token_cache:
+            _token_cache.move_to_end(key)
+        else:
+            if len(_token_cache) >= _TOKEN_CACHE_MAX_SIZE:
+                _token_cache.popitem(last=False)
+            _token_cache[key] = tokens
+
+
+def clear_token_cache():
+    """清空 token 缓存"""
+    with _token_cache_lock:
+        _token_cache.clear()
+
+
+def get_token_cache_stats() -> dict:
+    """获取缓存统计"""
+    with _token_cache_lock:
+        return {
+            "size": len(_token_cache),
+            "max_size": _TOKEN_CACHE_MAX_SIZE
+        }
+
+
+def estimate_tokens(text: str, use_tiktoken: bool = True, use_cache: bool = True) -> int:
     """
     估算文本的token数量
     
@@ -36,6 +90,7 @@ def estimate_tokens(text: str, use_tiktoken: bool = True) -> int:
     Args:
         text: 输入文本
         use_tiktoken: 是否尝试使用tiktoken（默认True）
+        use_cache: 是否使用缓存（默认True）
     
     Returns:
         估算的token数量
@@ -43,13 +98,24 @@ def estimate_tokens(text: str, use_tiktoken: bool = True) -> int:
     if not text:
         return 0
     
+    if use_cache:
+        hit, cached_tokens = _cache_get(text)
+        if hit:
+            return cached_tokens
+    
     if use_tiktoken and _tiktoken_available and _encoder:
         try:
-            return len(_encoder.encode(text))
+            tokens = len(_encoder.encode(text))
+            if use_cache:
+                _cache_set(text, tokens)
+            return tokens
         except Exception:
             pass
     
-    return _estimate_tokens_fallback(text)
+    tokens = _estimate_tokens_fallback(text)
+    if use_cache:
+        _cache_set(text, tokens)
+    return tokens
 
 
 def estimate_tokens_with_limit(

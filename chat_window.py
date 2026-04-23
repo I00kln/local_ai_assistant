@@ -8,13 +8,14 @@ from typing import Optional, List, Dict, Any
 from config import config
 from models import UIState
 from ui_state import UIStateManager
-from logger import TraceContext, get_trace_id
+from logger import TraceContext, get_trace_id, get_logger
 
 
 class ChatWindow:
     """本地AI助理对话窗口 - 支持本地+云端混合模式"""
     
     def __init__(self):
+        self._log = get_logger()
         self.memory = None
         self.llm = None
         self.context_builder = None
@@ -32,7 +33,11 @@ class ChatWindow:
         
         self._setup_ui()
         
-        self.state_manager = UIStateManager(self.status_label, self.memory_count_label)
+        self.state_manager = UIStateManager(
+            self.status_label, 
+            self.memory_count_label, 
+            self.window
+        )
         self.state_manager.set_state(UIState.INITIALIZING, "正在初始化...")
         
         self.window.update()
@@ -231,17 +236,39 @@ class ChatWindow:
             self.async_processor = AsyncMemoryProcessor()
             self.async_processor.start()
             
+            self._check_llm_health()
+            
             self._init_cloud_client()
             
             self._initialized = True
             
             self._safe_after(0, self._enable_ui)
-            self._safe_after(0, self._check_connections)
             
         except Exception as e:
             err_msg = str(e)
             self._safe_after(0, lambda msg=err_msg: self._append_message("system", f"初始化失败: {msg}"))
             self._safe_after(0, lambda: self.state_manager.set_state(UIState.ERROR, "初始化失败"))
+    
+    def _check_llm_health(self):
+        """检查本地 LLM 服务健康状态"""
+        self._safe_after(0, lambda: self.state_manager.set_state(
+            UIState.INITIALIZING, "正在检查 LLM 服务..."
+        ))
+        
+        try:
+            llm_available = self.llm.check_connection()
+            if llm_available:
+                self._safe_after(0, lambda: self._append_message("system", "本地 LLM 服务连接成功"))
+            else:
+                self._safe_after(0, lambda: self._append_message(
+                    "system", 
+                    "⚠️ 本地 LLM 服务连接失败，请检查 llama.cpp 是否已启动"
+                ))
+                self._safe_after(0, lambda: self.local_btn.config(state=tk.DISABLED))
+        except Exception as e:
+            self._safe_after(0, lambda msg=str(e): self._append_message(
+                "system", f"⚠️ LLM 健康检查失败: {msg}"
+            ))
     
     def _init_cloud_client(self):
         """初始化云端客户端"""
@@ -783,72 +810,30 @@ class ChatWindow:
         """
         窗口关闭时的清理
         
-        清理顺序：
+        使用 LifecycleManager 集中管理资源释放：
         1. 设置关闭标志，阻止新请求
         2. 取消所有待执行的 UI 回调
-        3. 等待初始化线程完成（最多5秒）
-        4. 停止异步处理器
-        5. 停止事件总线
-        6. 停止自动归档
-        7. 保存记忆状态
-        8. 清理 MemoryManager 资源（SQLite 连接池）
-        9. 清理 VectorStore 资源（ONNX 模型会话）
-        10. 清理 EmbeddingService 资源
-        11. 清理 SQLite 资源
-        12. 销毁窗口
+        3. 调用 LifecycleManager.shutdown() 关闭所有服务
+        4. 销毁窗口
         """
         self._closing = True
         self._cancel_all_after()
         
         if hasattr(self, '_init_thread') and self._init_thread.is_alive():
-            self._init_thread.join(timeout=5)
-            if self._init_thread.is_alive():
-                print("[警告] 初始化线程未能在5秒内完成")
-        
-        if self.async_processor:
-            self.async_processor.stop()
+            self._init_thread.join(timeout=2)
         
         try:
-            from event_bus import get_event_bus
-            get_event_bus().shutdown()
+            from lifecycle_manager import get_lifecycle_manager
+            lifecycle = get_lifecycle_manager()
+            lifecycle.shutdown(timeout=8)
         except Exception as e:
-            print(f"清理 EventBus 失败: {e}")
-        
-        try:
-            from memory_archiver import get_archiver
-            archiver = get_archiver()
-            if archiver._running:
-                archiver.stop_auto_archive()
-        except Exception as e:
-            print(f"清理 MemoryArchiver 失败: {e}")
+            self._log.error("LIFECYCLE_SHUTDOWN_FAILED", error=str(e))
         
         if self.memory:
-            self.memory.save()
-            self.memory.cleanup_resources()
-        
-        try:
-            from vector_store import get_vector_store
-            vector_store = get_vector_store()
-            if vector_store:
-                vector_store.close()
-        except Exception as e:
-            print(f"清理 VectorStore 失败: {e}")
-        
-        try:
-            from embedding_service import get_embedding_service
-            embedding_service = get_embedding_service()
-            if hasattr(embedding_service, 'cleanup'):
-                embedding_service.cleanup()
-        except Exception as e:
-            print(f"清理 EmbeddingService 失败: {e}")
-        
-        try:
-            from sqlite_store import get_sqlite_store
-            sqlite_store = get_sqlite_store()
-            if sqlite_store:
-                sqlite_store.close()
-        except Exception as e:
-            print(f"清理 SQLite 失败: {e}")
+            try:
+                self.memory.save()
+            except Exception as e:
+                self._log.error("MEMORY_SAVE_FAILED", error=str(e))
         
         try:
             self.window.destroy()

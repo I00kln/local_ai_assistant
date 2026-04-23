@@ -1,7 +1,120 @@
 # config.py
 import os
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Any
+
+
+def _safe_int(value: str, default: int, name: str = "") -> int:
+    """
+    安全的整数类型转换
+    
+    Args:
+        value: 字符串值
+        default: 默认值
+        name: 配置名称（用于日志）
+    
+    Returns:
+        转换后的整数或默认值
+    """
+    try:
+        return int(value)
+    except (ValueError, TypeError) as e:
+        if name:
+            print(f"[配置警告] {name} 值 '{value}' 无法转换为整数，使用默认值 {default}")
+        return default
+
+
+def _safe_float(value: str, default: float, name: str = "") -> float:
+    """
+    安全的浮点数类型转换
+    
+    Args:
+        value: 字符串值
+        default: 默认值
+        name: 配置名称（用于日志）
+    
+    Returns:
+        转换后的浮点数或默认值
+    """
+    try:
+        return float(value)
+    except (ValueError, TypeError) as e:
+        if name:
+            print(f"[配置警告] {name} 值 '{value}' 无法转换为浮点数，使用默认值 {default}")
+        return default
+
+
+def _check_path_writable(path: str, name: str = "") -> bool:
+    """
+    检查路径是否可写
+    
+    Args:
+        path: 路径
+        name: 路径名称（用于日志）
+    
+    Returns:
+        是否可写
+    """
+    try:
+        if os.path.exists(path):
+            test_file = os.path.join(path, ".write_test")
+            with open(test_file, 'w') as f:
+                f.write("test")
+            os.remove(test_file)
+            return True
+        else:
+            parent = os.path.dirname(path)
+            if parent and not os.path.exists(parent):
+                os.makedirs(parent, exist_ok=True)
+            
+            os.makedirs(path, exist_ok=True)
+            test_file = os.path.join(path, ".write_test")
+            with open(test_file, 'w') as f:
+                f.write("test")
+            os.remove(test_file)
+            return True
+    except PermissionError:
+        if name:
+            print(f"[配置错误] {name} 路径 '{path}' 无写入权限")
+        return False
+    except Exception as e:
+        if name:
+            print(f"[配置警告] {name} 路径 '{path}' 检查失败: {e}")
+        return False
+
+
+def _check_file_path_writable(file_path: str, name: str = "") -> bool:
+    """
+    检查文件路径所在目录是否可写
+    
+    Args:
+        file_path: 文件路径
+        name: 路径名称（用于日志）
+    
+    Returns:
+        是否可写
+    """
+    try:
+        dir_path = os.path.dirname(file_path)
+        if not dir_path:
+            dir_path = "."
+        
+        if not os.path.exists(dir_path):
+            os.makedirs(dir_path, exist_ok=True)
+        
+        test_file = os.path.join(dir_path, ".write_test")
+        with open(test_file, 'w') as f:
+            f.write("test")
+        os.remove(test_file)
+        return True
+    except PermissionError:
+        if name:
+            print(f"[配置错误] {name} 文件路径 '{file_path}' 所在目录无写入权限")
+        return False
+    except Exception as e:
+        if name:
+            print(f"[配置警告] {name} 文件路径 '{file_path}' 检查失败: {e}")
+        return False
 
 
 @dataclass
@@ -266,14 +379,32 @@ class Config:
         self._load_nonsense_filter_config()
         self._load_high_density_config()
         self._load_context_config()
+        self._validate_critical_paths()
+    
+    def _validate_critical_paths(self):
+        """预校验关键路径的写入权限"""
+        self._path_validation_results = {}
+        
+        chroma_dir = self.vector_store.chroma_persist_dir
+        self._path_validation_results["chroma_db"] = _check_path_writable(chroma_dir, "ChromaDB")
+        
+        db_path = self.sqlite_store.db_path
+        self._path_validation_results["sqlite_db"] = _check_file_path_writable(db_path, "SQLite")
+        
+        nonsense_db = self.nonsense_filter.db_path
+        self._path_validation_results["nonsense_db"] = _check_file_path_writable(nonsense_db, "废话过滤库")
+    
+    def get_path_validation_results(self) -> dict:
+        """获取路径校验结果"""
+        return getattr(self, '_path_validation_results', {})
     
     def _load_local_config(self):
         """加载本地AI配置"""
         self.local.enabled = os.environ.get("LOCAL_ENABLED", "true").lower() == "true"
         self.local.api_url = os.environ.get("LOCAL_API_URL", "http://localhost:8080/completion")
-        self.local.max_context = int(os.environ.get("LOCAL_MAX_CONTEXT", "8192"))
-        self.local.temperature = float(os.environ.get("LOCAL_TEMPERATURE", "0.7"))
-        self.local.max_output_tokens = int(os.environ.get("LOCAL_MAX_OUTPUT_TOKENS", "3000"))
+        self.local.max_context = _safe_int(os.environ.get("LOCAL_MAX_CONTEXT", "8192"), 8192, "LOCAL_MAX_CONTEXT")
+        self.local.temperature = _safe_float(os.environ.get("LOCAL_TEMPERATURE", "0.7"), 0.7, "LOCAL_TEMPERATURE")
+        self.local.max_output_tokens = _safe_int(os.environ.get("LOCAL_MAX_OUTPUT_TOKENS", "3000"), 3000, "LOCAL_MAX_OUTPUT_TOKENS")
     
     def _load_cloud_config(self):
         """加载云端AI配置"""
@@ -290,8 +421,8 @@ class Config:
                 api_key=openai_key,
                 model=os.environ.get("OPENAI_MODEL", "gpt-4o-mini"),
                 base_url=os.environ.get("OPENAI_BASE_URL"),
-                max_context=int(os.environ.get("CLOUD_MAX_CONTEXT", "100000")),
-                max_retrieve_results=int(os.environ.get("CLOUD_MAX_RETRIEVE_RESULTS", "20"))
+                max_context=_safe_int(os.environ.get("CLOUD_MAX_CONTEXT", "100000"), 100000, "CLOUD_MAX_CONTEXT"),
+                max_retrieve_results=_safe_int(os.environ.get("CLOUD_MAX_RETRIEVE_RESULTS", "20"), 20, "CLOUD_MAX_RETRIEVE_RESULTS")
             )
             if not openai_key:
                 print("[配置] 警告: CLOUD_PROVIDER=openai 但 OPENAI_API_KEY 为空")
@@ -302,8 +433,8 @@ class Config:
                 api_key=gemini_key,
                 model=os.environ.get("GEMINI_MODEL", "gemini-2.5-flash"),
                 base_url=os.environ.get("GEMINI_BASE_URL"),
-                max_context=int(os.environ.get("CLOUD_MAX_CONTEXT", "100000")),
-                max_retrieve_results=int(os.environ.get("CLOUD_MAX_RETRIEVE_RESULTS", "20"))
+                max_context=_safe_int(os.environ.get("CLOUD_MAX_CONTEXT", "100000"), 100000, "CLOUD_MAX_CONTEXT"),
+                max_retrieve_results=_safe_int(os.environ.get("CLOUD_MAX_RETRIEVE_RESULTS", "20"), 20, "CLOUD_MAX_RETRIEVE_RESULTS")
             )
             if not gemini_key:
                 print("[配置] 警告: CLOUD_PROVIDER=gemini 但 GEMINI_API_KEY 为空")
@@ -314,8 +445,8 @@ class Config:
                 api_key=glm_key,
                 model=os.environ.get("GLM_MODEL", "glm-4-flash"),
                 base_url=os.environ.get("GLM_BASE_URL"),
-                max_context=int(os.environ.get("CLOUD_MAX_CONTEXT", "128000")),
-                max_retrieve_results=int(os.environ.get("CLOUD_MAX_RETRIEVE_RESULTS", "20"))
+                max_context=_safe_int(os.environ.get("CLOUD_MAX_CONTEXT", "128000"), 128000, "CLOUD_MAX_CONTEXT"),
+                max_retrieve_results=_safe_int(os.environ.get("CLOUD_MAX_RETRIEVE_RESULTS", "20"), 20, "CLOUD_MAX_RETRIEVE_RESULTS")
             )
             if not glm_key:
                 print("[配置] 警告: CLOUD_PROVIDER=glm 但 GLM_API_KEY 为空")
@@ -324,38 +455,38 @@ class Config:
     
     def _load_async_config(self):
         """加载异步处理器配置"""
-        self.async_processor.dedup_interval = int(os.environ.get("MEMORY_DEDUP_INTERVAL", "300"))
-        self.async_processor.compression_interval = int(os.environ.get("MEMORY_COMPRESSION_INTERVAL", "600"))
-        self.async_processor.forget_interval = int(os.environ.get("MEMORY_FORGET_INTERVAL", "3600"))
-        self.async_processor.flush_interval = int(os.environ.get("MEMORY_FLUSH_INTERVAL", "30"))
-        self.async_processor.max_buffer_age = int(os.environ.get("MEMORY_MAX_BUFFER_AGE", "60"))
-        self.async_processor.batch_size = int(os.environ.get("BATCH_UPDATE_SIZE", "5"))
-        self.async_processor.max_pending_compressions = int(os.environ.get("MAX_PENDING_COMPRESSIONS", "50"))
-        self.async_processor.compressor_check_interval = int(os.environ.get("COMPRESSOR_CHECK_INTERVAL", "300"))
-        self.async_processor.compressor_failure_threshold = int(os.environ.get("COMPRESSOR_FAILURE_THRESHOLD", "5"))
-        self.async_processor.max_queue_size = int(os.environ.get("MAX_QUEUE_SIZE", "1000"))
+        self.async_processor.dedup_interval = _safe_int(os.environ.get("MEMORY_DEDUP_INTERVAL", "300"), 300, "MEMORY_DEDUP_INTERVAL")
+        self.async_processor.compression_interval = _safe_int(os.environ.get("MEMORY_COMPRESSION_INTERVAL", "600"), 600, "MEMORY_COMPRESSION_INTERVAL")
+        self.async_processor.forget_interval = _safe_int(os.environ.get("MEMORY_FORGET_INTERVAL", "3600"), 3600, "MEMORY_FORGET_INTERVAL")
+        self.async_processor.flush_interval = _safe_int(os.environ.get("MEMORY_FLUSH_INTERVAL", "30"), 30, "MEMORY_FLUSH_INTERVAL")
+        self.async_processor.max_buffer_age = _safe_int(os.environ.get("MEMORY_MAX_BUFFER_AGE", "60"), 60, "MEMORY_MAX_BUFFER_AGE")
+        self.async_processor.batch_size = _safe_int(os.environ.get("BATCH_UPDATE_SIZE", "5"), 5, "BATCH_UPDATE_SIZE")
+        self.async_processor.max_pending_compressions = _safe_int(os.environ.get("MAX_PENDING_COMPRESSIONS", "50"), 50, "MAX_PENDING_COMPRESSIONS")
+        self.async_processor.compressor_check_interval = _safe_int(os.environ.get("COMPRESSOR_CHECK_INTERVAL", "300"), 300, "COMPRESSOR_CHECK_INTERVAL")
+        self.async_processor.compressor_failure_threshold = _safe_int(os.environ.get("COMPRESSOR_FAILURE_THRESHOLD", "5"), 5, "COMPRESSOR_FAILURE_THRESHOLD")
+        self.async_processor.max_queue_size = _safe_int(os.environ.get("MAX_QUEUE_SIZE", "1000"), 1000, "MAX_QUEUE_SIZE")
         self.async_processor.queue_full_action = os.environ.get("QUEUE_FULL_ACTION", "drop_oldest")
-        self.async_processor.llm_timeout = int(os.environ.get("LLM_TIMEOUT", "30"))
-        self.async_processor.circuit_breaker_threshold = int(os.environ.get("CIRCUIT_BREAKER_THRESHOLD", "5"))
-        self.async_processor.circuit_breaker_reset_timeout = int(os.environ.get("CIRCUIT_BREAKER_RESET_TIMEOUT", "300"))
-        self.async_processor.dedup_batch_size = int(os.environ.get("DEDUP_BATCH_SIZE", "500"))
-        self.async_processor.dedup_max_records = int(os.environ.get("DEDUP_MAX_RECORDS", "1000"))
-        self.async_processor.orphan_cleanup_batch_size = int(os.environ.get("ORPHAN_CLEANUP_BATCH_SIZE", "100"))
-        self.async_processor.orphan_cleanup_interval = float(os.environ.get("ORPHAN_CLEANUP_INTERVAL", "0.1"))
+        self.async_processor.llm_timeout = _safe_int(os.environ.get("LLM_TIMEOUT", "30"), 30, "LLM_TIMEOUT")
+        self.async_processor.circuit_breaker_threshold = _safe_int(os.environ.get("CIRCUIT_BREAKER_THRESHOLD", "5"), 5, "CIRCUIT_BREAKER_THRESHOLD")
+        self.async_processor.circuit_breaker_reset_timeout = _safe_int(os.environ.get("CIRCUIT_BREAKER_RESET_TIMEOUT", "300"), 300, "CIRCUIT_BREAKER_RESET_TIMEOUT")
+        self.async_processor.dedup_batch_size = _safe_int(os.environ.get("DEDUP_BATCH_SIZE", "500"), 500, "DEDUP_BATCH_SIZE")
+        self.async_processor.dedup_max_records = _safe_int(os.environ.get("DEDUP_MAX_RECORDS", "1000"), 1000, "DEDUP_MAX_RECORDS")
+        self.async_processor.orphan_cleanup_batch_size = _safe_int(os.environ.get("ORPHAN_CLEANUP_BATCH_SIZE", "100"), 100, "ORPHAN_CLEANUP_BATCH_SIZE")
+        self.async_processor.orphan_cleanup_interval = _safe_float(os.environ.get("ORPHAN_CLEANUP_INTERVAL", "0.1"), 0.1, "ORPHAN_CLEANUP_INTERVAL")
     
     def _load_flow_config(self):
         """加载记忆流动配置"""
-        self.memory_flow.cooldown_hours = int(os.environ.get("MEMORY_FLOW_COOLDOWN_HOURS", "24"))
-        self.memory_flow.l2_move_threshold_multiplier = float(os.environ.get("L2_MOVE_THRESHOLD_MULTIPLIER", "2.0"))
-        self.memory_flow.l3_promotion_weight_threshold = float(os.environ.get("L3_PROMOTION_WEIGHT_THRESHOLD", "0.8"))
-        self.memory_flow.max_l2_to_l3_batch = int(os.environ.get("MAX_L2_TO_L3_BATCH", "20"))
-        self.memory_flow.max_l3_to_l2_batch = int(os.environ.get("MAX_L3_TO_L2_BATCH", "10"))
+        self.memory_flow.cooldown_hours = _safe_int(os.environ.get("MEMORY_FLOW_COOLDOWN_HOURS", "24"), 24, "MEMORY_FLOW_COOLDOWN_HOURS")
+        self.memory_flow.l2_move_threshold_multiplier = _safe_float(os.environ.get("L2_MOVE_THRESHOLD_MULTIPLIER", "2.0"), 2.0, "L2_MOVE_THRESHOLD_MULTIPLIER")
+        self.memory_flow.l3_promotion_weight_threshold = _safe_float(os.environ.get("L3_PROMOTION_WEIGHT_THRESHOLD", "0.8"), 0.8, "L3_PROMOTION_WEIGHT_THRESHOLD")
+        self.memory_flow.max_l2_to_l3_batch = _safe_int(os.environ.get("MAX_L2_TO_L3_BATCH", "20"), 20, "MAX_L2_TO_L3_BATCH")
+        self.memory_flow.max_l3_to_l2_batch = _safe_int(os.environ.get("MAX_L3_TO_L2_BATCH", "10"), 10, "MAX_L3_TO_L2_BATCH")
     
     def _load_compression_config(self):
         """加载压缩配置"""
-        self.compression.min_length = int(os.environ.get("COMPRESSION_MIN_LENGTH", "100"))
-        self.compression.target_ratio = float(os.environ.get("COMPRESSION_TARGET_RATIO", "0.6"))
-        self.compression.max_segment_length = int(os.environ.get("COMPRESSION_MAX_SEGMENT_LENGTH", "2000"))
+        self.compression.min_length = _safe_int(os.environ.get("COMPRESSION_MIN_LENGTH", "100"), 100, "COMPRESSION_MIN_LENGTH")
+        self.compression.target_ratio = _safe_float(os.environ.get("COMPRESSION_TARGET_RATIO", "0.6"), 0.6, "COMPRESSION_TARGET_RATIO")
+        self.compression.max_segment_length = _safe_int(os.environ.get("COMPRESSION_MAX_SEGMENT_LENGTH", "2000"), 2000, "COMPRESSION_MAX_SEGMENT_LENGTH")
         self.compression.fallback_enabled = os.environ.get("COMPRESSION_FALLBACK_ENABLED", "true").lower() == "true"
         self.compression.key_patterns = os.environ.get("COMPRESSION_KEY_PATTERNS", 
             r'\d+|[A-Z][a-z]+|设置|配置|修改|添加|删除|创建|因为|所以|如果|那么|但是')
@@ -368,49 +499,49 @@ class Config:
         self.privacy.log_sensitive_detection = os.environ.get("LOG_SENSITIVE_DETECTION", "false").lower() == "true"
         self.privacy.https_only = os.environ.get("HTTPS_ONLY", "true").lower() == "true"
         self.privacy.verify_ssl = os.environ.get("VERIFY_SSL", "true").lower() == "true"
-        self.privacy.api_key_min_length = int(os.environ.get("API_KEY_MIN_LENGTH", "20"))
+        self.privacy.api_key_min_length = _safe_int(os.environ.get("API_KEY_MIN_LENGTH", "20"), 20, "API_KEY_MIN_LENGTH")
         self.privacy.mask_in_logs = os.environ.get("MASK_IN_LOGS", "true").lower() == "true"
     
     def _load_sqlite_pool_config(self):
         """加载SQLite连接池配置"""
-        self.sqlite_pool.max_pool_size = int(os.environ.get("SQLITE_MAX_POOL_SIZE", "10"))
-        self.sqlite_pool.connection_timeout = int(os.environ.get("SQLITE_CONNECTION_TIMEOUT", "3600"))
-        self.sqlite_pool.cleanup_interval = int(os.environ.get("SQLITE_CLEANUP_INTERVAL", "300"))
-        self.sqlite_pool.busy_timeout = int(os.environ.get("SQLITE_BUSY_TIMEOUT", "30000"))
-        self.sqlite_pool.cache_size = int(os.environ.get("SQLITE_CACHE_SIZE", "-64000"))
+        self.sqlite_pool.max_pool_size = _safe_int(os.environ.get("SQLITE_MAX_POOL_SIZE", "10"), 10, "SQLITE_MAX_POOL_SIZE")
+        self.sqlite_pool.connection_timeout = _safe_int(os.environ.get("SQLITE_CONNECTION_TIMEOUT", "3600"), 3600, "SQLITE_CONNECTION_TIMEOUT")
+        self.sqlite_pool.cleanup_interval = _safe_int(os.environ.get("SQLITE_CLEANUP_INTERVAL", "300"), 300, "SQLITE_CLEANUP_INTERVAL")
+        self.sqlite_pool.busy_timeout = _safe_int(os.environ.get("SQLITE_BUSY_TIMEOUT", "30000"), 30000, "SQLITE_BUSY_TIMEOUT")
+        self.sqlite_pool.cache_size = _safe_int(os.environ.get("SQLITE_CACHE_SIZE", "-64000"), -64000, "SQLITE_CACHE_SIZE")
     
     def _load_decay_config(self):
         """加载权重衰减配置"""
-        self.decay.batch_size = int(os.environ.get("DECAY_BATCH_SIZE", "1000"))
-        self.decay.decay_rate = float(os.environ.get("MEMORY_WEIGHT_DECAY", "0.95"))
-        self.decay.min_weight_threshold = float(os.environ.get("MEMORY_MIN_WEIGHT", "0.3"))
-        self.decay.max_weight = float(os.environ.get("MEMORY_MAX_WEIGHT", "5.0"))
-        self.decay.weight_boost_on_access = float(os.environ.get("MEMORY_WEIGHT_BOOST", "1.2"))
-        self.decay.forget_age_days = int(os.environ.get("MEMORY_DECAY_DAYS", "30"))
+        self.decay.batch_size = _safe_int(os.environ.get("DECAY_BATCH_SIZE", "1000"), 1000, "DECAY_BATCH_SIZE")
+        self.decay.decay_rate = _safe_float(os.environ.get("MEMORY_WEIGHT_DECAY", "0.95"), 0.95, "MEMORY_WEIGHT_DECAY")
+        self.decay.min_weight_threshold = _safe_float(os.environ.get("MEMORY_MIN_WEIGHT", "0.3"), 0.3, "MEMORY_MIN_WEIGHT")
+        self.decay.max_weight = _safe_float(os.environ.get("MEMORY_MAX_WEIGHT", "5.0"), 5.0, "MEMORY_MAX_WEIGHT")
+        self.decay.weight_boost_on_access = _safe_float(os.environ.get("MEMORY_WEIGHT_BOOST", "1.2"), 1.2, "MEMORY_WEIGHT_BOOST")
+        self.decay.forget_age_days = _safe_int(os.environ.get("MEMORY_DECAY_DAYS", "30"), 30, "MEMORY_DECAY_DAYS")
     
     def _load_retrieval_config(self):
         """加载检索配置"""
-        self.retrieval.max_retrieve_results = int(os.environ.get("MAX_RETRIEVE_RESULTS", "5"))
-        self.retrieval.similarity_threshold = float(os.environ.get("SIMILARITY_THRESHOLD", "0.90"))
-        self.retrieval.l1_min_results = int(os.environ.get("L1_MIN_RESULTS", "2"))
-        self.retrieval.l2_lower_threshold = float(os.environ.get("L2_LOWER_THRESHOLD", "0.80"))
-        self.retrieval.cloud_l1_threshold = float(os.environ.get("CLOUD_L1_THRESHOLD", "0.70"))
-        self.retrieval.cloud_l2_threshold = float(os.environ.get("CLOUD_L2_THRESHOLD", "0.75"))
-        self.retrieval.cloud_l3_threshold = float(os.environ.get("CLOUD_L3_THRESHOLD", "0.70"))
-        self.retrieval.local_l1_threshold = float(os.environ.get("LOCAL_L1_THRESHOLD", "0.75"))
-        self.retrieval.local_l2_threshold = float(os.environ.get("LOCAL_L2_THRESHOLD", "0.80"))
-        self.retrieval.local_l3_threshold = float(os.environ.get("LOCAL_L3_THRESHOLD", "0.75"))
-        self.retrieval.source_weight_l1 = float(os.environ.get("SOURCE_WEIGHT_L1", "1.2"))
-        self.retrieval.source_weight_l2 = float(os.environ.get("SOURCE_WEIGHT_L2", "1.0"))
-        self.retrieval.source_weight_l3 = float(os.environ.get("SOURCE_WEIGHT_L3", "0.8"))
-        self.retrieval.diversity_threshold = float(os.environ.get("DIVERSITY_THRESHOLD", "0.95"))
-        self.retrieval.recall_multiplier = int(os.environ.get("RECALL_MULTIPLIER", "3"))
-        self.retrieval.high_quality_threshold = float(os.environ.get("HIGH_QUALITY_THRESHOLD", "0.95"))
+        self.retrieval.max_retrieve_results = _safe_int(os.environ.get("MAX_RETRIEVE_RESULTS", "5"), 5, "MAX_RETRIEVE_RESULTS")
+        self.retrieval.similarity_threshold = _safe_float(os.environ.get("SIMILARITY_THRESHOLD", "0.90"), 0.90, "SIMILARITY_THRESHOLD")
+        self.retrieval.l1_min_results = _safe_int(os.environ.get("L1_MIN_RESULTS", "2"), 2, "L1_MIN_RESULTS")
+        self.retrieval.l2_lower_threshold = _safe_float(os.environ.get("L2_LOWER_THRESHOLD", "0.80"), 0.80, "L2_LOWER_THRESHOLD")
+        self.retrieval.cloud_l1_threshold = _safe_float(os.environ.get("CLOUD_L1_THRESHOLD", "0.70"), 0.70, "CLOUD_L1_THRESHOLD")
+        self.retrieval.cloud_l2_threshold = _safe_float(os.environ.get("CLOUD_L2_THRESHOLD", "0.75"), 0.75, "CLOUD_L2_THRESHOLD")
+        self.retrieval.cloud_l3_threshold = _safe_float(os.environ.get("CLOUD_L3_THRESHOLD", "0.70"), 0.70, "CLOUD_L3_THRESHOLD")
+        self.retrieval.local_l1_threshold = _safe_float(os.environ.get("LOCAL_L1_THRESHOLD", "0.75"), 0.75, "LOCAL_L1_THRESHOLD")
+        self.retrieval.local_l2_threshold = _safe_float(os.environ.get("LOCAL_L2_THRESHOLD", "0.80"), 0.80, "LOCAL_L2_THRESHOLD")
+        self.retrieval.local_l3_threshold = _safe_float(os.environ.get("LOCAL_L3_THRESHOLD", "0.75"), 0.75, "LOCAL_L3_THRESHOLD")
+        self.retrieval.source_weight_l1 = _safe_float(os.environ.get("SOURCE_WEIGHT_L1", "1.2"), 1.2, "SOURCE_WEIGHT_L1")
+        self.retrieval.source_weight_l2 = _safe_float(os.environ.get("SOURCE_WEIGHT_L2", "1.0"), 1.0, "SOURCE_WEIGHT_L2")
+        self.retrieval.source_weight_l3 = _safe_float(os.environ.get("SOURCE_WEIGHT_L3", "0.8"), 0.8, "SOURCE_WEIGHT_L3")
+        self.retrieval.diversity_threshold = _safe_float(os.environ.get("DIVERSITY_THRESHOLD", "0.95"), 0.95, "DIVERSITY_THRESHOLD")
+        self.retrieval.recall_multiplier = _safe_int(os.environ.get("RECALL_MULTIPLIER", "3"), 3, "RECALL_MULTIPLIER")
+        self.retrieval.high_quality_threshold = _safe_float(os.environ.get("HIGH_QUALITY_THRESHOLD", "0.95"), 0.95, "HIGH_QUALITY_THRESHOLD")
     
     def _load_vector_store_config(self):
         """加载向量存储配置"""
         self.vector_store.onnx_model_path = os.environ.get("ONNX_MODEL_PATH", "models/bge_onnx_model")
-        self.vector_store.embedding_dimension = int(os.environ.get("EMBEDDING_DIMENSION", "512"))
+        self.vector_store.embedding_dimension = _safe_int(os.environ.get("EMBEDDING_DIMENSION", "512"), 512, "EMBEDDING_DIMENSION")
         self.vector_store.chroma_persist_dir = os.environ.get("CHROMA_PERSIST_DIR", "chroma_db")
         self.vector_store.chroma_collection_name = os.environ.get("CHROMA_COLLECTION_NAME", "memories")
     
@@ -428,12 +559,12 @@ class Config:
         """加载高密度内容配置"""
         self.high_density.patterns = os.environ.get("HIGH_DENSITY_PATTERNS", 
             "流程图|时序图|架构图|状态机|数据流|ER图|类图|部署图|网络拓扑|API接口|数据库设计|系统设计|技术方案")
-        self.high_density.preserve_ratio = float(os.environ.get("HIGH_DENSITY_PRESERVE_RATIO", "1.0"))
+        self.high_density.preserve_ratio = _safe_float(os.environ.get("HIGH_DENSITY_PRESERVE_RATIO", "1.0"), 1.0, "HIGH_DENSITY_PRESERVE_RATIO")
     
     def _load_context_config(self):
         """加载上下文构建配置"""
-        self.context.max_memory_tokens = int(os.environ.get("MAX_MEMORY_TOKENS", "5000"))
-        self.context.system_prompt_reserve = int(os.environ.get("SYSTEM_PROMPT_RESERVE", "200"))
+        self.context.max_memory_tokens = _safe_int(os.environ.get("MAX_MEMORY_TOKENS", "5000"), 5000, "MAX_MEMORY_TOKENS")
+        self.context.system_prompt_reserve = _safe_int(os.environ.get("SYSTEM_PROMPT_RESERVE", "200"), 200, "SYSTEM_PROMPT_RESERVE")
     
     @property
     def max_retrieve_results(self) -> int:

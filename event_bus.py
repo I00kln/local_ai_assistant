@@ -87,6 +87,24 @@ class EventBus:
             name="EventBusWorker"
         )
         self._worker_thread.start()
+        
+        self._register_lifecycle()
+    
+    def _register_lifecycle(self):
+        """注册到生命周期管理器"""
+        try:
+            from lifecycle_manager import get_lifecycle_manager, ServicePriority
+            lifecycle = get_lifecycle_manager()
+            lifecycle.register(
+                name="event_bus",
+                cleanup_fn=self.shutdown,
+                priority=ServicePriority.HIGH,
+                timeout=2.0,
+                is_running=lambda: self._running,
+                stop_fn=lambda: setattr(self, '_running', False)
+            )
+        except Exception:
+            pass
     
     def _process_loop(self):
         """后台线程处理异步事件队列"""

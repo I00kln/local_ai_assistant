@@ -26,6 +26,7 @@
 import threading
 import re
 import json
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple, Any
@@ -277,13 +278,36 @@ class MemoryMerger:
         """
         检测语义冲突
         
-        检测否定词对：
-        - "不喜欢" vs "喜欢"
-        - "没去" vs "去"
-        - "不是" vs "是"
+        检测类型：
+        1. 否定词对： "不喜欢" vs "喜欢"
+        2. 语义相似但内容不同： "我喜欢苹果手机" vs "我喜欢吃苹果"
+        3. 同主体不同属性： "明天去北京出差" vs "明天去北京旅游"
         
         Returns:
             冲突描述，无冲突返回空字符串
+        """
+        if len(texts) < 2:
+            return ""
+        
+        conflict = self._detect_negation_conflicts(texts)
+        if conflict:
+            return conflict
+        
+        conflict = self._detect_context_conflicts(texts)
+        if conflict:
+            return conflict
+        
+        conflict = self._detect_subject_attribute_conflicts(texts)
+        if conflict:
+            return conflict
+        
+        return ""
+    
+    def _detect_negation_conflicts(self, texts: List[str]) -> str:
+        """
+        检测否定词对冲突
+        
+        例如： "不喜欢" vs "喜欢", "没去" vs "去"
         """
         NEGATION_PAIRS = [
             (r"不(.{1,4})", r"\1"),
@@ -309,6 +333,205 @@ class MemoryMerger:
                 return f"语义冲突: 否定词对 [{', '.join(conflict_words)}]"
         
         return ""
+    
+    def _detect_context_conflicts(self, texts: List[str]) -> str:
+        """
+        检测语义相似但上下文不同的冲突
+        
+        例如：
+        - "我喜欢苹果手机" vs "我喜欢吃苹果" (苹果：手机 vs 水果)
+        - "Python很好用" vs "蟒蛇很好用" (Python：编程语言 vs 动物)
+        """
+        CONTEXT_CONFLICT_PATTERNS = [
+            {
+                "keyword": "苹果",
+                "contexts": ["手机", "电脑", "公司", "水果", "吃", "买"],
+                "conflict_groups": [
+                    (["手机", "电脑", "公司"], ["水果", "吃"]),
+                ]
+            },
+            {
+                "keyword": "Python",
+                "contexts": ["编程", "代码", "语言", "蟒蛇", "动物"],
+                "conflict_groups": [
+                    (["编程", "代码", "语言"], ["蟒蛇", "动物"]),
+                ]
+            },
+            {
+                "keyword": "Java",
+                "contexts": ["编程", "代码", "语言", "咖啡", "岛"],
+                "conflict_groups": [
+                    (["编程", "代码", "语言"], ["咖啡", "岛"]),
+                ]
+            },
+        ]
+        
+        for pattern in CONTEXT_CONFLICT_PATTERNS:
+            keyword = pattern["keyword"]
+            if not any(keyword in text for text in texts):
+                continue
+            
+            detected_contexts = set()
+            for text in texts:
+                if keyword in text:
+                    for ctx in pattern["contexts"]:
+                        if ctx in text:
+                            detected_contexts.add(ctx)
+            
+            for group1, group2 in pattern["conflict_groups"]:
+                has_group1 = any(ctx in detected_contexts for ctx in group1)
+                has_group2 = any(ctx in detected_contexts for ctx in group2)
+                
+                if has_group1 and has_group2:
+                    return f"语义冲突: '{keyword}' 存在歧义上下文 [{', '.join(detected_contexts)}]"
+        
+        return ""
+    
+    def _detect_subject_attribute_conflicts(self, texts: List[str]) -> str:
+        """
+        检测同主体不同属性的冲突
+        
+        例如：
+        - "明天去北京出差" vs "明天去北京旅游" (目的不同)
+        - "买了红色的车" vs "买了黑色的车" (颜色不同)
+        """
+        ATTRIBUTE_CONFLICT_PATTERNS = [
+            {
+                "subject_pattern": r"(明天|后天|下周|这周).*(去|到|在)(北京|上海|广州|深圳)",
+                "attribute_patterns": [r"出差", r"旅游", r"开会", r"探亲"],
+                "name": "行程目的"
+            },
+            {
+                "subject_pattern": r"(买|买了|订购).*(车|手机|电脑)",
+                "attribute_patterns": [r"红", r"黑", r"白", r"蓝", r"银"],
+                "name": "商品颜色"
+            },
+            {
+                "subject_pattern": r"(工资|收入|月薪)",
+                "attribute_patterns": [r"\d+万", r"\d+千", r"\d+块"],
+                "name": "金额数值"
+            },
+        ]
+        
+        for pattern in ATTRIBUTE_CONFLICT_PATTERNS:
+            subject_re = re.compile(pattern["subject_pattern"])
+            attribute_res = [re.compile(p) for p in pattern["attribute_patterns"]]
+            
+            matched_texts = [t for t in texts if subject_re.search(t)]
+            
+            if len(matched_texts) < 2:
+                continue
+            
+            detected_attributes = set()
+            for text in matched_texts:
+                for attr_re in attribute_res:
+                    match = attr_re.search(text)
+                    if match:
+                        detected_attributes.add(match.group())
+            
+            if len(detected_attributes) > 1:
+                return f"属性冲突: {pattern['name']} [{', '.join(detected_attributes)}]"
+        
+        return ""
+    
+    def detect_conflict_with_llm(
+        self,
+        new_record: str,
+        old_record: str,
+        llm_client
+    ) -> Dict[str, Any]:
+        """
+        使用 LLM 进行深度冲突检测
+        
+        Args:
+            new_record: 新记忆
+            old_record: 旧记忆
+            llm_client: LLM 客户端
+        
+        Returns:
+            {
+                "has_conflict": bool,
+                "action": "Update|Correct|Coexist|None",
+                "reason": str
+            }
+        """
+        import re
+        
+        try:
+            from prompts import get_prompt_manager
+            
+            prompt_manager = get_prompt_manager()
+            messages = prompt_manager.get_conflict_prompt(new_record, old_record)
+            
+            response = llm_client.chat(messages, max_tokens=200)
+            
+            json_match = re.search(r'\{[\s\S]*\}', response)
+            if json_match:
+                result = json.loads(json_match.group())
+                return {
+                    "has_conflict": result.get("has_conflict", False),
+                    "action": result.get("action", "None"),
+                    "reason": result.get("reason", "")
+                }
+        except Exception as e:
+            self._log.warning("LLM_CONFLICT_DETECTION_FAILED", error=str(e))
+        
+        return {
+            "has_conflict": False,
+            "action": "None",
+            "reason": "LLM 冲突检测失败"
+        }
+    
+    def resolve_conflict(
+        self,
+        conflict_result: Dict[str, Any],
+        new_record: Dict,
+        old_records: List[Dict]
+    ) -> Dict[str, Any]:
+        """
+        解决冲突
+        
+        Args:
+            conflict_result: LLM 冲突检测结果
+            new_record: 新记忆
+            old_records: 旧记忆列表
+        
+        Returns:
+            解决方案
+        """
+        action = conflict_result.get("action", "None")
+        
+        if action == "Update":
+            return {
+                "action": "update",
+                "keep": new_record,
+                "remove": old_records,
+                "reason": conflict_result.get("reason", "新信息更可靠")
+            }
+        
+        elif action == "Correct":
+            return {
+                "action": "correct",
+                "keep": new_record,
+                "remove": old_records,
+                "reason": conflict_result.get("reason", "旧信息是误导")
+            }
+        
+        elif action == "Coexist":
+            return {
+                "action": "coexist",
+                "keep": [new_record] + old_records,
+                "remove": [],
+                "reason": conflict_result.get("reason", "两者是状态演进")
+            }
+        
+        else:
+            return {
+                "action": "none",
+                "keep": [new_record] + old_records,
+                "remove": [],
+                "reason": "无冲突或无法判断"
+            }
     
     def should_trigger_merge(
         self, 
@@ -783,7 +1006,12 @@ class MemoryMerger:
             if MemoryTags.SEMANTIC_TAG in metadata:
                 try:
                     from tag_classifier import MemoryTag
-                    tag = MemoryTag.from_dict(metadata[MemoryTags.SEMANTIC_TAG])
+                    tag_data = metadata[MemoryTags.SEMANTIC_TAG]
+                    
+                    if isinstance(tag_data, str):
+                        tag_data = json.loads(tag_data)
+                    
+                    tag = MemoryTag.from_dict(tag_data)
                     semantic_tags_to_merge.append(tag)
                 except Exception:
                     pass
@@ -903,7 +1131,6 @@ class MemoryMerger:
         Returns:
             合并结果
         """
-        import time
         
         current_time = time.time()
         interval_seconds = self.config.merge_interval_hours * 3600

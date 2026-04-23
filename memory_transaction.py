@@ -313,12 +313,11 @@ class TransactionCoordinator:
             timeout: 超时时间（秒）
         
         Returns:
-            是否成功获取锁
+            是否成功获取锁（迁移是否完成）
         """
         if self._scheduler:
-            lock_context = self._scheduler.read_lock(timeout=timeout)
-            lock_context.__enter__()
-            return lock_context.is_locked()
+            with self._scheduler.read_lock(timeout=timeout) as lock_context:
+                return lock_context.is_locked()
         return True
     
     def release_migration_wait(self):
@@ -605,10 +604,16 @@ class TransactionCoordinator:
         恢复 add_memory_batch 类型的批量事务
         
         恢复策略：
-        1. 检查 prepare_result 中是否有待向量化的数据
-        2. 尝试批量写入 ChromaDB
-        3. 成功后更新 SQLite 状态为 is_vectorized=1
-        4. 失败则标记事务失败
+        1. 验证 prepare_result 数据完整性
+        2. 检查是否有待向量化的数据
+        3. 尝试批量写入 ChromaDB
+        4. 成功后更新 SQLite 状态为 is_vectorized=1
+        5. 失败则标记事务失败
+        
+        数据完整性验证：
+        - texts_to_vectorize 必须存在且非空
+        - metadatas_to_vectorize 数量必须与 texts_to_vectorize 一致
+        - vector_ids 数量必须与 texts_to_vectorize 一致
         
         Args:
             tx_record: 事务记录
@@ -618,6 +623,16 @@ class TransactionCoordinator:
         """
         data = tx_record.data
         prepare_result = data.get("prepare_result", {})
+        
+        if not prepare_result:
+            self._update_transaction_state(
+                tx_record.transaction_id,
+                TransactionState.FAILED,
+                "Missing prepare_result in transaction data"
+            )
+            self._log.error("TRANSACTION_RECOVERY_MISSING_PREPARE_RESULT",
+                           transaction_id=tx_record.transaction_id)
+            return None
         
         texts_to_vectorize = prepare_result.get("texts_to_vectorize", [])
         metadatas_to_vectorize = prepare_result.get("metadatas_to_vectorize", [])
@@ -633,6 +648,30 @@ class TransactionCoordinator:
                           transaction_id=tx_record.transaction_id)
             return 0
         
+        if len(texts_to_vectorize) != len(metadatas_to_vectorize):
+            self._update_transaction_state(
+                tx_record.transaction_id,
+                TransactionState.FAILED,
+                f"Data mismatch: {len(texts_to_vectorize)} texts vs {len(metadatas_to_vectorize)} metadatas"
+            )
+            self._log.error("TRANSACTION_RECOVERY_DATA_MISMATCH",
+                           transaction_id=tx_record.transaction_id,
+                           texts_count=len(texts_to_vectorize),
+                           metadatas_count=len(metadatas_to_vectorize))
+            return None
+        
+        if len(texts_to_vectorize) != len(vector_ids):
+            self._update_transaction_state(
+                tx_record.transaction_id,
+                TransactionState.FAILED,
+                f"Data mismatch: {len(texts_to_vectorize)} texts vs {len(vector_ids)} vector_ids"
+            )
+            self._log.error("TRANSACTION_RECOVERY_VECTOR_ID_MISMATCH",
+                           transaction_id=tx_record.transaction_id,
+                           texts_count=len(texts_to_vectorize),
+                           vector_ids_count=len(vector_ids))
+            return None
+        
         try:
             result_ids = self._vector_store.add(
                 texts_to_vectorize,
@@ -642,9 +681,17 @@ class TransactionCoordinator:
             
             if result_ids and len(result_ids) > 0:
                 if self._sqlite_store and sqlite_ids:
+                    matched_count = 0
                     for sid, vid in zip(sqlite_ids, result_ids):
                         if sid and vid:
                             self._sqlite_store.update_vector_status(sid, vid, is_vectorized=1)
+                            matched_count += 1
+                    
+                    if matched_count < len(result_ids):
+                        self._log.warning("TRANSACTION_RECOVERY_PARTIAL_MATCH",
+                                         transaction_id=tx_record.transaction_id,
+                                         matched=matched_count,
+                                         total=len(result_ids))
                 
                 self._update_transaction_state(
                     tx_record.transaction_id,

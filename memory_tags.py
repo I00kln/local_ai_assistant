@@ -512,12 +512,17 @@ class MemoryTagHelper:
         
         Args:
             metadata: 记忆元数据
-            tag_dict: 语义标签字典
+            tag_dict: 语义标签字典或 JSON 字符串
         
         Returns:
             更新后的元数据
         
         注意：ChromaDB 不支持嵌套 dict，因此将 tag_dict 序列化为 JSON 字符串
+        
+        验证规则：
+        - dict 类型：直接序列化
+        - str 类型：验证是否为有效 JSON，无效则存储空对象
+        - 其他类型：存储空对象
         """
         if metadata is None:
             metadata = {}
@@ -525,7 +530,11 @@ class MemoryTagHelper:
         if isinstance(tag_dict, dict):
             metadata[MemoryTags.SEMANTIC_TAG] = json.dumps(tag_dict, ensure_ascii=False)
         elif isinstance(tag_dict, str):
-            metadata[MemoryTags.SEMANTIC_TAG] = tag_dict
+            try:
+                json.loads(tag_dict)
+                metadata[MemoryTags.SEMANTIC_TAG] = tag_dict
+            except json.JSONDecodeError:
+                metadata[MemoryTags.SEMANTIC_TAG] = json.dumps({}, ensure_ascii=False)
         else:
             metadata[MemoryTags.SEMANTIC_TAG] = json.dumps({}, ensure_ascii=False)
         return metadata

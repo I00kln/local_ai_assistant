@@ -800,10 +800,15 @@ class TagMerger:
         has_user_correction = len(user_corrected_tags) > 0
         
         if has_user_correction:
-            base_tag = user_corrected_tags[0]
-            category = base_tag.category
-            sentiment = base_tag.sentiment
-            confidence = base_tag.confidence
+            if len(user_corrected_tags) == 1:
+                base_tag = user_corrected_tags[0]
+                category = base_tag.category
+                sentiment = base_tag.sentiment
+                confidence = base_tag.confidence
+            else:
+                category = self._vote_category(user_corrected_tags)
+                sentiment = self._vote_sentiment(user_corrected_tags)
+                confidence = self._average_confidence(user_corrected_tags)
         else:
             category = self._vote_category(tags_list)
             sentiment = self._vote_sentiment(tags_list)

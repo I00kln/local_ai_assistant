@@ -142,7 +142,23 @@ class VectorStore:
         
         self.lock = threading.RLock()
         
+        self._register_lifecycle()
+        
         print(f"向量存储初始化完成: {persist_directory}")
+    
+    def _register_lifecycle(self):
+        """注册到生命周期管理器"""
+        try:
+            from lifecycle_manager import get_lifecycle_manager, ServicePriority
+            lifecycle = get_lifecycle_manager()
+            lifecycle.register(
+                name="vector_store",
+                cleanup_fn=self.close,
+                priority=ServicePriority.NORMAL,
+                timeout=3.0
+            )
+        except Exception:
+            pass
     
     def warmup(self):
         """
@@ -618,7 +634,6 @@ class VectorStore:
             - 全量去重: O(n) 内存加载全部文档
             - 增量去重: O(k) 只处理 k 条新记录，k << n
         """
-        import time
         from datetime import datetime
         
         current_timestamp = datetime.now().isoformat()
@@ -719,7 +734,6 @@ class VectorStore:
         3. 批次间让出 CPU，避免阻塞
         4. 适合在后台线程中定期执行
         """
-        import time
         
         total_count = self.collection.count()
         if total_count == 0:
