@@ -1,5 +1,6 @@
 # memory_tags.py
 # 记忆标签统一管理
+import json
 from typing import Optional
 from datetime import datetime, timedelta
 
@@ -515,11 +516,18 @@ class MemoryTagHelper:
         
         Returns:
             更新后的元数据
+        
+        注意：ChromaDB 不支持嵌套 dict，因此将 tag_dict 序列化为 JSON 字符串
         """
         if metadata is None:
             metadata = {}
         
-        metadata[MemoryTags.SEMANTIC_TAG] = tag_dict
+        if isinstance(tag_dict, dict):
+            metadata[MemoryTags.SEMANTIC_TAG] = json.dumps(tag_dict, ensure_ascii=False)
+        elif isinstance(tag_dict, str):
+            metadata[MemoryTags.SEMANTIC_TAG] = tag_dict
+        else:
+            metadata[MemoryTags.SEMANTIC_TAG] = json.dumps({}, ensure_ascii=False)
         return metadata
     
     @staticmethod
@@ -535,7 +543,19 @@ class MemoryTagHelper:
         """
         if metadata is None:
             return {}
-        return metadata.get(MemoryTags.SEMANTIC_TAG, {})
+        
+        tag_data = metadata.get(MemoryTags.SEMANTIC_TAG, {})
+        
+        if isinstance(tag_data, str):
+            try:
+                return json.loads(tag_data)
+            except json.JSONDecodeError:
+                return {}
+        
+        if isinstance(tag_data, dict):
+            return tag_data
+        
+        return {}
     
     @staticmethod
     def mark_tag_corrected(metadata: dict) -> dict:

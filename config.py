@@ -44,6 +44,7 @@ class AsyncProcessorConfig:
     circuit_breaker_threshold: int = 5
     circuit_breaker_reset_timeout: int = 300
     dedup_batch_size: int = 500
+    dedup_max_records: int = 1000
     orphan_cleanup_batch_size: int = 100
     orphan_cleanup_interval: float = 0.1
 

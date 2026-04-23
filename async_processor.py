@@ -10,7 +10,8 @@ from config import config, get_memory_config
 from memory_transaction import get_transaction_coordinator
 from event_bus import get_event_bus, EventType
 from nonsense_filter import get_nonsense_filter
-from sqlite_store import get_sqlite_store, MemoryRecord
+from sqlite_store import get_sqlite_store
+from models import MemoryRecord
 from logger import get_logger, set_trace_id
 from memory_tags import MemoryTags, MemoryTagHelper
 from memory_merger import get_merger
@@ -191,7 +192,8 @@ class AsyncMemoryProcessor:
         1. ChromaDB写入成功但SQLite更新失败导致的数据不一致
         2. L2→L3迁移中断导致的孤立记录（is_vectorized=2）
         3. L2→L3迁移崩溃导致的迁移中记录（is_vectorized=3）
-        4. 队列满时溢出到文件缓冲的数据
+        4. L3→L2回流崩溃导致的回流中记录（is_vectorized=4）
+        5. 队列满时溢出到文件缓冲的数据
         
         防重复机制：
         - 添加向量前先搜索是否已存在相同文本（相似度>0.99）
@@ -205,7 +207,7 @@ class AsyncMemoryProcessor:
         try:
             migration_interrupted = self.sqlite.get_records_by_vector_status(is_vectorized=3, limit=50)
             if migration_interrupted:
-                print(f"[启动补偿] 发现 {len(migration_interrupted)} 条迁移中断记录，开始恢复...")
+                print(f"[启动补偿] 发现 {len(migration_interrupted)} 条 L2→L3 迁移中断记录，开始恢复...")
                 for record in migration_interrupted:
                     try:
                         if record.vector_id:
@@ -217,6 +219,16 @@ class AsyncMemoryProcessor:
                         self._log.info("MIGRATION_INTERRUPTED_RECOVERED", record_id=record.id)
                     except Exception as e:
                         self._log.error("MIGRATION_INTERRUPTED_RECOVERY_FAILED", record_id=record.id, error=str(e))
+            
+            backflow_interrupted = self.sqlite.get_records_by_vector_status(is_vectorized=4, limit=50)
+            if backflow_interrupted:
+                print(f"[启动补偿] 发现 {len(backflow_interrupted)} 条 L3→L2 回流中断记录，开始恢复...")
+                for record in backflow_interrupted:
+                    try:
+                        self.sqlite.update_vector_status(record.id, "", is_vectorized=0)
+                        self._log.info("BACKFLOW_INTERRUPTED_RECOVERED", record_id=record.id)
+                    except Exception as e:
+                        self._log.error("BACKFLOW_INTERRUPTED_RECOVERY_FAILED", record_id=record.id, error=str(e))
             
             unvectorized = self.sqlite.get_unvectorized(limit=50)
             if not unvectorized:
@@ -950,12 +962,11 @@ class AsyncMemoryProcessor:
             return
         
         try:
-            from sqlite_store import MemoryRecord
             record = MemoryRecord(
                 text=text,
                 source=metadata.get("source", "local"),
                 metadata=metadata,
-                is_vectorized=-1  # 标记为不向量化
+                is_vectorized=-1
             )
             self.sqlite.add(record)
         except Exception as e:
@@ -1086,7 +1097,6 @@ class AsyncMemoryProcessor:
                         except Exception as e:
                             self._log.debug("TAG_RULE_FAILED", error=str(e))
                     
-                    from sqlite_store import MemoryRecord
                     record = MemoryRecord(
                         text=text,
                         source=meta.get("source", "local") if meta else "local",
@@ -1196,10 +1206,36 @@ class AsyncMemoryProcessor:
         """
         无事务协调器的降级写入
         
+        增强功能：
+        - 记录操作日志到 SQLite transactions 表（如果可用）
+        - 崩溃后可通过 recover_pending_transactions 恢复
+        
         Args:
             texts: 文本列表
             metadatas: 元数据列表
         """
+        import uuid as uuid_module
+        
+        tx_id = f"fallback_{uuid_module.uuid4().hex[:16]}_{int(time.time())}"
+        tx_recorded = False
+        
+        if self.sqlite:
+            try:
+                with self.sqlite._get_write_connection() as conn:
+                    cursor = conn.cursor()
+                    cursor.execute("""
+                        INSERT INTO transactions 
+                        (transaction_id, operation_type, state, created_time, data)
+                        VALUES (?, ?, ?, ?, ?)
+                    """, (tx_id, "add_memory_batch_fallback", "preparing", 
+                          datetime.now().isoformat(),
+                          json.dumps({"texts_count": len(texts)}, ensure_ascii=False)))
+                    conn.commit()
+                    tx_recorded = True
+                    self._log.info("FALLBACK_TX_LOGGED", transaction_id=tx_id)
+            except Exception as e:
+                self._log.warning("FALLBACK_TX_LOG_FAILED", error=str(e))
+        
         sqlite_ids = []
         vector_ids = []
         texts_to_vectorize = []
@@ -1235,7 +1271,6 @@ class AsyncMemoryProcessor:
                     metadatas_to_vectorize.append(meta_with_id)
                 else:
                     pre_generated_id = deterministic_id
-                    from sqlite_store import MemoryRecord
                     
                     record = MemoryRecord(
                         text=text,
@@ -1257,6 +1292,8 @@ class AsyncMemoryProcessor:
             metadatas_to_vectorize = metadatas
         
         if not texts_to_vectorize:
+            if tx_recorded:
+                self._update_fallback_tx_state(tx_id, "committed", "empty_batch")
             return
         
         try:
@@ -1267,6 +1304,10 @@ class AsyncMemoryProcessor:
                     [(sid, vid) for sid, vid in zip(sqlite_ids, result_ids)],
                     is_vectorized=1
                 )
+            
+            if tx_recorded:
+                self._update_fallback_tx_state(tx_id, "committed", 
+                    json.dumps({"success_count": len(result_ids) if result_ids else 0}))
             
             self._log.info("ATOMIC_WRITE_COMPLETE", count=len(texts_to_vectorize))
             self._last_flush_time = time.time()
@@ -1280,9 +1321,37 @@ class AsyncMemoryProcessor:
         except Exception as e:
             self._log.error("CHROMADB_WRITE_FAILED", error=str(e))
             
+            if tx_recorded:
+                self._update_fallback_tx_state(tx_id, "failed", str(e))
+            
             if self.sqlite and sqlite_ids:
                 for sid in sqlite_ids:
                     self.sqlite.update_vector_status(sid, "", is_vectorized=-1)
+    
+    def _update_fallback_tx_state(self, tx_id: str, state: str, message: str = ""):
+        """
+        更新降级事务状态
+        
+        Args:
+            tx_id: 事务ID
+            state: 新状态 (committed, failed)
+            message: 状态消息
+        """
+        if not self.sqlite:
+            return
+        
+        try:
+            with self.sqlite._get_write_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    UPDATE transactions 
+                    SET state = ?, updated_time = ?, error_message = ?
+                    WHERE transaction_id = ?
+                """, (state, datetime.now().isoformat(), message, tx_id))
+                conn.commit()
+        except Exception as e:
+            self._log.warning("FALLBACK_TX_UPDATE_FAILED", 
+                            transaction_id=tx_id, error=str(e))
     
     def _retry_failed_vectorizations(self):
         """
@@ -1384,7 +1453,14 @@ class AsyncMemoryProcessor:
             self._last_flush_time = current_time
     
     def _check_and_dedup(self):
-        """空闲时检查并执行去重（通过调度器）"""
+        """
+        空闲时检查并执行去重（通过调度器）
+        
+        使用增量去重策略：
+        - 只检查最近添加的 N 条记录（默认 1000 条）
+        - 分批处理，每批 batch_size 条
+        - 批次间让出 CPU，避免阻塞
+        """
         current_time = time.time()
         
         if self._idle_count < 3:
@@ -1398,9 +1474,17 @@ class AsyncMemoryProcessor:
         if len(self.vector_store) < 10:
             return
         
+        dedup_batch_size = getattr(self._mem_config.async_processor, 'dedup_batch_size', 100)
+        max_records = getattr(self._mem_config.async_processor, 'dedup_max_records', 1000)
+        
         def dedup_task():
             try:
-                removed = self.vector_store.deduplicate(sqlite_store=self.sqlite)
+                removed = self.vector_store.deduplicate_incremental(
+                    sqlite_store=self.sqlite,
+                    batch_size=dedup_batch_size,
+                    max_records=max_records,
+                    yield_cpu=True
+                )
                 self._last_dedup_time = time.time()
                 self._idle_count = 0
                 return {"affected_count": removed}
@@ -1804,7 +1888,29 @@ class AsyncMemoryProcessor:
                                                 record_id=record.id,
                                                 error=str(del_e))
                             record.vector_id = ""
+                        
+                        try:
+                            deterministic_id = self.vector_store._generate_deterministic_id(compressed_text)
+                            new_vector_ids = self.vector_store.add(
+                                [compressed_text],
+                                [record.metadata or {}],
+                                ids=[deterministic_id]
+                            )
+                            if new_vector_ids:
+                                record.vector_id = new_vector_ids[0]
+                                record.is_vectorized = 1
+                                self._log.info("COMPRESSION_REVECTORIZED", 
+                                             record_id=record.id,
+                                             new_vector_id=new_vector_ids[0])
+                            else:
+                                record.is_vectorized = 0
+                                self._log.warning("COMPRESSION_REVECTORIZATION_EMPTY",
+                                                record_id=record.id)
+                        except Exception as revec_e:
                             record.is_vectorized = 0
+                            self._log.warning("COMPRESSION_REVECTORIZATION_FAILED",
+                                            record_id=record.id,
+                                            error=str(revec_e))
                         
                         self.sqlite.add(record)
                         compressed_count += 1
@@ -1845,6 +1951,13 @@ class AsyncMemoryProcessor:
         - 由 BackgroundTaskScheduler 统一管理迁移锁
         - 回流失败时回滚已写入的向量
         
+        状态定义：
+        - is_vectorized=0: 未向量化(L3)
+        - is_vectorized=1: 已向量化(L2)
+        - is_vectorized=2: 向量化失败
+        - is_vectorized=3: L2→L3 迁移中
+        - is_vectorized=4: L3→L2 回流中
+        
         Returns:
             移动的记录数
         """
@@ -1877,7 +1990,7 @@ class AsyncMemoryProcessor:
                             except Exception:
                                 pass
                     
-                    self.sqlite.update_vector_status(record.id, "", is_vectorized=2)
+                    self.sqlite.update_vector_status(record.id, "", is_vectorized=4)
                     
                     text_to_vectorize = record.text
                     deterministic_id = self.vector_store._generate_deterministic_id(text_to_vectorize)

@@ -40,24 +40,22 @@ class LLMCompressionStrategy(CompressionStrategy):
     - HALF_OPEN: 半开状态，允许探测请求
     
     常量说明：
-    - CIRCUIT_BREAKER_THRESHOLD: 熔断器触发阈值，连续失败次数
-    - CIRCUIT_BREAKER_RESET_TIMEOUT: 熔断器重置超时（秒）
-    - CIRCUIT_BREAKER_HALF_OPEN_WINDOW: 半开状态窗口期（秒）
     - COMPRESSOR_CHECK_INTERVAL: 压缩器可用性检查间隔（秒）
     - LONG_TEXT_THRESHOLD: 长文本阈值，超过此值使用云端压缩
     - CHUNK_TEXT_THRESHOLD: 分块压缩阈值，超过此值分块处理
     - CHUNK_SIZE: 分块大小
     """
     
-    CIRCUIT_BREAKER_THRESHOLD = 5
-    CIRCUIT_BREAKER_RESET_TIMEOUT = 300
-    CIRCUIT_BREAKER_HALF_OPEN_WINDOW = 30
     COMPRESSOR_CHECK_INTERVAL = 300
     LONG_TEXT_THRESHOLD = 10000
     CHUNK_TEXT_THRESHOLD = 6000
     CHUNK_SIZE = 3000
     MAX_COMPRESSION_RATIO = 0.7
     LONG_TEXT_COMPRESSION_RATIO = 0.8
+    
+    _DEFAULT_CB_THRESHOLD = 5
+    _DEFAULT_CB_RESET_TIMEOUT = 300
+    _DEFAULT_CB_HALF_OPEN_WINDOW = 30
     
     def __init__(self, mem_config):
         self._mem_config = mem_config
@@ -67,17 +65,19 @@ class LLMCompressionStrategy(CompressionStrategy):
         self._available = False
         self._log = get_logger()
         
+        self._cb_half_open_window = self._DEFAULT_CB_HALF_OPEN_WINDOW
+        
         self._circuit_breaker = {
             "failures": 0,
             "last_failure": 0,
             "open_until": 0,
-            "threshold": self.CIRCUIT_BREAKER_THRESHOLD,
-            "reset_timeout": self.CIRCUIT_BREAKER_RESET_TIMEOUT
+            "threshold": self._DEFAULT_CB_THRESHOLD,
+            "reset_timeout": self._DEFAULT_CB_RESET_TIMEOUT
         }
         try:
             async_config = mem_config.async_processor
-            self._circuit_breaker["threshold"] = getattr(async_config, 'circuit_breaker_threshold', self.CIRCUIT_BREAKER_THRESHOLD)
-            self._circuit_breaker["reset_timeout"] = getattr(async_config, 'circuit_breaker_reset_timeout', self.CIRCUIT_BREAKER_RESET_TIMEOUT)
+            self._circuit_breaker["threshold"] = getattr(async_config, 'circuit_breaker_threshold', self._DEFAULT_CB_THRESHOLD)
+            self._circuit_breaker["reset_timeout"] = getattr(async_config, 'circuit_breaker_reset_timeout', self._DEFAULT_CB_RESET_TIMEOUT)
         except Exception:
             pass
     
@@ -96,7 +96,7 @@ class LLMCompressionStrategy(CompressionStrategy):
         current_time = time.time()
         
         if current_time < self._circuit_breaker["open_until"]:
-            if current_time > self._circuit_breaker["open_until"] - self.CIRCUIT_BREAKER_HALF_OPEN_WINDOW:
+            if current_time > self._circuit_breaker["open_until"] - self._cb_half_open_window:
                 if self._probe_connection():
                     self._log.info("CIRCUIT_BREAKER_HALF_OPEN_SUCCESS")
                     return True

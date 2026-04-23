@@ -3,11 +3,12 @@
 import os
 import time
 import threading
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 from datetime import datetime
 
 from config import config
 from memory_tags import MemoryTags
+from models import MemoryRecord
 
 
 class ONNXEmbeddingFunction:
@@ -291,7 +292,6 @@ class VectorStore:
                 
                 if sqlite_store:
                     try:
-                        from sqlite_store import MemoryRecord
                         for text, meta in zip(texts, metadatas or []):
                             record = MemoryRecord(
                                 text=text,
@@ -314,7 +314,6 @@ class VectorStore:
             
             if sqlite_store:
                 try:
-                    from sqlite_store import MemoryRecord
                     for text, meta in zip(texts, metadatas or []):
                         record = MemoryRecord(
                             text=text,
@@ -550,28 +549,153 @@ class VectorStore:
             "persist_directory": self.persist_directory
         }
     
-    def deduplicate(self, sqlite_store=None, batch_size: int = 500) -> int:
+    def deduplicate(self, sqlite_store=None, batch_size: int = 500, last_dedup_timestamp: str = None, yield_cpu: bool = True) -> Tuple[int, str]:
         """
-        去重 - 基于文本内容（分批增量处理版）
+        去重 - 基于文本内容（增量处理版）
         
         Args:
             sqlite_store: SQLite存储实例（可选，用于同步删除）
             batch_size: 每批处理的文档数量（默认500）
+            last_dedup_timestamp: 上次去重的时间戳（ISO格式），只处理该时间之后的记录
+            yield_cpu: 是否在批次间让出 CPU（默认 True）
+        
+        Returns:
+            (移除的重复文档数量, 本次去重的时间戳)
+        
+        增量去重策略：
+        1. 如果提供了 last_dedup_timestamp，只处理该时间之后的记录
+        2. 使用 ChromaDB 的 where 过滤按时间范围筛选
+        3. 分批处理间让出 CPU，避免阻塞其他操作
+        4. 返回本次去重的时间戳，供下次调用使用
+        
+        时间复杂度：
+            - 全量去重: O(n) 内存加载全部文档
+            - 增量去重: O(k) 只处理 k 条新记录，k << n
+        """
+        import time
+        from datetime import datetime
+        
+        current_timestamp = datetime.now().isoformat()
+        
+        where_filter = None
+        if last_dedup_timestamp:
+            where_filter = {
+                "timestamp": {"$gte": last_dedup_timestamp}
+            }
+        
+        try:
+            if where_filter:
+                results = self.collection.get(
+                    where=where_filter,
+                    include=["documents", "metadatas"]
+                )
+            else:
+                total_count = self.collection.count()
+                if total_count == 0:
+                    return 0, current_timestamp
+                
+                results = self.collection.get(
+                    limit=batch_size,
+                    include=["documents", "metadatas"]
+                )
+        except Exception as e:
+            print(f"[去重] 获取文档失败: {e}")
+            return 0, current_timestamp
+        
+        if not results["ids"]:
+            return 0, current_timestamp
+        
+        total_duplicates = 0
+        seen_texts = {}
+        
+        if not where_filter:
+            try:
+                all_results = self.collection.get(
+                    include=["documents", "metadatas"]
+                )
+                if all_results["ids"]:
+                    for i, text in enumerate(all_results["documents"]):
+                        if text not in seen_texts:
+                            seen_texts[text] = all_results["ids"][i]
+            except Exception as e:
+                print(f"[去重] 获取已有文档失败: {e}")
+        
+        try:
+            check_results = self.collection.get(
+                include=["documents", "metadatas"]
+            )
+            if check_results["ids"]:
+                for i, text in enumerate(check_results["documents"]):
+                    if text not in seen_texts:
+                        seen_texts[text] = check_results["ids"][i]
+        except Exception:
+            pass
+        
+        duplicate_ids = []
+        
+        for i, text in enumerate(results["documents"]):
+            doc_id = results["ids"][i]
+            if text in seen_texts and seen_texts[text] != doc_id:
+                duplicate_ids.append(doc_id)
+        
+        if duplicate_ids:
+            self.collection.delete(ids=duplicate_ids)
+            total_duplicates += len(duplicate_ids)
+            
+            if sqlite_store:
+                for dup_id in duplicate_ids:
+                    try:
+                        sqlite_store.delete_by_vector_id(dup_id)
+                    except Exception:
+                        pass
+        
+        if total_duplicates > 0:
+            print(f"去重完成：移除 {total_duplicates} 条重复记忆")
+        
+        return total_duplicates, current_timestamp
+    
+    def deduplicate_incremental(self, sqlite_store=None, batch_size: int = 100, max_records: int = 1000, yield_cpu: bool = True) -> int:
+        """
+        增量去重 - 只检查最近添加的 N 条记录
+        
+        Args:
+            sqlite_store: SQLite存储实例（可选，用于同步删除）
+            batch_size: 每批处理的文档数量（默认100）
+            max_records: 最大检查记录数（默认1000）
+            yield_cpu: 是否在批次间让出 CPU（默认 True）
         
         Returns:
             移除的重复文档数量
         
-        时间复杂度：
-            - 优化前: O(n) 内存加载全部文档
-            - 优化后: O(batch_size) 分批处理，内存占用恒定
+        增量去重策略：
+        1. 只检查最近添加的 max_records 条记录
+        2. 分批处理，每批 batch_size 条
+        3. 批次间让出 CPU，避免阻塞
+        4. 适合在后台线程中定期执行
         """
+        import time
+        
         total_count = self.collection.count()
         if total_count == 0:
             return 0
         
+        check_count = min(max_records, total_count)
         total_duplicates = 0
         seen_texts = {}
-        offset = 0
+        
+        try:
+            existing_results = self.collection.get(
+                limit=total_count - check_count if total_count > check_count else 0,
+                include=["documents"]
+            )
+            if existing_results["ids"]:
+                for text in existing_results["documents"]:
+                    if text not in seen_texts:
+                        seen_texts[text] = True
+        except Exception:
+            pass
+        
+        offset = total_count - check_count if total_count > check_count else 0
         
         while offset < total_count:
             try:
@@ -606,12 +730,15 @@ class VectorStore:
                 
                 offset += batch_size
                 
+                if yield_cpu:
+                    time.sleep(0.01)
+                
             except Exception as e:
-                print(f"[去重] 批次处理失败 (offset={offset}): {e}")
+                print(f"[增量去重] 批次处理失败 (offset={offset}): {e}")
                 break
         
         if total_duplicates > 0:
-            print(f"去重完成：移除 {total_duplicates} 条重复记忆")
+            print(f"增量去重完成：检查 {check_count} 条，移除 {total_duplicates} 条重复")
         
         return total_duplicates
     

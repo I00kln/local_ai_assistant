@@ -127,6 +127,35 @@ class MemoryMetadata:
 
 
 @dataclass
+class MemoryRecord:
+    """
+    记忆记录结构
+    
+    核心领域模型，用于 L2/L3 存储层
+    """
+    id: Optional[int] = None
+    text: str = ""
+    compressed_text: Optional[str] = None
+    source: str = "user"
+    weight: float = 1.0
+    access_count: int = 0
+    last_access_time: Optional[str] = None
+    created_time: Optional[str] = None
+    metadata: Dict[str, Any] = None
+    vector_id: Optional[str] = None
+    is_vectorized: int = 0
+    bm25_score: float = 0.0
+    
+    def __post_init__(self):
+        if self.created_time is None:
+            self.created_time = datetime.now().isoformat()
+        if self.last_access_time is None:
+            self.last_access_time = self.created_time
+        if self.metadata is None:
+            self.metadata = {}
+
+
+@dataclass
 class ConversationRecord:
     """
     会话记录结构

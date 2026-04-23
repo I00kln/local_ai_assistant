@@ -13,16 +13,6 @@
 """
 
 from typing import List, Dict, Any
-from dataclasses import dataclass
-
-
-@dataclass
-class PromptResult:
-    """提示词执行结果"""
-    success: bool
-    content: str
-    reason: str = ""
-    metadata: Dict[str, Any] = None
 
 
 class MemoryPrompts:

@@ -462,6 +462,12 @@ class TransactionCoordinator:
                     recovered += recovery_result
                 else:
                     failed += 1
+            elif tx_record.operation_type == "add_memory_batch_fallback":
+                recovery_result = self._recover_add_memory_batch_transaction(tx_record)
+                if recovery_result:
+                    recovered += recovery_result
+                else:
+                    failed += 1
             else:
                 self._update_transaction_state(
                     tx_record.transaction_id, 

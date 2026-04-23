@@ -23,6 +23,7 @@ from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Any
 from pathlib import Path
 from memory_tags import MemoryTags
+from models import MemoryRecord
 
 
 @dataclass
@@ -358,8 +359,6 @@ class MemoryArchiver:
             
             for record in records:
                 try:
-                    from sqlite_store import MemoryRecord
-                    
                     memory_record = MemoryRecord(
                         text=record["text"],
                         compressed_text=record.get("compressed_text"),

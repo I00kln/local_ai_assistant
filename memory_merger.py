@@ -25,6 +25,7 @@
 
 import threading
 import re
+import json
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple, Any
@@ -32,6 +33,7 @@ import numpy as np
 
 from memory_tags import MemoryTags, MemoryTagHelper
 from logger import get_logger
+from models import MemoryRecord
 
 
 @dataclass
@@ -715,7 +717,7 @@ class MemoryMerger:
             from tag_classifier import get_tag_classifier
             tagger = get_tag_classifier()
             new_tag = tagger.tag_memory(merged_text)
-            merged_metadata[MemoryTags.SEMANTIC_TAG] = new_tag.to_dict()
+            merged_metadata[MemoryTags.SEMANTIC_TAG] = json.dumps(new_tag.to_dict(), ensure_ascii=False)
         except Exception:
             pass
         
@@ -808,10 +810,10 @@ class MemoryMerger:
                 from tag_classifier import get_tag_classifier
                 tagger = get_tag_classifier()
                 merged_tag = tagger.merge_tags(semantic_tags_to_merge)
-                merged[MemoryTags.SEMANTIC_TAG] = merged_tag.to_dict()
+                merged[MemoryTags.SEMANTIC_TAG] = json.dumps(merged_tag.to_dict(), ensure_ascii=False)
             except Exception:
                 if semantic_tags_to_merge:
-                    merged[MemoryTags.SEMANTIC_TAG] = semantic_tags_to_merge[0].to_dict()
+                    merged[MemoryTags.SEMANTIC_TAG] = json.dumps(semantic_tags_to_merge[0].to_dict(), ensure_ascii=False)
         
         return merged
     
@@ -1131,7 +1133,6 @@ class MemoryMerger:
                     
                     for rec_backup in records_to_delete_backup:
                         try:
-                            from sqlite_store import MemoryRecord
                             restored = sqlite_store.get(rec_backup["id"])
                             if not restored:
                                 restored = MemoryRecord(

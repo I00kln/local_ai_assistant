@@ -923,7 +923,7 @@ class TagCorrectionManager:
                     if not record.metadata:
                         record.metadata = {}
                     
-                    record.metadata[MemoryTags.SEMANTIC_TAG] = new_tag.to_dict()
+                    record.metadata[MemoryTags.SEMANTIC_TAG] = json.dumps(new_tag.to_dict(), ensure_ascii=False)
                     record.metadata[MemoryTags.TAG_CORRECTED_AT] = datetime.now().isoformat()
                     
                     sqlite_store.add(record)
@@ -1189,6 +1189,13 @@ class TagClassifier:
             return MemoryTag()
         
         tag_data = metadata.get(MemoryTags.SEMANTIC_TAG, {})
+        
+        if isinstance(tag_data, str):
+            try:
+                tag_data = json.loads(tag_data)
+            except json.JSONDecodeError:
+                tag_data = {}
+        
         return MemoryTag.from_dict(tag_data)
     
     def update_metadata_with_tag(
@@ -1205,11 +1212,13 @@ class TagClassifier:
         
         Returns:
             更新后的元数据
+        
+        注意：ChromaDB 不支持嵌套 dict，因此将 tag 序列化为 JSON 字符串
         """
         if metadata is None:
             metadata = {}
         
-        metadata[MemoryTags.SEMANTIC_TAG] = tag.to_dict()
+        metadata[MemoryTags.SEMANTIC_TAG] = json.dumps(tag.to_dict(), ensure_ascii=False)
         
         return metadata
     

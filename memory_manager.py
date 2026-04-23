@@ -188,6 +188,16 @@ class MemoryManager:
         3. 早停机制：高质量结果足够时提前终止
         4. 内存重排结合时间衰减、权重等因素
         
+        相似度分数统一：
+        - L1: 关键词覆盖率 + 时间衰减（0-1）
+        - L2: ChromaDB 余弦相似度（0-1）
+        - L3: BM25 分数 sigmoid 归一化（0-1）
+        
+        combined_score 计算：
+        - 所有层级统一使用: similarity * time_decay * weight * source_weight
+        - source_weight 来自配置项，控制各层级的重要性
+        - 确保不同来源的结果可比较
+        
         时间复杂度：
             - 优化前: O(recall_limit) 固定超额采样
             - 优化后: O(actual_recall) 动态调整，可能提前终止
@@ -200,8 +210,12 @@ class MemoryManager:
         recall_multiplier = getattr(config, 'recall_multiplier', 3)
         recall_limit = top_k * recall_multiplier
         
-        high_quality_threshold = 0.95
+        high_quality_threshold = getattr(config.retrieval, 'high_quality_threshold', 0.95)
         min_high_quality = top_k
+        
+        source_weight_l1 = getattr(config.retrieval, 'source_weight_l1', 1.2)
+        source_weight_l2 = getattr(config.retrieval, 'source_weight_l2', 1.0)
+        source_weight_l3 = getattr(config.retrieval, 'source_weight_l3', 0.8)
         
         if include_l1:
             l1_results = self._search_l1(query, recall_limit, threshold)
@@ -210,7 +224,8 @@ class MemoryManager:
                     if MemoryTagHelper.is_forgotten(r.metadata):
                         continue
                     seen_texts.add(r.text)
-                    r.combined_score = r.similarity * r.weight
+                    time_decay = self._apply_time_decay(r, time_context)
+                    r.combined_score = r.similarity * time_decay * r.weight * source_weight_l1
                     results.append(r)
             self.stats["l1_hits"] += len(l1_results)
         
@@ -225,7 +240,7 @@ class MemoryManager:
                         continue
                     seen_texts.add(r.text)
                     time_decay = self._apply_time_decay(r, time_context)
-                    r.combined_score = time_decay * r.weight
+                    r.combined_score = r.similarity * time_decay * r.weight * source_weight_l2
                     results.append(r)
         self.stats["l2_hits"] += len(l2_results)
         
@@ -240,7 +255,7 @@ class MemoryManager:
                         continue
                     seen_texts.add(r.text)
                     time_decay = self._apply_time_decay(r, time_context)
-                    r.combined_score = time_decay * r.weight
+                    r.combined_score = r.similarity * time_decay * r.weight * source_weight_l3
                     results.append(r)
             
             for result in l3_results:
@@ -483,12 +498,7 @@ class MemoryManager:
         results = []
         
         try:
-            where_filter = {
-                "$or": [
-                    {"forgotten": {"$ne": True}},
-                    {"forgotten": None}
-                ]
-            }
+            where_filter = {"forgotten": {"$ne": True}}
             
             l2_results = self.vector_store.search(
                 query, 
@@ -517,7 +527,9 @@ class MemoryManager:
         """
         搜索L3数据库
         
-        优化：直接使用FTS5的BM25分数，移除Python层冗余的字符串匹配
+        使用 FTS5 的 BM25 分数归一化作为相似度：
+        - BM25 分数通过 sigmoid 函数归一化到 0-1
+        - 相同语义的 L2/L3 结果具有相近的相似度分数
         
         对于 sqlite_only 记录（is_vectorized=-1）：
         - 降低权重（乘以 0.5）
@@ -526,9 +538,12 @@ class MemoryManager:
         results = []
         
         try:
-            l3_results = self.sqlite.search(query, limit=top_k * MemoryConstants.L3_SEARCH_RESULT_MULTIPLIER)
+            l3_results = self.sqlite.search_with_normalized_score(
+                query, 
+                limit=top_k * MemoryConstants.L3_SEARCH_RESULT_MULTIPLIER
+            )
             
-            for record in l3_results:
+            for record, normalized_score in l3_results:
                 text = record.compressed_text or record.text
                 
                 is_sqlite_only = (record.is_vectorized == -1)
@@ -540,7 +555,7 @@ class MemoryManager:
                     weight *= 0.5
                     source = "L3_LOW_QUALITY"
                 
-                similarity = min(1.0, record.weight / 2.0)
+                similarity = normalized_score
                 
                 results.append(MemorySearchResult(
                     text=text,
@@ -551,7 +566,8 @@ class MemoryManager:
                         "id": record.id,
                         "access_count": record.access_count,
                         MemoryTags.TIMESTAMP: record.created_time,
-                        MemoryTags.IS_SQLITE_ONLY: is_sqlite_only
+                        MemoryTags.IS_SQLITE_ONLY: is_sqlite_only,
+                        "bm25_normalized": True
                     }
                 ))
             

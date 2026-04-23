@@ -3,6 +3,7 @@
 import os
 import sqlite3
 import json
+import re
 import threading
 import time
 from datetime import datetime, timedelta
@@ -11,6 +12,29 @@ from dataclasses import dataclass
 from contextlib import contextmanager
 from config import config
 from memory_tags import MemoryTags
+from models import MemoryRecord
+
+
+def escape_fts5_query(query: str) -> str:
+    """
+    转义 FTS5 查询字符串
+    
+    FTS5 对某些字符有特殊含义，需要进行转义：
+    - 双引号需要转义
+    - 特殊字符需要用双引号包裹整个查询
+    
+    Args:
+        query: 原始查询字符串
+    
+    Returns:
+        转义后的 FTS5 安全查询字符串
+    """
+    if not query:
+        return '""'
+    
+    escaped = query.replace('"', '""')
+    
+    return f'"{escaped}"'
 
 
 class EncryptionError(Exception):
@@ -27,7 +51,7 @@ def get_encryption_key() -> Optional[str]:
     Returns:
         加密密钥或 None
     """
-    key_env = getattr(config.sqlite, 'encryption_key_env', 'SQLITE_ENCRYPTION_KEY')
+    key_env = getattr(config.sqlite_store, 'encryption_key_env', 'SQLITE_ENCRYPTION_KEY')
     return os.environ.get(key_env)
 
 
@@ -49,30 +73,6 @@ def is_sqlcipher_available() -> bool:
             return False
 
 
-@dataclass
-class MemoryRecord:
-    """记忆记录结构"""
-    id: Optional[int] = None
-    text: str = ""
-    compressed_text: Optional[str] = None
-    source: str = "user"
-    weight: float = 1.0
-    access_count: int = 0
-    last_access_time: Optional[str] = None
-    created_time: Optional[str] = None
-    metadata: Dict[str, Any] = None
-    vector_id: Optional[str] = None
-    is_vectorized: int = 0
-    
-    def __post_init__(self):
-        if self.created_time is None:
-            self.created_time = datetime.now().isoformat()
-        if self.last_access_time is None:
-            self.last_access_time = self.created_time
-        if self.metadata is None:
-            self.metadata = {}
-
-
 class SQLiteStore:
     """
     L3 长期记忆存储层
@@ -89,14 +89,7 @@ class SQLiteStore:
     - 仅写操作使用互斥锁保护
     """
     
-    WEIGHT_DECAY_RATE = 0.95
-    WEIGHT_BOOST_ON_ACCESS = 1.2
-    MIN_WEIGHT_THRESHOLD = 0.3
-    MAX_WEIGHT = 5.0
-    
     FORGET_CHECK_INTERVAL = 3600
-    FORGET_AGE_DAYS = 30
-    
     MAX_POOL_SIZE = 10
     CONNECTION_TIMEOUT = 3600
     BACKUP_SUFFIX = ".backup"
@@ -119,7 +112,13 @@ class SQLiteStore:
         self._encryption_enabled = False
         self._encryption_key = None
         
-        encryption_configured = getattr(config.sqlite, 'encryption_enabled', False)
+        self._weight_decay_rate = config.decay.decay_rate
+        self._weight_boost_on_access = config.decay.weight_boost_on_access
+        self._min_weight_threshold = config.decay.min_weight_threshold
+        self._max_weight = config.decay.max_weight
+        self._forget_age_days = config.decay.forget_age_days
+        
+        encryption_configured = getattr(config.sqlite_store, 'encryption_enabled', False)
         if encryption_configured:
             key = encryption_key or get_encryption_key()
             if key and is_sqlcipher_available():
@@ -560,6 +559,169 @@ class SQLiteStore:
                 except sqlite3.OperationalError:
                     pass
                 
+                try:
+                    cursor.execute("""
+                        CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
+                            text,
+                            compressed_text,
+                            content='memories',
+                            content_rowid='id'
+                        )
+                    """)
+                except sqlite3.OperationalError:
+                    pass
+                
+                try:
+                    cursor.execute("""
+                        CREATE INDEX IF NOT EXISTS idx_weight 
+                        ON memories(weight DESC)
+                    """)
+                except sqlite3.OperationalError:
+                    pass
+                
+                try:
+                    cursor.execute("""
+                        CREATE INDEX IF NOT EXISTS idx_created_time 
+                        ON memories(created_time DESC)
+                    """)
+                except sqlite3.OperationalError:
+                    pass
+                
+                try:
+                    cursor.execute("""
+                        CREATE INDEX IF NOT EXISTS idx_last_access 
+                        ON memories(last_access_time DESC)
+                    """)
+                except sqlite3.OperationalError:
+                    pass
+                
+                try:
+                    cursor.execute("""
+                        CREATE INDEX IF NOT EXISTS idx_vector_id 
+                        ON memories(vector_id)
+                    """)
+                except sqlite3.OperationalError:
+                    pass
+                
+                try:
+                    cursor.execute("""
+                        CREATE INDEX IF NOT EXISTS idx_is_vectorized 
+                        ON memories(is_vectorized)
+                    """)
+                except sqlite3.OperationalError:
+                    pass
+                
+                try:
+                    cursor.execute("""
+                        CREATE INDEX IF NOT EXISTS idx_text_hash 
+                        ON memories(text_hash)
+                    """)
+                except sqlite3.OperationalError:
+                    pass
+                
+                try:
+                    cursor.execute("""
+                        CREATE INDEX IF NOT EXISTS idx_decay_candidate 
+                        ON memories(is_archived, created_time, weight)
+                    """)
+                except sqlite3.OperationalError:
+                    pass
+                
+                try:
+                    cursor.execute("""
+                        CREATE INDEX IF NOT EXISTS idx_forget_candidate 
+                        ON memories(is_archived, weight, is_vectorized)
+                    """)
+                except sqlite3.OperationalError:
+                    pass
+                
+                try:
+                    cursor.execute("""
+                        CREATE INDEX IF NOT EXISTS idx_weight_access 
+                        ON memories(weight DESC, last_access_time DESC)
+                    """)
+                except sqlite3.OperationalError:
+                    pass
+                
+                try:
+                    cursor.execute("""
+                        CREATE INDEX IF NOT EXISTS idx_vectorized_weight 
+                        ON memories(is_vectorized, weight DESC)
+                    """)
+                except sqlite3.OperationalError:
+                    pass
+                
+                try:
+                    cursor.execute("""
+                        CREATE INDEX IF NOT EXISTS idx_source_weight 
+                        ON memories(source, weight DESC)
+                    """)
+                except sqlite3.OperationalError:
+                    pass
+                
+                try:
+                    cursor.execute("""
+                        CREATE TRIGGER IF NOT EXISTS memories_ai AFTER INSERT ON memories BEGIN
+                            INSERT INTO memories_fts(rowid, text, compressed_text)
+                            VALUES (new.id, new.text, COALESCE(new.compressed_text, ''));
+                        END
+                    """)
+                except sqlite3.OperationalError:
+                    pass
+                
+                try:
+                    cursor.execute("""
+                        CREATE TRIGGER IF NOT EXISTS memories_ad AFTER DELETE ON memories BEGIN
+                            INSERT INTO memories_fts(memories_fts, rowid, text, compressed_text)
+                            VALUES('delete', old.id, old.text, COALESCE(old.compressed_text, ''));
+                        END
+                    """)
+                except sqlite3.OperationalError:
+                    pass
+                
+                try:
+                    cursor.execute("""
+                        CREATE TRIGGER IF NOT EXISTS memories_au AFTER UPDATE ON memories BEGIN
+                            INSERT INTO memories_fts(memories_fts, rowid, text, compressed_text)
+                            VALUES('delete', old.id, old.text, COALESCE(old.compressed_text, ''));
+                            INSERT INTO memories_fts(rowid, text, compressed_text)
+                            VALUES (new.id, new.text, COALESCE(new.compressed_text, ''));
+                        END
+                    """)
+                except sqlite3.OperationalError:
+                    pass
+                
+                try:
+                    cursor.execute("""
+                        CREATE TABLE IF NOT EXISTS conversations (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            session_id TEXT NOT NULL,
+                            user_input TEXT NOT NULL,
+                            assistant_response TEXT,
+                            source TEXT DEFAULT 'local',
+                            timestamp TEXT,
+                            metadata TEXT
+                        )
+                    """)
+                except sqlite3.OperationalError:
+                    pass
+                
+                try:
+                    cursor.execute("""
+                        CREATE INDEX IF NOT EXISTS idx_session_id 
+                        ON conversations(session_id)
+                    """)
+                except sqlite3.OperationalError:
+                    pass
+                
+                try:
+                    cursor.execute("""
+                        CREATE INDEX IF NOT EXISTS idx_conversation_time 
+                        ON conversations(timestamp DESC)
+                    """)
+                except sqlite3.OperationalError:
+                    pass
+                
                 conn.commit()
                 
                 if os.path.exists(self.db_path):
@@ -610,115 +772,6 @@ class SQLiteStore:
         except Exception as e:
             print(f"[严重] 数据库重建失败: {e}")
             raise
-            
-            # 全文搜索虚拟表（FTS5）
-            cursor.execute("""
-                CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
-                    text,
-                    compressed_text,
-                    content='memories',
-                    content_rowid='id'
-                )
-            """)
-            
-            # 创建索引
-            cursor.execute("""
-                CREATE INDEX IF NOT EXISTS idx_weight 
-                ON memories(weight DESC)
-            """)
-            cursor.execute("""
-                CREATE INDEX IF NOT EXISTS idx_created_time 
-                ON memories(created_time DESC)
-            """)
-            cursor.execute("""
-                CREATE INDEX IF NOT EXISTS idx_last_access 
-                ON memories(last_access_time DESC)
-            """)
-            cursor.execute("""
-                CREATE INDEX IF NOT EXISTS idx_vector_id 
-                ON memories(vector_id)
-            """)
-            cursor.execute("""
-                CREATE INDEX IF NOT EXISTS idx_is_vectorized 
-                ON memories(is_vectorized)
-            """)
-            cursor.execute("""
-                CREATE INDEX IF NOT EXISTS idx_text_hash 
-                ON memories(text_hash)
-            """)
-            
-            cursor.execute("""
-                CREATE INDEX IF NOT EXISTS idx_decay_candidate 
-                ON memories(is_archived, created_time, weight)
-            """)
-            
-            cursor.execute("""
-                CREATE INDEX IF NOT EXISTS idx_forget_candidate 
-                ON memories(is_archived, weight, is_vectorized)
-            """)
-            
-            cursor.execute("""
-                CREATE INDEX IF NOT EXISTS idx_weight_access 
-                ON memories(weight DESC, last_access_time DESC)
-            """)
-            
-            cursor.execute("""
-                CREATE INDEX IF NOT EXISTS idx_vectorized_weight 
-                ON memories(is_vectorized, weight DESC)
-            """)
-            
-            cursor.execute("""
-                CREATE INDEX IF NOT EXISTS idx_source_weight 
-                ON memories(source, weight DESC)
-            """)
-            
-            # 触发器：自动同步FTS索引
-            cursor.execute("""
-                CREATE TRIGGER IF NOT EXISTS memories_ai AFTER INSERT ON memories BEGIN
-                    INSERT INTO memories_fts(rowid, text, compressed_text)
-                    VALUES (new.id, new.text, COALESCE(new.compressed_text, ''));
-                END
-            """)
-            cursor.execute("""
-                CREATE TRIGGER IF NOT EXISTS memories_ad AFTER DELETE ON memories BEGIN
-                    INSERT INTO memories_fts(memories_fts, rowid, text, compressed_text)
-                    VALUES('delete', old.id, old.text, COALESCE(old.compressed_text, ''));
-                END
-            """)
-            cursor.execute("""
-                CREATE TRIGGER IF NOT EXISTS memories_au AFTER UPDATE ON memories BEGIN
-                    INSERT INTO memories_fts(memories_fts, rowid, text, compressed_text)
-                    VALUES('delete', old.id, old.text, COALESCE(old.compressed_text, ''));
-                    INSERT INTO memories_fts(rowid, text, compressed_text)
-                    VALUES (new.id, new.text, COALESCE(new.compressed_text, ''));
-                END
-            """)
-            
-            # 会话历史表（用于UI分页显示）
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS conversations (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    session_id TEXT NOT NULL,
-                    user_input TEXT NOT NULL,
-                    assistant_response TEXT,
-                    source TEXT DEFAULT 'local',
-                    timestamp TEXT,
-                    metadata TEXT
-                )
-            """)
-            
-            # 会话历史索引
-            cursor.execute("""
-                CREATE INDEX IF NOT EXISTS idx_session_id 
-                ON conversations(session_id)
-            """)
-            cursor.execute("""
-                CREATE INDEX IF NOT EXISTS idx_conversation_time 
-                ON conversations(timestamp DESC)
-            """)
-            
-            conn.commit()
-            print(f"SQLite数据库初始化完成: {self.db_path}")
     
     def add(self, record: MemoryRecord) -> int:
         """添加记忆记录"""
@@ -810,24 +863,79 @@ class SQLiteStore:
         增强功能：
         - 自动重试连接错误
         - 捕获 ProgrammingError 并恢复
+        - 返回 BM25 分数（归一化到 0-1）
+        - 自动转义 FTS5 特殊字符
         """
+        safe_query = escape_fts5_query(query)
+        
         def _do_search():
             conn = self._get_read_connection()
             cursor = conn.cursor()
             
             cursor.execute("""
-                SELECT m.* FROM memories m
+                SELECT m.*, bm25(memories_fts) as bm25_score
+                FROM memories m
                 JOIN memories_fts fts ON m.id = fts.rowid
                 WHERE memories_fts MATCH ?
                 AND m.weight >= ?
                 AND m.is_archived = 0
-                ORDER BY m.weight DESC, bm25(memories_fts) ASC
+                ORDER BY bm25_score ASC
                 LIMIT ?
-            """, (query, min_weight, limit))
+            """, (safe_query, min_weight, limit))
             
             results = []
             for row in cursor.fetchall():
-                results.append(self._row_to_record(row))
+                record = self._row_to_record(row)
+                results.append(record)
+            
+            return results
+        
+        return self._retry_on_connection_error(_do_search)
+    
+    def search_with_normalized_score(self, query: str, limit: int = 10, min_weight: float = 0.0) -> List[Tuple[MemoryRecord, float]]:
+        """
+        全文搜索（带归一化 BM25 分数）
+        
+        Args:
+            query: 查询文本
+            limit: 返回数量限制
+            min_weight: 最小权重过滤
+        
+        Returns:
+            [(MemoryRecord, normalized_score), ...] 列表
+            normalized_score 范围为 0-1，1 表示最相关
+        
+        BM25 分数归一化策略：
+        - BM25 分数为负数，越接近 0 越相关
+        - 使用 sigmoid 函数归一化：score = 1 / (1 + exp(-bm25 / 10))
+        - 这样可以将负数 BM25 分数映射到 0-1 范围
+        """
+        safe_query = escape_fts5_query(query)
+        
+        def _do_search():
+            conn = self._get_read_connection()
+            cursor = conn.cursor()
+            
+            cursor.execute("""
+                SELECT m.*, bm25(memories_fts) as bm25_score
+                FROM memories m
+                JOIN memories_fts fts ON m.id = fts.rowid
+                WHERE memories_fts MATCH ?
+                AND m.weight >= ?
+                AND m.is_archived = 0
+                ORDER BY bm25_score ASC
+                LIMIT ?
+            """, (safe_query, min_weight, limit))
+            
+            results = []
+            for row in cursor.fetchall():
+                record = self._row_to_record(row)
+                bm25_score = record.bm25_score
+                
+                import math
+                normalized_score = 1.0 / (1.0 + math.exp(-bm25_score / 10.0))
+                
+                results.append((record, normalized_score))
             
             return results
         
@@ -891,14 +999,14 @@ class SQLiteStore:
                         access_count = access_count + 1,
                         last_access_time = ?
                     WHERE id = ?
-                """, (self.MAX_WEIGHT, self.WEIGHT_BOOST_ON_ACCESS, 
+                """, (self._max_weight, self._weight_boost_on_access, 
                       datetime.now().isoformat(), record_id))
             else:
                 cursor.execute("""
                     UPDATE memories 
                     SET weight = MAX(0, MIN(?, weight + ?))
                     WHERE id = ?
-                """, (self.MAX_WEIGHT, delta or 0, record_id))
+                """, (self._max_weight, delta or 0, record_id))
             
             conn.commit()
     
@@ -1027,7 +1135,7 @@ class SQLiteStore:
             }
         """
         if days_threshold is None:
-            days_threshold = self.FORGET_AGE_DAYS
+            days_threshold = self._forget_age_days
         
         total_decayed = 0
         total_forgotten = 0
@@ -1050,8 +1158,8 @@ class SQLiteStore:
                         AND (metadata IS NULL OR metadata NOT LIKE '%"important"%')
                         LIMIT ?
                     )
-                """, (self.WEIGHT_DECAY_RATE, threshold_time, 
-                      self.MIN_WEIGHT_THRESHOLD, batch_size))
+                """, (self._weight_decay_rate, threshold_time, 
+                      self._min_weight_threshold, batch_size))
                 
                 batch_decayed = cursor.rowcount
                 total_decayed += batch_decayed
@@ -1069,7 +1177,7 @@ class SQLiteStore:
                     AND vector_id != ''
                     AND (metadata IS NULL OR metadata NOT LIKE '%"important"%')
                     LIMIT ?
-                """, (self.MIN_WEIGHT_THRESHOLD, batch_size))
+                """, (self._min_weight_threshold, batch_size))
                 
                 rows = cursor.fetchall()
                 if not rows:
@@ -1113,7 +1221,7 @@ class SQLiteStore:
         - 捕获 ProgrammingError 并恢复
         """
         if threshold is None:
-            threshold = self.MIN_WEIGHT_THRESHOLD * 2
+            threshold = self._min_weight_threshold * 2
         
         def _do_get():
             conn = self._get_read_connection()
@@ -1147,7 +1255,7 @@ class SQLiteStore:
         - 捕获 ProgrammingError 并恢复
         """
         if threshold is None:
-            threshold = self.MAX_WEIGHT * 0.6
+            threshold = self._max_weight * 0.6
         
         recent_time = (datetime.now() - timedelta(days=7)).isoformat()
         
@@ -1217,7 +1325,7 @@ class SQLiteStore:
         应该升级到向量库以支持语义检索。
         """
         if threshold is None:
-            threshold = self.MAX_WEIGHT * 0.5
+            threshold = self._max_weight * 0.5
         
         recent_time = (datetime.now() - timedelta(days=7)).isoformat()
         
@@ -1320,7 +1428,7 @@ class SQLiteStore:
         cursor.execute("""
             SELECT COUNT(*) FROM memories 
             WHERE weight < ? AND is_archived = 0
-        """, (self.MIN_WEIGHT_THRESHOLD * 2,))
+        """, (self._min_weight_threshold * 2,))
         low_weight_count = cursor.fetchone()[0]
         
         cursor.execute("""
@@ -1348,25 +1456,28 @@ class SQLiteStore:
     
     def _row_to_record(self, row: sqlite3.Row) -> MemoryRecord:
         """将数据库行转换为MemoryRecord"""
+        row_keys = row.keys()
+        
         metadata = {}
-        if row["metadata"]:
+        if "metadata" in row_keys and row["metadata"]:
             try:
                 metadata = json.loads(row["metadata"])
             except json.JSONDecodeError:
                 pass
         
         return MemoryRecord(
-            id=row["id"],
-            text=row["text"],
-            compressed_text=row["compressed_text"],
-            source=row["source"],
-            weight=row["weight"],
-            access_count=row["access_count"],
-            last_access_time=row["last_access_time"],
-            created_time=row["created_time"],
+            id=row["id"] if "id" in row_keys else None,
+            text=row["text"] if "text" in row_keys else "",
+            compressed_text=row["compressed_text"] if "compressed_text" in row_keys else None,
+            source=row["source"] if "source" in row_keys else "user",
+            weight=row["weight"] if "weight" in row_keys else 1.0,
+            access_count=row["access_count"] if "access_count" in row_keys else 0,
+            last_access_time=row["last_access_time"] if "last_access_time" in row_keys else None,
+            created_time=row["created_time"] if "created_time" in row_keys else None,
             metadata=metadata,
-            vector_id=row["vector_id"] if "vector_id" in row.keys() else None,
-            is_vectorized=row["is_vectorized"] if "is_vectorized" in row.keys() else 0
+            vector_id=row["vector_id"] if "vector_id" in row_keys else None,
+            is_vectorized=row["is_vectorized"] if "is_vectorized" in row_keys else 0,
+            bm25_score=row["bm25_score"] if "bm25_score" in row_keys else 0.0
         )
     
     def update_vector_status(self, record_id: int, vector_id: str, is_vectorized: int = 1):
