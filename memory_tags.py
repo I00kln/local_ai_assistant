@@ -3,6 +3,37 @@
 from typing import Optional
 from datetime import datetime, timedelta
 
+
+class MemoryConstants:
+    """
+    记忆系统常量定义
+    
+    魔法数字说明：
+    - L3_COOLDOWN_MULTIPLIER: L3回流冷却期倍数
+      从L3回流后的冷却期 = 原冷却期 * 此倍数
+      值为2表示回流后冷却期翻倍，防止频繁回流
+    - KEYWORD_USER_WEIGHT_MULTIPLIER: 用户消息关键词权重倍数
+      用户消息中的关键词权重 = 原权重 * 此倍数
+      值为2.0表示用户消息权重是助理消息的2倍
+    - KEYWORD_COVERAGE_MULTIPLIER: 关键词覆盖率计算倍数
+      用于计算覆盖率时的分母调整
+    - L3_SEARCH_RESULT_MULTIPLIER: L3搜索结果倍数
+      L3搜索返回数量 = top_k * 此倍数
+      值为2表示返回2倍结果用于后续过滤
+    - NUMBER_WEIGHT_SCORE: 数值权重分数
+      每个数值对信息密度的贡献分数
+    - DENSITY_NORMALIZATION_MULTIPLIER: 密度归一化倍数
+      用于将密度值归一化到0-1范围
+    """
+    
+    L3_COOLDOWN_MULTIPLIER = 2
+    KEYWORD_USER_WEIGHT_MULTIPLIER = 2.0
+    KEYWORD_COVERAGE_MULTIPLIER = 2
+    L3_SEARCH_RESULT_MULTIPLIER = 2
+    NUMBER_WEIGHT_SCORE = 2.0
+    DENSITY_NORMALIZATION_MULTIPLIER = 2.0
+
+
 class MemoryTags:
     """记忆元数据标签常量"""
     
@@ -379,7 +410,7 @@ class MemoryTagHelper:
             if moved_time_str:
                 try:
                     moved_time = datetime.fromisoformat(moved_time_str)
-                    cooldown_end = moved_time + timedelta(hours=cooldown_hours * 2)
+                    cooldown_end = moved_time + timedelta(hours=cooldown_hours * MemoryConstants.L3_COOLDOWN_MULTIPLIER)
                     if datetime.now() < cooldown_end:
                         return True
                 except Exception:

@@ -2,8 +2,48 @@ import logging
 import os
 import uuid
 from typing import Optional, Dict, Any
-from logging.handlers import TimedRotatingFileHandler
+from logging.handlers import TimedRotatingFileHandler, RotatingFileHandler
 from contextvars import ContextVar
+
+
+class LogConfig:
+    """
+    日志配置常量
+    
+    日志格式说明：
+    - LOG_FORMAT: 统一日志格式
+      %(asctime)s: 时间戳
+      %(levelname)-8s: 日志级别（左对齐8字符）
+      %(message)s: 日志消息
+    
+    轮转配置说明：
+    - ROTATION_TYPE: 轮转类型（time=按时间, size=按大小）
+    - ROTATION_WHEN: 时间轮转间隔（midnight=每天午夜）
+    - ROTATION_INTERVAL: 轮转间隔值
+    - ROTATION_BACKUP_COUNT: 保留备份数量
+    - ROTATION_MAX_BYTES: 大小轮转最大字节数（10MB）
+    
+    日志级别说明：
+    - DEFAULT_LEVEL: 默认日志级别
+    - CONSOLE_LEVEL: 控制台默认级别
+    - FILE_LEVEL: 文件默认级别
+    """
+    
+    LOG_FORMAT = '%(asctime)s | %(levelname)-8s | %(message)s'
+    LOG_DATE_FORMAT = '%Y-%m-%d %H:%M:%S'
+    
+    ROTATION_TYPE = 'time'
+    ROTATION_WHEN = 'midnight'
+    ROTATION_INTERVAL = 1
+    ROTATION_BACKUP_COUNT = 30
+    ROTATION_MAX_BYTES = 10 * 1024 * 1024
+    
+    DEFAULT_LEVEL = logging.DEBUG
+    CONSOLE_LEVEL = logging.INFO
+    FILE_LEVEL = logging.DEBUG
+    
+    LOG_DIR_NAME = 'logs'
+    LOG_FILE_NAME = 'memory.log'
 
 
 _trace_id: ContextVar[str] = ContextVar('trace_id', default='')
@@ -144,31 +184,40 @@ class StructuredLogger:
         
         self._initialized = True
         self.logger = logging.getLogger('MemorySystem')
-        self.logger.setLevel(logging.DEBUG)
+        self.logger.setLevel(LogConfig.DEFAULT_LEVEL)
         
-        log_dir = os.path.join(os.path.dirname(__file__), 'logs')
+        log_dir = os.path.join(os.path.dirname(__file__), LogConfig.LOG_DIR_NAME)
         os.makedirs(log_dir, exist_ok=True)
         
-        log_file = os.path.join(log_dir, 'memory.log')
+        log_file = os.path.join(log_dir, LogConfig.LOG_FILE_NAME)
         
-        file_handler = TimedRotatingFileHandler(
-            filename=log_file,
-            when='midnight',
-            interval=1,
-            backupCount=30,
-            encoding='utf-8'
-        )
-        file_handler.setLevel(logging.DEBUG)
-        file_handler.suffix = "%Y%m%d"
+        if LogConfig.ROTATION_TYPE == 'time':
+            file_handler = TimedRotatingFileHandler(
+                filename=log_file,
+                when=LogConfig.ROTATION_WHEN,
+                interval=LogConfig.ROTATION_INTERVAL,
+                backupCount=LogConfig.ROTATION_BACKUP_COUNT,
+                encoding='utf-8'
+            )
+            file_handler.suffix = "%Y%m%d"
+        else:
+            file_handler = RotatingFileHandler(
+                filename=log_file,
+                maxBytes=LogConfig.ROTATION_MAX_BYTES,
+                backupCount=LogConfig.ROTATION_BACKUP_COUNT,
+                encoding='utf-8'
+            )
+        
+        file_handler.setLevel(LogConfig.FILE_LEVEL)
         file_formatter = logging.Formatter(
-            '%(asctime)s | %(levelname)-8s | %(message)s',
-            datefmt='%Y-%m-%d %H:%M:%S'
+            LogConfig.LOG_FORMAT,
+            datefmt=LogConfig.LOG_DATE_FORMAT
         )
         file_handler.setFormatter(file_formatter)
         
         console_handler = logging.StreamHandler()
-        console_handler.setLevel(logging.INFO)
-        console_formatter = logging.Formatter('%(message)s')
+        console_handler.setLevel(LogConfig.CONSOLE_LEVEL)
+        console_formatter = logging.Formatter(LogConfig.LOG_FORMAT)
         console_handler.setFormatter(console_formatter)
         
         self.logger.addHandler(file_handler)

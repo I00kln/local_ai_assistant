@@ -417,6 +417,9 @@ class LLMTagger:
     
     异步处理，不阻塞主流程
     在压缩时复用 LLM 调用
+    
+    依赖注入：
+    - sqlite_store: 通过 set_sqlite_store() 注入，避免循环依赖
     """
     
     LLM_TAG_PROMPT = """请分析以下记忆内容，返回分类标签。
@@ -436,14 +439,42 @@ class LLMTagger:
 
 只返回 JSON，不要其他解释。"""
     
-    def __init__(self, config: TagConfig = None):
+    def __init__(self, config: TagConfig = None, sqlite_store=None):
         self.config = config or TagConfig()
+        self._sqlite_store = sqlite_store
         self._task_queue = queue.Queue(maxsize=100)
         self._result_cache: Dict[str, MemoryTag] = {}
         self._running = False
         self._worker_thread: Optional[threading.Thread] = None
         self._llm_client = None
         self._log = self._get_logger()
+    
+    def set_sqlite_store(self, sqlite_store):
+        """
+        设置 SQLite 存储实例（依赖注入）
+        
+        Args:
+            sqlite_store: SQLiteStore 实例
+        """
+        self._sqlite_store = sqlite_store
+    
+    def _get_sqlite_store(self):
+        """
+        获取 SQLite 存储实例
+        
+        Returns:
+            SQLiteStore 实例或 None
+        """
+        if self._sqlite_store is not None:
+            return self._sqlite_store
+        
+        try:
+            from sqlite_store import get_sqlite_store
+            self._sqlite_store = get_sqlite_store()
+            return self._sqlite_store
+        except Exception as e:
+            self._log.error("GET_SQLITE_STORE_FAILED", error=str(e))
+            return None
     
     def _get_logger(self):
         """获取日志器"""
@@ -509,18 +540,24 @@ class LLMTagger:
                 if use_atomic_update:
                     try:
                         memory_id_int = int(memory_id)
-                        from sqlite_store import SQLiteStore
-                        sqlite_store = SQLiteStore()
-                        sqlite_store.update_metadata_field(
-                            record_id=memory_id_int,
-                            field_path="semantic_tag",
-                            field_value=tag.to_dict()
-                        )
-                        self._log.info(
-                            "LLM_TAG_ATOMIC_UPDATE",
-                            memory_id=memory_id,
-                            category=tag.category
-                        )
+                        sqlite_store = self._get_sqlite_store()
+                        
+                        if sqlite_store:
+                            sqlite_store.update_metadata_field(
+                                record_id=memory_id_int,
+                                field_path="semantic_tag",
+                                field_value=tag.to_dict()
+                            )
+                            self._log.info(
+                                "LLM_TAG_ATOMIC_UPDATE",
+                                memory_id=memory_id,
+                                category=tag.category
+                            )
+                        else:
+                            self._log.warning(
+                                "LLM_TAG_SQLITE_NOT_AVAILABLE",
+                                memory_id=memory_id
+                            )
                     except (ValueError, Exception) as e:
                         self._log.warning(
                             "LLM_TAG_ATOMIC_FAILED",
@@ -944,12 +981,15 @@ class TagClassifier:
     标签分类器主入口
     
     单例模式，整合所有标签功能
+    
+    依赖注入：
+    - sqlite_store: 通过 set_sqlite_store() 或构造函数注入，避免循环依赖
     """
     
     _instance: Optional['TagClassifier'] = None
     _lock = threading.Lock()
     
-    def __new__(cls):
+    def __new__(cls, sqlite_store=None):
         if cls._instance is None:
             with cls._lock:
                 if cls._instance is None:
@@ -957,11 +997,14 @@ class TagClassifier:
                     cls._instance._initialized = False
         return cls._instance
     
-    def __init__(self):
+    def __init__(self, sqlite_store=None):
         if self._initialized:
+            if sqlite_store is not None:
+                self._sqlite_store = sqlite_store
             return
         
         self._initialized = True
+        self._sqlite_store = sqlite_store
         self.config = TagConfig()
         self.stats = TagStats()
         
@@ -974,6 +1017,35 @@ class TagClassifier:
         
         if self.config.enabled and self.config.llm_tagging_enabled:
             self._llm_tagger.start()
+    
+    def set_sqlite_store(self, sqlite_store):
+        """
+        设置 SQLite 存储实例（依赖注入）
+        
+        Args:
+            sqlite_store: SQLiteStore 实例
+        """
+        self._sqlite_store = sqlite_store
+    
+    def _get_sqlite_store(self):
+        """
+        获取 SQLite 存储实例
+        
+        优先使用注入的实例，否则延迟获取
+        
+        Returns:
+            SQLiteStore 实例或 None
+        """
+        if self._sqlite_store is not None:
+            return self._sqlite_store
+        
+        try:
+            from sqlite_store import get_sqlite_store
+            self._sqlite_store = get_sqlite_store()
+            return self._sqlite_store
+        except Exception as e:
+            self._log.error("GET_SQLITE_STORE_FAILED", error=str(e))
+            return None
     
     def _get_logger(self):
         """获取日志器"""
@@ -1155,18 +1227,17 @@ class TagClassifier:
         Args:
             record_id: 记录ID
             tag: 标签对象
-            sqlite_store: SQLite 存储实例（可选，自动获取）
+            sqlite_store: SQLite 存储实例（可选，使用依赖注入）
         
         Returns:
             是否成功
         """
         if sqlite_store is None:
-            try:
-                from sqlite_store import SQLiteStore
-                sqlite_store = SQLiteStore()
-            except Exception as e:
-                self._log.error("GET_SQLITE_STORE_FAILED", error=str(e))
-                return False
+            sqlite_store = self._get_sqlite_store()
+        
+        if sqlite_store is None:
+            self._log.error("SQLITE_STORE_NOT_AVAILABLE")
+            return False
         
         try:
             return sqlite_store.update_metadata_field(
@@ -1196,6 +1267,14 @@ class TagClassifier:
         self._log.info("TAG_CLASSIFIER_SHUTDOWN")
 
 
-def get_tag_classifier() -> TagClassifier:
-    """获取标签分类器单例"""
-    return TagClassifier()
+def get_tag_classifier(sqlite_store=None) -> TagClassifier:
+    """
+    获取标签分类器单例
+    
+    Args:
+        sqlite_store: SQLite 存储实例（可选，用于依赖注入）
+    
+    Returns:
+        TagClassifier 实例
+    """
+    return TagClassifier(sqlite_store=sqlite_store)

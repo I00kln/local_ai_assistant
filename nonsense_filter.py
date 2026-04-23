@@ -9,7 +9,7 @@ from typing import List, Dict, Tuple, Optional
 from dataclasses import dataclass
 from datetime import datetime
 from config import config
-from memory_tags import MemoryTagHelper
+from memory_tags import MemoryTagHelper, MemoryConstants
 
 
 @dataclass
@@ -404,8 +404,7 @@ class NonsenseFilter:
             # 综合评分（越高表示信息越丰富）
             density = (vec_mean * 0.3 + vec_std * 0.4 + vec_entropy * 0.3)
             
-            # 归一化到0-1
-            density = min(1.0, max(0.0, density * 2))
+            density = min(1.0, max(0.0, density * MemoryConstants.DENSITY_NORMALIZATION_MULTIPLIER))
             
             return density
         except Exception as e:

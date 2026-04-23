@@ -11,7 +11,7 @@ from vector_store import VectorStore, get_vector_store
 from sqlite_store import SQLiteStore, get_sqlite_store
 from event_bus import get_event_bus, EventType
 from memory_transaction import get_transaction_coordinator
-from memory_tags import MemoryTags, MemoryTagHelper
+from memory_tags import MemoryTags, MemoryTagHelper, MemoryConstants
 from logger import get_logger
 
 
@@ -426,7 +426,7 @@ class MemoryManager:
             
             for kw, kw_weight in keyword_weights.items():
                 if kw in user_text:
-                    score += kw_weight * 2.0
+                    score += kw_weight * MemoryConstants.KEYWORD_USER_WEIGHT_MULTIPLIER
                     matched_keywords += 1
                 if kw in assistant_text:
                     score += kw_weight * 1.0
@@ -438,7 +438,7 @@ class MemoryManager:
                 max_possible_score = sum(keyword_weights.values()) * 3
                 base_similarity = score / max_possible_score if max_possible_score > 0 else 0
                 
-                coverage = matched_keywords / (len(query_keywords) * 2)
+                coverage = matched_keywords / (len(query_keywords) * MemoryConstants.KEYWORD_COVERAGE_MULTIPLIER)
                 
                 time_decay = self._calculate_time_decay(conv.get("timestamp", ""))
                 
@@ -524,7 +524,7 @@ class MemoryManager:
         results = []
         
         try:
-            l3_results = self.sqlite.search(query, limit=top_k * 2)
+            l3_results = self.sqlite.search(query, limit=top_k * MemoryConstants.L3_SEARCH_RESULT_MULTIPLIER)
             
             for record in l3_results:
                 text = record.compressed_text or record.text

@@ -2,6 +2,7 @@
 # 上下文构建器 - 使用三层记忆管理器
 from typing import List, Dict, Tuple
 from config import config
+from memory_tags import MemoryConstants
 import re
 
 SHORT_QUERY_STOPWORDS = {
@@ -488,7 +489,7 @@ class ContextBuilder:
         
         number_patterns = r'\d+(?:\.\d+)?(?:元|美元|块|万|千|百|亿|%|％|度|kg|kg|ml|GB|MB|TB)?'
         numbers = re.findall(number_patterns, text)
-        score += len(numbers) * 2.0
+        score += len(numbers) * MemoryConstants.NUMBER_WEIGHT_SCORE
         
         proper_noun_patterns = r'[A-Z][a-z]+|[\u4e00-\u9fa5]{2,4}(?:公司|项目|产品|版本|系统|模块)'
         proper_nouns = re.findall(proper_noun_patterns, text)
