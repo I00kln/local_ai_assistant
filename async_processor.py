@@ -21,6 +21,7 @@ from compression_strategies import (
     RuleBasedCompressionStrategy,
     create_compression_chain
 )
+from background_scheduler import get_background_scheduler, TaskType, TaskPriority
 
 _tag_classifier = None
 
@@ -53,6 +54,7 @@ class AsyncMemoryProcessor:
         self._mem_config = get_memory_config()
         self._tx_coordinator = get_transaction_coordinator()
         self._event_bus = get_event_bus()
+        self._scheduler = get_background_scheduler()
         
         self._buffer_lock = threading.Lock()
         self._memory_flow_lock = threading.Lock()
@@ -102,6 +104,8 @@ class AsyncMemoryProcessor:
             return
         
         self.running = True
+        self._scheduler.start()
+        
         self.thread = threading.Thread(target=self._process_loop, daemon=True)
         self.thread.start()
         
@@ -115,16 +119,38 @@ class AsyncMemoryProcessor:
         
         self._log.info("ASYNC_PROCESSOR_STARTED")
     
+    def stop(self, timeout: float = 10.0):
+        """
+        停止后台处理线程
+        
+        Args:
+            timeout: 等待超时时间（秒）
+        """
+        self.running = False
+        
+        self._scheduler.stop()
+        
+        if self.thread and self.thread.is_alive():
+            self.thread.join(timeout=timeout)
+        
+        self._log.info("ASYNC_PROCESSOR_STOPPED")
+    
     def _compression_loop(self):
         """
         独立的压缩处理循环
         
         将压缩和遗忘等重型操作从主处理循环中分离，
         避免阻塞队列处理
+        
+        使用调度器提交任务，确保并发安全
         """
         while self.running:
             try:
                 time.sleep(self._mem_config.async_processor.compressor_check_interval)
+                if not self.running:
+                    break
+                
+                self._schedule_memory_flow_tasks()
                 if not self.running:
                     break
                 self._check_memory_flow()
@@ -306,31 +332,86 @@ class AsyncMemoryProcessor:
         """
         调度孤立向量清理任务（非阻塞）
         
-        在后台线程中启动清理，不阻塞主流程
+        在后台线程中启动清理，不阻塞主流程。
+        
+        特性：
+        - 分批处理，每批使用配置的 batch_size
+        - 批次间间隔使用配置的 interval
+        - 通过 EventBus 发布进度事件
+        - 可通过 self.running 标志中断
+        - 完成后发布完成事件
         """
         if not self.sqlite:
             return
         
+        if getattr(self, '_orphan_cleanup_running', False):
+            self._log.info("ORPHAN_CLEANUP_ALREADY_RUNNING")
+            return
+        
         def cleanup_task():
+            self._orphan_cleanup_running = True
             try:
                 total_cleaned = 0
-                batch_size = 100
-                max_batches = 10
+                total_checked = 0
+                offset = 0
+                batch_size = getattr(config.async_processor, 'orphan_cleanup_batch_size', 100)
+                interval = getattr(config.async_processor, 'orphan_cleanup_interval', 0.1)
                 
-                for _ in range(max_batches):
-                    cleaned = self._check_and_clean_orphan_vectors(batch_limit=batch_size)
+                while self.running:
+                    cleaned, new_offset = self._check_and_clean_orphan_vectors(
+                        batch_limit=batch_size, 
+                        offset=offset
+                    )
+                    
                     total_cleaned += cleaned
-                    if cleaned == 0:
+                    total_checked += batch_size
+                    
+                    self._event_bus.publish(
+                        EventType.ORPHAN_CLEANUP_PROGRESS,
+                        {
+                            "batch_cleaned": cleaned,
+                            "total_cleaned": total_cleaned,
+                            "total_checked": total_checked,
+                            "offset": offset,
+                            "batch_size": batch_size
+                        },
+                        source="AsyncProcessor"
+                    )
+                    
+                    if new_offset == offset:
                         break
-                    time.sleep(0.1)
+                    
+                    offset = new_offset
+                    time.sleep(interval)
                 
-                if total_cleaned > 0:
-                    self._log.info("ORPHAN_CLEANUP_COMPLETE", total_cleaned=total_cleaned)
+                self._log.info("ORPHAN_CLEANUP_COMPLETE", 
+                              total_cleaned=total_cleaned,
+                              total_checked=total_checked)
+                
+                self._event_bus.publish(
+                    EventType.ORPHAN_CLEANUP_COMPLETE,
+                    {
+                        "total_cleaned": total_cleaned,
+                        "total_checked": total_checked
+                    },
+                    source="AsyncProcessor"
+                )
             except Exception as e:
                 self._log.error("ORPHAN_CLEANUP_TASK_FAILED", error=str(e))
+            finally:
+                self._orphan_cleanup_running = False
         
         cleanup_thread = threading.Thread(target=cleanup_task, daemon=True)
         cleanup_thread.start()
+    
+    def stop_orphan_cleanup(self):
+        """
+        停止孤立向量清理任务
+        
+        通过设置 _orphan_cleanup_running 标志来中断清理
+        """
+        self._orphan_cleanup_running = False
+        self._log.info("ORPHAN_CLEANUP_STOPPED")
     
     def _sync_timestamps(self):
         """
@@ -495,17 +576,66 @@ class AsyncMemoryProcessor:
         """
         处理队列满的情况
         
-        策略：
-        1. 尝试写入本地文件缓冲
-        2. 如果文件缓冲也失败，根据配置决定丢弃策略
+        策略（按优先级）：
+        1. 尝试写入 SQLite pending_queue 表（持久化缓冲）
+        2. 尝试写入本地文件缓冲
+        3. 根据配置决定丢弃策略
+        4. 触发 EventBus 事件通知 UI
+        
+        配置选项：
+        - drop_oldest: 丢弃最旧的记录
+        - reject: 拒绝新记录
+        - block: 阻塞等待（带超时）
         """
         queue_config = self._get_queue_config()
         action = getattr(queue_config, 'queue_full_action', 'drop_oldest')
+        block_timeout = getattr(queue_config, 'queue_block_timeout', 5.0)
+        
+        if self.sqlite:
+            try:
+                record_id = self.sqlite.enqueue_pending(conv_data)
+                if record_id:
+                    self._log.info("QUEUE_FULL_BUFFERED_TO_SQLITE",
+                                  record_id=record_id,
+                                  queue_size=self.pending_queue.qsize())
+                    
+                    self._event_bus.publish(
+                        EventType.QUEUE_OVERFLOW,
+                        {
+                            "buffer_type": "sqlite",
+                            "record_id": record_id,
+                            "queue_size": self.pending_queue.qsize(),
+                            "pending_count": self.sqlite.get_pending_queue_count()
+                        },
+                        source="AsyncProcessor"
+                    )
+                    return
+            except Exception as e:
+                self._log.error("SQLITE_PENDING_QUEUE_FAILED", error=str(e))
         
         if self._write_to_overflow_buffer(conv_data):
             self._log.info("QUEUE_FULL_BUFFERED_TO_FILE",
                           queue_size=self.pending_queue.qsize())
+            
+            self._event_bus.publish(
+                EventType.QUEUE_OVERFLOW,
+                {
+                    "buffer_type": "file",
+                    "queue_size": self.pending_queue.qsize()
+                },
+                source="AsyncProcessor"
+            )
             return
+        
+        if action == "block":
+            try:
+                self.pending_queue.put(conv_data, timeout=block_timeout)
+                self._log.info("QUEUE_FULL_BLOCKED_SUCCESS",
+                              timeout=block_timeout)
+                return
+            except queue.Full:
+                self._log.warning("QUEUE_FULL_BLOCK_TIMEOUT",
+                                 timeout=block_timeout)
         
         if action == "drop_oldest":
             try:
@@ -522,6 +652,16 @@ class AsyncMemoryProcessor:
             self._log.warning("QUEUE_FULL_REJECTED",
                               rejected_count=self._queue_dropped_count,
                               queue_size=self.pending_queue.qsize())
+        
+        self._event_bus.publish(
+            EventType.QUEUE_DROPPED,
+            {
+                "action": action,
+                "dropped_count": self._queue_dropped_count,
+                "queue_size": self.pending_queue.qsize()
+            },
+            source="AsyncProcessor"
+        )
     
     def _write_to_overflow_buffer(self, conv_data: Dict) -> bool:
         """
@@ -555,7 +695,41 @@ class AsyncMemoryProcessor:
         恢复溢出缓冲区中的数据
         
         启动时检查并重新处理溢出的对话数据
+        
+        恢复顺序：
+        1. SQLite pending_queue 表（优先）
+        2. 本地文件缓冲
         """
+        recovered_total = 0
+        
+        if self.sqlite:
+            try:
+                pending_records = self.sqlite.dequeue_pending(limit=100)
+                recovered_ids = []
+                
+                for record_id, conv_data in pending_records:
+                    try:
+                        self.pending_queue.put_nowait(conv_data)
+                        recovered_ids.append(record_id)
+                        recovered_total += 1
+                    except queue.Full:
+                        break
+                
+                if recovered_ids:
+                    self.sqlite.mark_pending_processed(recovered_ids)
+                    self._log.info("SQLITE_PENDING_QUEUE_RECOVERED", count=len(recovered_ids))
+                    
+                    self._event_bus.publish(
+                        EventType.QUEUE_RECOVERED,
+                        {
+                            "source": "sqlite",
+                            "count": len(recovered_ids)
+                        },
+                        source="AsyncProcessor"
+                    )
+            except Exception as e:
+                self._log.error("SQLITE_PENDING_RECOVERY_FAILED", error=str(e))
+        
         import json
         import os
         import glob
@@ -563,13 +737,12 @@ class AsyncMemoryProcessor:
         try:
             buffer_dir = os.path.join(os.path.dirname(__file__), "overflow_buffer")
             if not os.path.exists(buffer_dir):
-                return
+                return recovered_total
             
             buffer_files = glob.glob(os.path.join(buffer_dir, "overflow_*.jsonl"))
             if not buffer_files:
-                return
+                return recovered_total
             
-            recovered_count = 0
             for buffer_file in buffer_files:
                 try:
                     with open(buffer_file, "r", encoding="utf-8") as f:
@@ -581,16 +754,11 @@ class AsyncMemoryProcessor:
                                 conv_data = json.loads(line)
                                 try:
                                     self.pending_queue.put_nowait(conv_data)
-                                    recovered_count += 1
+                                    recovered_total += 1
                                 except queue.Full:
                                     break
                             except json.JSONDecodeError:
                                 continue
-                    
-                    if recovered_count > 0:
-                        self._log.info("OVERFLOW_BUFFER_RECOVERED", 
-                                      file=buffer_file,
-                                      count=recovered_count)
                     
                     os.remove(buffer_file)
                     
@@ -599,24 +767,116 @@ class AsyncMemoryProcessor:
                                    file=buffer_file,
                                    error=str(e))
             
-            if recovered_count > 0:
-                self._log.info("OVERFLOW_BUFFER_TOTAL_RECOVERED", count=recovered_count)
+            if recovered_total > 0:
+                self._log.info("OVERFLOW_BUFFER_TOTAL_RECOVERED", count=recovered_total)
+                
+                self._event_bus.publish(
+                    EventType.QUEUE_RECOVERED,
+                    {
+                        "source": "file",
+                        "count": recovered_total
+                    },
+                    source="AsyncProcessor"
+                )
                 
         except Exception as e:
             self._log.error("OVERFLOW_BUFFER_RECOVERY_ERROR", error=str(e))
+        
+        return recovered_total
     
-    def get_queue_stats(self) -> Dict[str, int]:
-        """获取队列统计信息"""
-        return {
+    def _recover_pending_during_runtime(self):
+        """
+        运行时恢复待处理数据
+        
+        在后台线程中定期检查并恢复 SQLite pending_queue 中的数据。
+        """
+        if not self.sqlite:
+            return
+        
+        try:
+            pending_count = self.sqlite.get_pending_queue_count()
+            if pending_count == 0:
+                return
+            
+            available_slots = self.pending_queue.maxsize - self.pending_queue.qsize()
+            if available_slots <= 0:
+                return
+            
+            recover_limit = min(available_slots, 10)
+            pending_records = self.sqlite.dequeue_pending(limit=recover_limit)
+            
+            if not pending_records:
+                return
+            
+            recovered_ids = []
+            for record_id, conv_data in pending_records:
+                try:
+                    self.pending_queue.put_nowait(conv_data)
+                    recovered_ids.append(record_id)
+                except queue.Full:
+                    break
+            
+            if recovered_ids:
+                self.sqlite.mark_pending_processed(recovered_ids)
+                self._log.info("RUNTIME_PENDING_RECOVERED", count=len(recovered_ids))
+                
+                self._event_bus.publish(
+                    EventType.QUEUE_RECOVERED,
+                    {
+                        "source": "sqlite_runtime",
+                        "count": len(recovered_ids),
+                        "remaining": self.sqlite.get_pending_queue_count()
+                    },
+                    source="AsyncProcessor"
+                )
+        except Exception as e:
+            self._log.error("RUNTIME_PENDING_RECOVERY_FAILED", error=str(e))
+    
+    def get_queue_stats(self) -> Dict[str, Any]:
+        """
+        获取队列统计信息
+        
+        Returns:
+            包含内存队列和持久化队列状态的字典
+        """
+        stats = {
             "queue_size": self.pending_queue.qsize(),
             "queue_maxsize": self.pending_queue.maxsize,
             "total_enqueued": self._queue_total_count,
             "total_dropped": self._queue_dropped_count,
-            "drop_rate": self._queue_dropped_count / max(1, self._queue_total_count)
+            "drop_rate": self._queue_dropped_count / max(1, self._queue_total_count),
+            "pending_sqlite": 0,
+            "pending_file": 0
         }
+        
+        if self.sqlite:
+            try:
+                stats["pending_sqlite"] = self.sqlite.get_pending_queue_count()
+            except Exception:
+                pass
+        
+        import os
+        import glob
+        try:
+            buffer_dir = os.path.join(os.path.dirname(__file__), "overflow_buffer")
+            if os.path.exists(buffer_dir):
+                buffer_files = glob.glob(os.path.join(buffer_dir, "overflow_*.jsonl"))
+                stats["pending_file"] = len(buffer_files)
+        except Exception:
+            pass
+        
+        return stats
     
     def _process_loop(self):
-        """后台处理循环"""
+        """
+        后台处理循环
+        
+        功能：
+        1. 处理内存队列中的对话
+        2. 空闲时检查并刷新缓冲区
+        3. 空闲时恢复待处理数据
+        4. 空闲时执行去重检查
+        """
         while self.running:
             try:
                 try:
@@ -629,6 +889,7 @@ class AsyncMemoryProcessor:
                 except queue.Empty:
                     self._idle_count += 1
                     self._check_and_flush()
+                    self._recover_pending_during_runtime()
                     self._check_and_dedup()
                     continue
                 
@@ -707,26 +968,19 @@ class AsyncMemoryProcessor:
         流程（两阶段提交 + 事务日志）：
         1. 批量检查幂等性（文本哈希）
         2. 通过 TransactionCoordinator 执行事务：
-           - 准备阶段：批量写入SQLite（标记为待向量化）
+           - 准备阶段：批量写入SQLite（标记为待向量化 is_vectorized=0）
            - 提交阶段：批量写入ChromaDB
-           - 成功后：批量更新SQLite状态
+           - 成功后：批量更新SQLite状态为 is_vectorized=1
         3. 事务失败时自动回滚
         
-        性能优化：
-        - 使用批量哈希计算
-        - 使用批量存在性检查
-        - 使用批量插入（add_batch）
-        - 使用批量状态更新
-        - ID预生成实现幂等性
-        
-        失败恢复：
-        - 事务状态持久化到 transactions 表
-        - 启动时通过 TransactionCoordinator.recover_pending_transactions 恢复
-        - 使用文本哈希防止重复写入
-        - 预生成vector_id确保重试幂等性
+        事务持久化：
+        - 事务状态持久化到 SQLite transactions 表
+        - 崩溃后可通过 TransactionCoordinator.recover_pending_transactions 恢复
+        - 事务类型为 add_memory_batch
         
         线程安全：
         - 使用 _buffer_lock 保护 batch_buffer 的读取和清空
+        - 使用迁移锁保护批量写入，检索等待迁移完成
         """
         with self._buffer_lock:
             if not self.batch_buffer:
@@ -741,32 +995,76 @@ class AsyncMemoryProcessor:
             return
         
         import uuid
-        sqlite_ids = []
-        vector_ids = []
-        texts_to_vectorize = []
-        metadatas_to_vectorize = []
         
-        if self.sqlite:
-            text_hashes = [self.sqlite.compute_text_hash(text) for text in texts]
-            
-            existing_map = {}
+        tx_coordinator = get_transaction_coordinator()
+        
+        if not tx_coordinator or not tx_coordinator._sqlite_store:
+            self._flush_buffer_without_transaction(texts, metadatas)
+            return
+        
+        text_hashes = [self.sqlite.compute_text_hash(text) for text in texts] if self.sqlite else []
+        
+        existing_map = {}
+        if self.sqlite and text_hashes:
             for text_hash in text_hashes:
                 exists, existing_id = self.sqlite.exists_by_text_hash(text_hash)
                 if exists:
                     existing_map[text_hash] = existing_id
+        
+        tx_data = {
+            "texts": texts,
+            "metadatas": metadatas,
+            "text_hashes": text_hashes,
+            "existing_map": existing_map
+        }
+        
+        def prepare_fn(data):
+            """
+            准备阶段：批量写入 SQLite，标记为待向量化
+            
+            Returns:
+                {
+                    "sqlite_ids": [...],
+                    "vector_ids": [...],
+                    "texts_to_vectorize": [...],
+                    "metadatas_to_vectorize": [...]
+                }
+            """
+            texts = data["texts"]
+            metadatas = data["metadatas"]
+            text_hashes = data.get("text_hashes", [])
+            existing_map = data.get("existing_map", {})
+            
+            sqlite_ids = []
+            vector_ids = []
+            texts_to_vectorize = []
+            metadatas_to_vectorize = []
+            
+            if not self.sqlite:
+                vector_ids = [self.vector_store._generate_deterministic_id(text) for text in texts]
+                return {
+                    "sqlite_ids": [],
+                    "vector_ids": vector_ids,
+                    "texts_to_vectorize": texts,
+                    "metadatas_to_vectorize": metadatas
+                }
             
             new_records = []
             new_record_hashes = []
             
-            for i, (text, meta, text_hash) in enumerate(zip(texts, metadatas, text_hashes)):
+            for i, (text, meta) in enumerate(zip(texts, metadatas)):
+                text_hash = text_hashes[i] if i < len(text_hashes) else self.sqlite.compute_text_hash(text)
+                deterministic_id = self.vector_store._generate_deterministic_id(text)
+                
                 if text_hash in existing_map:
                     existing_id = existing_map[text_hash]
                     record = self.sqlite.get(existing_id)
+                    
                     if record and record.is_vectorized == 1:
                         self._log.debug("SKIP_DUPLICATE", text_preview=text[:50])
                         continue
                     
-                    pre_generated_id = record.vector_id if record and record.vector_id else str(uuid.uuid4())
+                    pre_generated_id = deterministic_id
                     if not record or not record.vector_id:
                         self.sqlite.update_vector_status(existing_id, pre_generated_id, is_vectorized=0)
                     
@@ -777,8 +1075,7 @@ class AsyncMemoryProcessor:
                     meta_with_id[MemoryTags.SQLITE_ID] = existing_id
                     metadatas_to_vectorize.append(meta_with_id)
                 else:
-                    pre_generated_id = str(uuid.uuid4())
-                    from sqlite_store import MemoryRecord
+                    pre_generated_id = deterministic_id
                     
                     tagged_meta = dict(meta) if meta else {}
                     tagger = _get_tag_classifier()
@@ -789,6 +1086,7 @@ class AsyncMemoryProcessor:
                         except Exception as e:
                             self._log.debug("TAG_RULE_FAILED", error=str(e))
                     
+                    from sqlite_store import MemoryRecord
                     record = MemoryRecord(
                         text=text,
                         source=meta.get("source", "local") if meta else "local",
@@ -808,6 +1106,151 @@ class AsyncMemoryProcessor:
                     meta_with_id = dict(record.metadata) if record.metadata else {}
                     meta_with_id[MemoryTags.SQLITE_ID] = new_id
                     metadatas_to_vectorize.append(meta_with_id)
+            
+            return {
+                "sqlite_ids": sqlite_ids,
+                "vector_ids": vector_ids,
+                "texts_to_vectorize": texts_to_vectorize,
+                "metadatas_to_vectorize": metadatas_to_vectorize
+            }
+        
+        def commit_fn(data):
+            """
+            提交阶段：批量写入 ChromaDB
+            
+            Args:
+                data: 包含 prepare_result 的数据
+            
+            Returns:
+                {"result_ids": [...]}
+            """
+            prepare_result = data.get("prepare_result", {})
+            texts_to_vectorize = prepare_result.get("texts_to_vectorize", [])
+            metadatas_to_vectorize = prepare_result.get("metadatas_to_vectorize", [])
+            vector_ids = prepare_result.get("vector_ids", [])
+            
+            if not texts_to_vectorize:
+                return {"result_ids": []}
+            
+            result_ids = self.vector_store.add(
+                texts_to_vectorize,
+                metadatas_to_vectorize,
+                ids=vector_ids
+            )
+            
+            return {"result_ids": result_ids}
+        
+        def rollback_fn(data):
+            """
+            回滚：将 SQLite 记录标记为失败
+            
+            Args:
+                data: 包含 prepare_result 的数据
+            """
+            prepare_result = data.get("prepare_result", {})
+            sqlite_ids = prepare_result.get("sqlite_ids", [])
+            
+            if self.sqlite and sqlite_ids:
+                for sid in sqlite_ids:
+                    self.sqlite.update_vector_status(sid, "", is_vectorized=-1)
+                self._log.info("TRANSACTION_ROLLBACK", count=len(sqlite_ids))
+        
+        result = tx_coordinator.execute_transaction(
+            operation_type="add_memory_batch",
+            data=tx_data,
+            prepare_fn=prepare_fn,
+            commit_fn=commit_fn,
+            rollback_fn=rollback_fn
+        )
+        
+        if result["success"]:
+            prepare_result = result.get("result", {}).get("prepare_result", {})
+            commit_result = result.get("result", {}).get("commit_result", {})
+            
+            sqlite_ids = prepare_result.get("sqlite_ids", [])
+            result_ids = commit_result.get("result_ids", [])
+            
+            if self.sqlite and sqlite_ids and result_ids:
+                self.sqlite.batch_update_vector_status(
+                    [(sid, vid) for sid, vid in zip(sqlite_ids, result_ids)],
+                    is_vectorized=1
+                )
+            
+            texts_to_vectorize = prepare_result.get("texts_to_vectorize", [])
+            self._log.info("ATOMIC_WRITE_COMPLETE", 
+                          count=len(texts_to_vectorize),
+                          transaction_id=result["transaction_id"])
+            self._last_flush_time = time.time()
+            
+            self._event_bus.publish(
+                EventType.MEMORY_WRITTEN,
+                {"count": len(texts_to_vectorize)},
+                source="AsyncProcessor"
+            )
+        else:
+            self._log.error("TRANSACTION_FAILED", 
+                           error=result.get("error"),
+                           transaction_id=result["transaction_id"])
+    
+    def _flush_buffer_without_transaction(self, texts: List[str], metadatas: List[Dict]):
+        """
+        无事务协调器的降级写入
+        
+        Args:
+            texts: 文本列表
+            metadatas: 元数据列表
+        """
+        sqlite_ids = []
+        vector_ids = []
+        texts_to_vectorize = []
+        metadatas_to_vectorize = []
+        
+        if self.sqlite:
+            text_hashes = [self.sqlite.compute_text_hash(text) for text in texts]
+            
+            existing_map = {}
+            for text_hash in text_hashes:
+                exists, existing_id = self.sqlite.exists_by_text_hash(text_hash)
+                if exists:
+                    existing_map[text_hash] = existing_id
+            
+            for i, (text, meta, text_hash) in enumerate(zip(texts, metadatas, text_hashes)):
+                deterministic_id = self.vector_store._generate_deterministic_id(text)
+                
+                if text_hash in existing_map:
+                    existing_id = existing_map[text_hash]
+                    record = self.sqlite.get(existing_id)
+                    if record and record.is_vectorized == 1:
+                        continue
+                    
+                    pre_generated_id = deterministic_id
+                    if not record or not record.vector_id:
+                        self.sqlite.update_vector_status(existing_id, pre_generated_id, is_vectorized=0)
+                    
+                    sqlite_ids.append(existing_id)
+                    vector_ids.append(pre_generated_id)
+                    texts_to_vectorize.append(text)
+                    meta_with_id = dict(meta) if meta else {}
+                    meta_with_id[MemoryTags.SQLITE_ID] = existing_id
+                    metadatas_to_vectorize.append(meta_with_id)
+                else:
+                    pre_generated_id = deterministic_id
+                    from sqlite_store import MemoryRecord
+                    
+                    record = MemoryRecord(
+                        text=text,
+                        source=meta.get("source", "local") if meta else "local",
+                        metadata=meta,
+                        is_vectorized=0,
+                        vector_id=pre_generated_id
+                    )
+                    new_id = self.sqlite.add(record)
+                    sqlite_ids.append(new_id)
+                    vector_ids.append(pre_generated_id)
+                    texts_to_vectorize.append(text)
+                    meta_with_id = dict(meta) if meta else {}
+                    meta_with_id[MemoryTags.SQLITE_ID] = new_id
+                    metadatas_to_vectorize.append(meta_with_id)
         else:
             vector_ids = [str(uuid.uuid4()) for _ in texts]
             texts_to_vectorize = texts
@@ -816,93 +1259,30 @@ class AsyncMemoryProcessor:
         if not texts_to_vectorize:
             return
         
-        tx_data = {
-            "texts": texts_to_vectorize,
-            "metadatas": metadatas_to_vectorize,
-            "vector_ids": vector_ids,
-            "sqlite_ids": sqlite_ids
-        }
-        
-        def prepare_fn(data):
-            return {"prepared": True, "count": len(data["texts"])}
-        
-        def commit_fn(data):
-            result_ids = self.vector_store.add(
-                data["texts"], 
-                data["metadatas"], 
-                ids=data["vector_ids"]
+        try:
+            result_ids = self.vector_store.add(texts_to_vectorize, metadatas_to_vectorize, ids=vector_ids)
+            
+            if self.sqlite and sqlite_ids and result_ids:
+                self.sqlite.batch_update_vector_status(
+                    [(sid, vid) for sid, vid in zip(sqlite_ids, result_ids)],
+                    is_vectorized=1
+                )
+            
+            self._log.info("ATOMIC_WRITE_COMPLETE", count=len(texts_to_vectorize))
+            self._last_flush_time = time.time()
+            
+            self._event_bus.publish(
+                EventType.MEMORY_WRITTEN,
+                {"count": len(texts_to_vectorize)},
+                source="AsyncProcessor"
             )
-            return {"result_ids": result_ids}
-        
-        def rollback_fn(data):
-            if self.sqlite and data.get("sqlite_ids"):
-                for sid in data["sqlite_ids"]:
+            
+        except Exception as e:
+            self._log.error("CHROMADB_WRITE_FAILED", error=str(e))
+            
+            if self.sqlite and sqlite_ids:
+                for sid in sqlite_ids:
                     self.sqlite.update_vector_status(sid, "", is_vectorized=-1)
-                self._log.info("TRANSACTION_ROLLBACK", count=len(data["sqlite_ids"]))
-        
-        tx_coordinator = get_transaction_coordinator()
-        if tx_coordinator and tx_coordinator._sqlite_store:
-            tx_coordinator.begin_migration("flush_buffer")
-            try:
-                result = tx_coordinator.execute_transaction(
-                    operation_type="flush_buffer",
-                    data=tx_data,
-                    prepare_fn=prepare_fn,
-                    commit_fn=commit_fn,
-                    rollback_fn=rollback_fn
-                )
-                
-                if result["success"]:
-                    commit_result = result.get("result", {})
-                    result_ids = commit_result.get("result_ids", [])
-                    
-                    if self.sqlite and sqlite_ids and result_ids:
-                        self.sqlite.batch_update_vector_status(
-                            [(sid, vid) for sid, vid in zip(sqlite_ids, result_ids)],
-                            is_vectorized=1
-                        )
-                    
-                    self._log.info("ATOMIC_WRITE_COMPLETE", 
-                                  count=len(texts_to_vectorize),
-                                  transaction_id=result["transaction_id"])
-                    self._last_flush_time = time.time()
-                    
-                    self._event_bus.publish(
-                        EventType.MEMORY_WRITTEN,
-                        {"count": len(texts_to_vectorize)},
-                        source="AsyncProcessor"
-                    )
-                else:
-                    self._log.error("TRANSACTION_FAILED", 
-                                   error=result.get("error"),
-                                   transaction_id=result["transaction_id"])
-            finally:
-                tx_coordinator.end_migration()
-        else:
-            try:
-                result_ids = self.vector_store.add(texts_to_vectorize, metadatas_to_vectorize, ids=vector_ids)
-                
-                if self.sqlite and sqlite_ids and result_ids:
-                    self.sqlite.batch_update_vector_status(
-                        [(sid, vid) for sid, vid in zip(sqlite_ids, result_ids)],
-                        is_vectorized=1
-                    )
-                
-                self._log.info("ATOMIC_WRITE_COMPLETE", count=len(texts_to_vectorize))
-                self._last_flush_time = time.time()
-                
-                self._event_bus.publish(
-                    EventType.MEMORY_WRITTEN,
-                    {"count": len(texts_to_vectorize)},
-                    source="AsyncProcessor"
-                )
-                
-            except Exception as e:
-                self._log.error("CHROMADB_WRITE_FAILED", error=str(e))
-                
-                if self.sqlite and sqlite_ids:
-                    for sid in sqlite_ids:
-                        self.sqlite.update_vector_status(sid, "", is_vectorized=-1)
     
     def _retry_failed_vectorizations(self):
         """
@@ -1004,7 +1384,7 @@ class AsyncMemoryProcessor:
             self._last_flush_time = current_time
     
     def _check_and_dedup(self):
-        """空闲时检查并执行去重"""
+        """空闲时检查并执行去重（通过调度器）"""
         current_time = time.time()
         
         if self._idle_count < 3:
@@ -1012,20 +1392,81 @@ class AsyncMemoryProcessor:
         
         dedup_interval = self._mem_config.async_processor.dedup_interval
         
-        if current_time - self._last_dedup_time < dedup_interval:
+        if not self._scheduler.should_run_task(TaskType.DEDUP, dedup_interval):
             return
         
         if len(self.vector_store) < 10:
             return
         
-        try:
-            removed = self.vector_store.deduplicate(sqlite_store=self.sqlite)
-            if removed > 0:
-                pass  # ChromaDB自动持久化
-            self._last_dedup_time = current_time
-            self._idle_count = 0
-        except Exception as e:
-            print(f"去重失败: {e}")
+        def dedup_task():
+            try:
+                removed = self.vector_store.deduplicate(sqlite_store=self.sqlite)
+                self._last_dedup_time = time.time()
+                self._idle_count = 0
+                return {"affected_count": removed}
+            except Exception as e:
+                self._log.error("DEDUP_FAILED", error=str(e))
+                raise
+        
+        self._scheduler.submit_task(
+            TaskType.DEDUP,
+            dedup_task,
+            priority=TaskPriority.LOW
+        )
+    
+    def _schedule_memory_flow_tasks(self):
+        """
+        调度记忆流动任务
+        
+        根据时间间隔和优先级提交各类后台任务到调度器。
+        调度器确保任务串行执行，避免并发竞态。
+        """
+        if not config.sqlite_enabled or not self.sqlite:
+            return
+        
+        current_time = time.time()
+        compression_interval = self._mem_config.async_processor.compression_interval
+        
+        if not self._scheduler.should_run_task(TaskType.MIGRATION_L2_TO_L3, compression_interval):
+            return
+        
+        self._scheduler.submit_task(
+            TaskType.MIGRATION_L2_TO_L3,
+            self._move_l2_to_l3,
+            priority=TaskPriority.NORMAL
+        )
+        
+        self._scheduler.submit_task(
+            TaskType.COMPRESSION,
+            self._compress_l3_memories,
+            priority=TaskPriority.LOW
+        )
+        
+        self._scheduler.submit_task(
+            TaskType.MIGRATION_L3_TO_L2,
+            self._move_l3_to_l2,
+            priority=TaskPriority.NORMAL
+        )
+        
+        self._scheduler.submit_task(
+            TaskType.UPGRADE_SQLITE_ONLY,
+            self._upgrade_sqlite_only,
+            priority=TaskPriority.LOW
+        )
+        
+        self._scheduler.submit_task(
+            TaskType.MERGE,
+            self._check_and_merge_l2,
+            priority=TaskPriority.LOW
+        )
+        
+        forget_interval = self._mem_config.async_processor.forget_interval
+        if self._scheduler.should_run_task(TaskType.DECAY, forget_interval):
+            self._scheduler.submit_task(
+                TaskType.DECAY,
+                self._decay_and_forget,
+                priority=TaskPriority.LOW
+            )
     
     def _check_memory_flow(self):
         """
@@ -1034,6 +1475,7 @@ class AsyncMemoryProcessor:
         并发安全：
         - 使用 _memory_flow_lock 确保同一时间只有一个线程执行
         - 通过 _memory_flow_running 标志避免重入
+        - 所有任务通过调度器串行执行
         
         记忆流动机制（按顺序执行）：
         1. L2→L3：不常用、低权重的记忆从向量库移动到SQLite暂存
@@ -1050,6 +1492,10 @@ class AsyncMemoryProcessor:
         
         if self._memory_flow_running:
             self._log.debug("MEMORY_FLOW_SKIPPED_RUNNING")
+            return
+        
+        if self._scheduler.is_migration_active():
+            self._log.debug("MEMORY_FLOW_SKIPPED_SCHEDULER_BUSY")
             return
         
         acquired = self._memory_flow_lock.acquire(blocking=False)
@@ -1088,21 +1534,9 @@ class AsyncMemoryProcessor:
             self._retry_failed_vectorizations()
             
             if self._idle_count >= 10 and current_time - self._last_forget_time >= forget_interval:
-                result = self.sqlite.decay_weights(config.memory_decay_days)
-                decayed = result.get("decayed", 0)
-                forgotten = result.get("forgotten", 0)
-                vector_ids_to_delete = result.get("vector_ids_to_delete", [])
-                
-                if vector_ids_to_delete:
-                    try:
-                        self.vector_store.delete(ids=vector_ids_to_delete)
-                        self._log.info("CHROMADB_SYNC_DELETE", count=len(vector_ids_to_delete))
-                    except Exception as e:
-                        self._log.error("CHROMADB_DELETE_FAILED", error=str(e))
-                
-                if decayed > 0 or forgotten > 0:
-                    self._log.info("MEMORY_DECAY", decayed=decayed, forgotten=forgotten)
-                self._last_forget_time = current_time
+                result = self._decay_and_forget()
+                if result:
+                    self._last_forget_time = current_time
             
             total_actions = moved_to_l3 + compressed + moved_to_l2 + merged
             if total_actions > 0:
@@ -1120,6 +1554,33 @@ class AsyncMemoryProcessor:
         finally:
             self._memory_flow_running = False
             self._memory_flow_lock.release()
+    
+    def _decay_and_forget(self) -> Dict[str, int]:
+        """
+        执行记忆衰减和遗忘
+        
+        Returns:
+            {"decayed": int, "forgotten": int}
+        """
+        if not self.sqlite:
+            return {"decayed": 0, "forgotten": 0}
+        
+        result = self.sqlite.decay_weights(config.memory_decay_days)
+        decayed = result.get("decayed", 0)
+        forgotten = result.get("forgotten", 0)
+        vector_ids_to_delete = result.get("vector_ids_to_delete", [])
+        
+        if vector_ids_to_delete:
+            try:
+                self.vector_store.delete(ids=vector_ids_to_delete)
+                self._log.info("CHROMADB_SYNC_DELETE", count=len(vector_ids_to_delete))
+            except Exception as e:
+                self._log.error("CHROMADB_DELETE_FAILED", error=str(e))
+        
+        if decayed > 0 or forgotten > 0:
+            self._log.info("MEMORY_DECAY", decayed=decayed, forgotten=forgotten)
+        
+        return {"decayed": decayed, "forgotten": forgotten}
     
     def _move_l2_to_l3(self) -> int:
         """
@@ -1139,7 +1600,7 @@ class AsyncMemoryProcessor:
         - 启动时检查 is_vectorized=2 的记录，重新向量化
         
         并发安全：
-        - 使用事务协调器的迁移锁保护整个迁移过程
+        - 由 BackgroundTaskScheduler 统一管理迁移锁
         - 检索操作会等待迁移完成
         
         状态定义：
@@ -1147,13 +1608,18 @@ class AsyncMemoryProcessor:
         - is_vectorized=1: 已向量化(L2)
         - is_vectorized=2: 向量化失败
         - is_vectorized=3: 迁移中（原子性保证）
+        
+        Returns:
+            移动的记录数
         """
         if not self.sqlite:
             return 0
         
         cooldown_hours = self._mem_config.memory_flow.cooldown_hours
         
-        self._tx_coordinator.begin_migration("l2_to_l3")
+        self._log.info("MIGRATION_L2_TO_L3_STARTED")
+        start_time = time.time()
+        
         try:
             threshold = config.memory_min_weight * self._mem_config.memory_flow.l2_move_threshold_multiplier
             
@@ -1209,13 +1675,18 @@ class AsyncMemoryProcessor:
                     except Exception as rollback_e:
                         self._log.error("L2_TO_L3_ROLLBACK_FAILED", record_id=record.id, error=str(rollback_e))
             
+            duration_ms = (time.time() - start_time) * 1000
+            self._log.info(
+                "MIGRATION_L2_TO_L3_COMPLETE",
+                moved_count=moved_count,
+                duration_ms=round(duration_ms, 2)
+            )
+            
             return moved_count
             
         except Exception as e:
             self._log.error("L2_TO_L3_FLOW_FAILED", error=str(e))
             return 0
-        finally:
-            self._tx_coordinator.end_migration()
     
     def _should_skip_compression(self, record: MemoryRecord) -> bool:
         """
@@ -1371,15 +1842,20 @@ class AsyncMemoryProcessor:
         - 回流完成后触发相似记忆合并检测
         
         并发安全：
-        - 使用事务协调器的迁移锁保护整个回流过程
+        - 由 BackgroundTaskScheduler 统一管理迁移锁
         - 回流失败时回滚已写入的向量
+        
+        Returns:
+            移动的记录数
         """
         if not self.sqlite:
             return 0
         
         cooldown_hours = self._mem_config.memory_flow.cooldown_hours
         
-        self._tx_coordinator.begin_migration("l3_to_l2")
+        self._log.info("MIGRATION_L3_TO_L2_STARTED")
+        start_time = time.time()
+        
         try:
             high_weight_records = self.sqlite.get_high_weight_memories(
                 limit=self._mem_config.memory_flow.max_l3_to_l2_batch
@@ -1404,10 +1880,12 @@ class AsyncMemoryProcessor:
                     self.sqlite.update_vector_status(record.id, "", is_vectorized=2)
                     
                     text_to_vectorize = record.text
+                    deterministic_id = self.vector_store._generate_deterministic_id(text_to_vectorize)
                     
                     vector_ids = self.vector_store.add(
                         [text_to_vectorize],
-                        [record.metadata or {}]
+                        [record.metadata or {}],
+                        ids=[deterministic_id]
                     )
                     
                     if vector_ids:
@@ -1444,13 +1922,18 @@ class AsyncMemoryProcessor:
             if moved_records:
                 self._trigger_merge_on_backflow(moved_records)
             
+            duration_ms = (time.time() - start_time) * 1000
+            self._log.info(
+                "MIGRATION_L3_TO_L2_COMPLETE",
+                moved_count=moved_count,
+                duration_ms=round(duration_ms, 2)
+            )
+            
             return moved_count
             
         except Exception as e:
             self._log.error("L3_TO_L2_FLOW_FAILED", error=str(e))
             return 0
-        finally:
-            self._tx_coordinator.end_migration()
     
     def _trigger_merge_on_backflow(self, moved_records: List[Dict]):
         """
@@ -1536,12 +2019,17 @@ class AsyncMemoryProcessor:
         应该升级到向量库以支持语义检索。
         
         并发安全：
-        - 使用事务协调器的迁移锁保护整个升级过程
+        - 由 BackgroundTaskScheduler 统一管理迁移锁
+        
+        Returns:
+            升级的记录数
         """
         if not self.sqlite:
             return 0
         
-        self._tx_coordinator.begin_migration()
+        self._log.info("UPGRADE_SQLITE_ONLY_STARTED")
+        start_time = time.time()
+        
         try:
             upgradeable_records = self.sqlite.get_upgradeable_sqlite_only(
                 limit=self._mem_config.memory_flow.max_l3_to_l2_batch
@@ -1555,9 +2043,12 @@ class AsyncMemoryProcessor:
                 try:
                     self.sqlite.update_vector_status(record.id, "", is_vectorized=2)
                     
+                    deterministic_id = self.vector_store._generate_deterministic_id(record.text)
+                    
                     vector_ids = self.vector_store.add(
                         [record.text],
-                        [record.metadata or {}]
+                        [record.metadata or {}],
+                        ids=[deterministic_id]
                     )
                     
                     if vector_ids:
@@ -1582,13 +2073,18 @@ class AsyncMemoryProcessor:
                     self._log.error("SQLITE_ONLY_UPGRADE_FAILED", record_id=record.id, error=str(e))
                     self.sqlite.update_vector_status(record.id, "", is_vectorized=-1)
             
+            duration_ms = (time.time() - start_time) * 1000
+            self._log.info(
+                "UPGRADE_SQLITE_ONLY_COMPLETE",
+                upgraded_count=upgraded_count,
+                duration_ms=round(duration_ms, 2)
+            )
+            
             return upgraded_count
             
         except Exception as e:
             self._log.error("SQLITE_ONLY_UPGRADE_FLOW_FAILED", error=str(e))
             return 0
-        finally:
-            self._tx_coordinator.end_migration()
     
     def _is_high_density_content(self, text: str) -> bool:
         """检测是否为高信息密度内容"""

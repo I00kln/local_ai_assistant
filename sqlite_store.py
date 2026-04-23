@@ -100,9 +100,11 @@ class SQLiteStore:
     MAX_POOL_SIZE = 10
     CONNECTION_TIMEOUT = 3600
     BACKUP_SUFFIX = ".backup"
-    CONNECTION_HEALTH_CHECK_INTERVAL = 300
+    CONNECTION_HEALTH_CHECK_INTERVAL = 3600
+    CONNECTION_IDLE_TIMEOUT = 3600
     BACKUP_INTERVAL = 3600
     MAX_BACKUP_VERSIONS = 3
+    MAX_RETRY_ATTEMPTS = 2
     
     def __init__(self, db_path: str = "memory.db", encryption_key: str = None):
         self.db_path = db_path
@@ -145,14 +147,16 @@ class SQLiteStore:
             cursor = conn.cursor()
             cursor.execute("SELECT 1")
             return True
-        except (sqlite3.OperationalError, sqlite3.DatabaseError, sqlite3.InterfaceError) as e:
+        except (sqlite3.OperationalError, sqlite3.DatabaseError, 
+                sqlite3.InterfaceError, sqlite3.ProgrammingError) as e:
             self._log_connection_error(e)
             return False
     
     def _log_connection_error(self, error: Exception):
         """记录连接错误"""
         import sys
-        print(f"[SQLite] 连接验证失败: {error}", file=sys.stderr)
+        error_type = type(error).__name__
+        print(f"[SQLite] 连接验证失败 ({error_type}): {error}", file=sys.stderr)
     
     def _create_connection(self):
         """
@@ -207,9 +211,14 @@ class SQLiteStore:
         WAL 模式下，多个读连接可以并发执行
         
         增强：
-        - 连接有效性检测
+        - 连接有效性检测（SELECT 1）
         - 自动重连机制
         - 定期健康检查
+        - 空闲超时自动关闭并重建
+        - 捕获 ProgrammingError 并自动恢复
+        
+        Returns:
+            有效的 SQLite 连接
         """
         current_thread_id = threading.get_ident()
         current_time = time.time()
@@ -219,22 +228,34 @@ class SQLiteStore:
         if not hasattr(self._local, 'read_conn') or self._local.read_conn is None:
             need_new_connection = True
         else:
-            last_check = self._last_connection_check.get(current_thread_id, 0)
-            if current_time - last_check > self.CONNECTION_HEALTH_CHECK_INTERVAL:
-                if not self._validate_connection(self._local.read_conn):
-                    try:
-                        self._local.read_conn.close()
-                    except Exception:
-                        pass
-                    self._local.read_conn = None
-                    need_new_connection = True
-                    print(f"[SQLite] 线程 {current_thread_id} 连接失效，正在重连...")
-                else:
-                    self._last_connection_check[current_thread_id] = current_time
+            last_use_time = getattr(self._local, 'last_use_time', current_time)
+            if current_time - last_use_time > self.CONNECTION_IDLE_TIMEOUT:
+                try:
+                    self._local.read_conn.close()
+                except Exception:
+                    pass
+                self._local.read_conn = None
+                need_new_connection = True
+                print(f"[SQLite] 线程 {current_thread_id} 连接空闲超时，正在重建...")
+            else:
+                last_check = self._last_connection_check.get(current_thread_id, 0)
+                if current_time - last_check > self.CONNECTION_HEALTH_CHECK_INTERVAL:
+                    if not self._validate_connection(self._local.read_conn):
+                        try:
+                            self._local.read_conn.close()
+                        except Exception:
+                            pass
+                        self._local.read_conn = None
+                        need_new_connection = True
+                        print(f"[SQLite] 线程 {current_thread_id} 连接失效，正在重连...")
+                    else:
+                        self._last_connection_check[current_thread_id] = current_time
         
         if need_new_connection:
             self._local.read_conn = self._create_connection()
             self._last_connection_check[current_thread_id] = current_time
+        
+        self._local.last_use_time = current_time
         
         return self._local.read_conn
     
@@ -255,6 +276,62 @@ class SQLiteStore:
                 except:
                     pass
                 raise
+    
+    def _retry_on_connection_error(self, func, *args, **kwargs):
+        """
+        连接错误自动重试装饰器
+        
+        捕获 ProgrammingError 和其他连接相关错误，
+        自动重建连接并重试操作。
+        
+        Args:
+            func: 要执行的函数
+            *args: 位置参数
+            **kwargs: 关键字参数
+        
+        Returns:
+            函数执行结果
+        
+        Raises:
+            最后一次重试失败后的异常
+        """
+        last_error = None
+        
+        for attempt in range(self.MAX_RETRY_ATTEMPTS):
+            try:
+                return func(*args, **kwargs)
+            except sqlite3.ProgrammingError as e:
+                last_error = e
+                error_msg = str(e).lower()
+                
+                if "closed" in error_msg or "cannot operate" in error_msg:
+                    print(f"[SQLite] 检测到连接已关闭 (尝试 {attempt + 1}/{self.MAX_RETRY_ATTEMPTS})，正在重建连接...")
+                    
+                    if hasattr(self._local, 'read_conn') and self._local.read_conn:
+                        try:
+                            self._local.read_conn.close()
+                        except Exception:
+                            pass
+                        self._local.read_conn = None
+                    
+                    self._local.read_conn = self._create_connection()
+                    current_thread_id = threading.get_ident()
+                    self._last_connection_check[current_thread_id] = time.time()
+                else:
+                    raise
+            except (sqlite3.OperationalError, sqlite3.InterfaceError) as e:
+                last_error = e
+                print(f"[SQLite] 连接错误 (尝试 {attempt + 1}/{self.MAX_RETRY_ATTEMPTS}): {e}")
+                
+                if hasattr(self._local, 'read_conn') and self._local.read_conn:
+                    try:
+                        self._local.read_conn.close()
+                    except Exception:
+                        pass
+                    self._local.read_conn = None
+        
+        if last_error:
+            raise last_error
     
     def _check_integrity(self) -> bool:
         """
@@ -465,6 +542,21 @@ class SQLiteStore:
                 
                 try:
                     cursor.execute("ALTER TABLE memories ADD COLUMN text_hash TEXT")
+                except sqlite3.OperationalError:
+                    pass
+                
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS pending_queue (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        data TEXT NOT NULL,
+                        created_time TEXT NOT NULL,
+                        retry_count INTEGER DEFAULT 0,
+                        status TEXT DEFAULT 'pending'
+                    )
+                """)
+                
+                try:
+                    cursor.execute("CREATE INDEX IF NOT EXISTS idx_pending_queue_status ON pending_queue(status, created_time)")
                 except sqlite3.OperationalError:
                     pass
                 
@@ -691,71 +783,94 @@ class SQLiteStore:
             return list(range(max_id_before + 1, max_id_before + 1 + len(records)))
     
     def get(self, record_id: int) -> Optional[MemoryRecord]:
-        """根据ID获取记录"""
-        conn = self._get_read_connection()
-        cursor = conn.cursor()
-        cursor.execute("SELECT * FROM memories WHERE id = ?", (record_id,))
-        row = cursor.fetchone()
-        if row:
-            return self._row_to_record(row)
-        return None
+        """
+        根据ID获取记录
+        
+        增强功能：
+        - 自动重试连接错误
+        - 捕获 ProgrammingError 并恢复
+        """
+        def _do_get():
+            conn = self._get_read_connection()
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM memories WHERE id = ?", (record_id,))
+            row = cursor.fetchone()
+            if row:
+                return self._row_to_record(row)
+            return None
+        
+        return self._retry_on_connection_error(_do_get)
     
     def search(self, query: str, limit: int = 10, min_weight: float = 0.0) -> List[MemoryRecord]:
         """
         全文搜索
         
         使用FTS5进行全文搜索，返回匹配的记忆
+        
+        增强功能：
+        - 自动重试连接错误
+        - 捕获 ProgrammingError 并恢复
         """
-        conn = self._get_read_connection()
-        cursor = conn.cursor()
+        def _do_search():
+            conn = self._get_read_connection()
+            cursor = conn.cursor()
+            
+            cursor.execute("""
+                SELECT m.* FROM memories m
+                JOIN memories_fts fts ON m.id = fts.rowid
+                WHERE memories_fts MATCH ?
+                AND m.weight >= ?
+                AND m.is_archived = 0
+                ORDER BY m.weight DESC, bm25(memories_fts) ASC
+                LIMIT ?
+            """, (query, min_weight, limit))
+            
+            results = []
+            for row in cursor.fetchall():
+                results.append(self._row_to_record(row))
+            
+            return results
         
-        cursor.execute("""
-            SELECT m.* FROM memories m
-            JOIN memories_fts fts ON m.id = fts.rowid
-            WHERE memories_fts MATCH ?
-            AND m.weight >= ?
-            AND m.is_archived = 0
-            ORDER BY m.weight DESC, bm25(memories_fts) ASC
-            LIMIT ?
-        """, (query, min_weight, limit))
-        
-        results = []
-        for row in cursor.fetchall():
-            results.append(self._row_to_record(row))
-        
-        return results
+        return self._retry_on_connection_error(_do_search)
     
     def search_by_keywords(self, keywords: List[str], limit: int = 10) -> List[MemoryRecord]:
         """
         关键词搜索（更宽松的匹配）
         
         使用LIKE进行模糊匹配
+        
+        增强功能：
+        - 自动重试连接错误
+        - 捕获 ProgrammingError 并恢复
         """
-        conn = self._get_read_connection()
-        cursor = conn.cursor()
+        def _do_search_by_keywords():
+            conn = self._get_read_connection()
+            cursor = conn.cursor()
+            
+            conditions = []
+            params = []
+            for kw in keywords:
+                conditions.append("(text LIKE ? OR compressed_text LIKE ?)")
+                params.extend([f"%{kw}%", f"%{kw}%"])
+            
+            query = f"""
+                SELECT * FROM memories 
+                WHERE ({' OR '.join(conditions)})
+                AND is_archived = 0
+                ORDER BY weight DESC, last_access_time DESC
+                LIMIT ?
+            """
+            params.append(limit)
+            
+            cursor.execute(query, params)
+            
+            results = []
+            for row in cursor.fetchall():
+                results.append(self._row_to_record(row))
+            
+            return results
         
-        conditions = []
-        params = []
-        for kw in keywords:
-            conditions.append("(text LIKE ? OR compressed_text LIKE ?)")
-            params.extend([f"%{kw}%", f"%{kw}%"])
-        
-        query = f"""
-            SELECT * FROM memories 
-            WHERE ({' OR '.join(conditions)})
-            AND is_archived = 0
-            ORDER BY weight DESC, last_access_time DESC
-            LIMIT ?
-        """
-        params.append(limit)
-        
-        cursor.execute(query, params)
-        
-        results = []
-        for row in cursor.fetchall():
-            results.append(self._row_to_record(row))
-        
-        return results
+        return self._retry_on_connection_error(_do_search_by_keywords)
     
     def update_weight(self, record_id: int, delta: float = None, boost: bool = False):
         """
@@ -992,22 +1107,29 @@ class SQLiteStore:
         - 已向量化（is_vectorized=1，L2中的记录）
         - 未归档
         - 不在迁移中（is_vectorized != 3）
+        
+        增强功能：
+        - 自动重试连接错误
+        - 捕获 ProgrammingError 并恢复
         """
         if threshold is None:
             threshold = self.MIN_WEIGHT_THRESHOLD * 2
         
-        conn = self._get_read_connection()
-        cursor = conn.cursor()
-        cursor.execute("""
-            SELECT * FROM memories 
-            WHERE weight < ?
-            AND is_archived = 0
-            AND is_vectorized = 1
-            ORDER BY weight ASC, last_access_time ASC
-            LIMIT ?
-        """, (threshold, limit))
+        def _do_get():
+            conn = self._get_read_connection()
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT * FROM memories 
+                WHERE weight < ?
+                AND is_archived = 0
+                AND is_vectorized = 1
+                ORDER BY weight ASC, last_access_time ASC
+                LIMIT ?
+            """, (threshold, limit))
+            
+            return [self._row_to_record(row) for row in cursor.fetchall()]
         
-        return [self._row_to_record(row) for row in cursor.fetchall()]
+        return self._retry_on_connection_error(_do_get)
     
     def get_high_weight_memories(self, threshold: float = None, limit: int = 50) -> List[MemoryRecord]:
         """
@@ -1019,25 +1141,32 @@ class SQLiteStore:
         - 未向量化（is_vectorized=0，L3中的记录）
         - 未归档
         - 不在迁移中（is_vectorized != 3）
+        
+        增强功能：
+        - 自动重试连接错误
+        - 捕获 ProgrammingError 并恢复
         """
         if threshold is None:
             threshold = self.MAX_WEIGHT * 0.6
         
         recent_time = (datetime.now() - timedelta(days=7)).isoformat()
         
-        conn = self._get_read_connection()
-        cursor = conn.cursor()
-        cursor.execute("""
-            SELECT * FROM memories 
-            WHERE weight >= ?
-            AND last_access_time > ?
-            AND is_vectorized = 0
-            AND is_archived = 0
-            ORDER BY weight DESC, last_access_time DESC
-            LIMIT ?
-        """, (threshold, recent_time, limit))
+        def _do_get():
+            conn = self._get_read_connection()
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT * FROM memories 
+                WHERE weight >= ?
+                AND last_access_time > ?
+                AND is_vectorized = 0
+                AND is_archived = 0
+                ORDER BY weight DESC, last_access_time DESC
+                LIMIT ?
+            """, (threshold, recent_time, limit))
+            
+            return [self._row_to_record(row) for row in cursor.fetchall()]
         
-        return [self._row_to_record(row) for row in cursor.fetchall()]
+        return self._retry_on_connection_error(_do_get)
     
     def get_recent_memories(
         self, 
@@ -1265,17 +1394,24 @@ class SQLiteStore:
         包括：
         - is_vectorized=0: 未处理
         - is_vectorized=2: 迁移中断，需要恢复
+        
+        增强功能：
+        - 自动重试连接错误
+        - 捕获 ProgrammingError 并恢复
         """
-        conn = self._get_read_connection()
-        cursor = conn.cursor()
-        cursor.execute("""
-            SELECT * FROM memories 
-            WHERE is_vectorized IN (0, 2)
-            AND is_archived = 0
-            ORDER BY created_time DESC
-            LIMIT ?
-        """, (limit,))
-        return [self._row_to_record(row) for row in cursor.fetchall()]
+        def _do_get():
+            conn = self._get_read_connection()
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT * FROM memories 
+                WHERE is_vectorized IN (0, 2)
+                AND is_archived = 0
+                ORDER BY created_time DESC
+                LIMIT ?
+            """, (limit,))
+            return [self._row_to_record(row) for row in cursor.fetchall()]
+        
+        return self._retry_on_connection_error(_do_get)
     
     def get_records_by_vector_status(self, is_vectorized: int, limit: int = 50) -> List[MemoryRecord]:
         """
@@ -1738,6 +1874,122 @@ class SQLiteStore:
             except Exception:
                 pass
             self._local.read_conn = None
+    
+    def enqueue_pending(self, data: Dict[str, Any]) -> int:
+        """
+        将数据写入待处理队列
+        
+        当内存队列满时，将数据持久化到 SQLite 的 pending_queue 表。
+        
+        Args:
+            data: 待处理的数据（通常是对话数据）
+        
+        Returns:
+            插入的记录ID
+        """
+        def _do_enqueue():
+            with self._get_write_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    INSERT INTO pending_queue (data, created_time, status)
+                    VALUES (?, ?, 'pending')
+                """, (json.dumps(data, ensure_ascii=False), datetime.now().isoformat()))
+                conn.commit()
+                return cursor.lastrowid
+        
+        return self._retry_on_connection_error(_do_enqueue)
+    
+    def dequeue_pending(self, limit: int = 10) -> List[Tuple[int, Dict[str, Any]]]:
+        """
+        从待处理队列获取数据
+        
+        获取并标记为处理中的记录。
+        
+        Args:
+            limit: 最大获取数量
+        
+        Returns:
+            [(id, data), ...] 列表
+        """
+        def _do_dequeue():
+            conn = self._get_read_connection()
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT id, data FROM pending_queue 
+                WHERE status = 'pending'
+                ORDER BY created_time ASC
+                LIMIT ?
+            """, (limit,))
+            
+            results = []
+            for row in cursor.fetchall():
+                try:
+                    data = json.loads(row[1])
+                    results.append((row[0], data))
+                except json.JSONDecodeError:
+                    continue
+            
+            return results
+        
+        return self._retry_on_connection_error(_do_dequeue)
+    
+    def mark_pending_processed(self, record_ids: List[int]):
+        """
+        标记待处理记录为已完成
+        
+        Args:
+            record_ids: 记录ID列表
+        """
+        if not record_ids:
+            return
+        
+        def _do_mark():
+            with self._get_write_connection() as conn:
+                cursor = conn.cursor()
+                placeholders = ','.join('?' * len(record_ids))
+                cursor.execute(f"""
+                    DELETE FROM pending_queue 
+                    WHERE id IN ({placeholders})
+                """, record_ids)
+                conn.commit()
+        
+        self._retry_on_connection_error(_do_mark)
+    
+    def get_pending_queue_count(self) -> int:
+        """
+        获取待处理队列中的记录数量
+        
+        Returns:
+            待处理记录数量
+        """
+        def _do_count():
+            conn = self._get_read_connection()
+            cursor = conn.cursor()
+            cursor.execute("SELECT COUNT(*) FROM pending_queue WHERE status = 'pending'")
+            return cursor.fetchone()[0]
+        
+        return self._retry_on_connection_error(_do_count)
+    
+    def cleanup_old_pending_records(self, max_age_hours: int = 24):
+        """
+        清理过旧的待处理记录
+        
+        Args:
+            max_age_hours: 最大保留时间（小时）
+        """
+        def _do_cleanup():
+            cutoff_time = (datetime.now() - timedelta(hours=max_age_hours)).isoformat()
+            with self._get_write_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    DELETE FROM pending_queue 
+                    WHERE created_time < ? AND status = 'pending'
+                """, (cutoff_time,))
+                deleted = cursor.rowcount
+                conn.commit()
+                return deleted
+        
+        return self._retry_on_connection_error(_do_cleanup)
 
 
 # 全局实例

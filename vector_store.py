@@ -197,12 +197,31 @@ class VectorStore:
             time.sleep(0.1)
         return False
     
+    @staticmethod
+    def _generate_deterministic_id(text: str) -> str:
+        """
+        生成确定性 ID
+        
+        使用文本哈希生成唯一且可预测的 ID，
+        确保相同文本多次写入只产生一个向量文档。
+        
+        Args:
+            text: 文本内容
+        
+        Returns:
+            格式为 "mem_{hash[:16]}" 的确定性 ID
+        """
+        import hashlib
+        text_hash = hashlib.sha256(text.encode('utf-8')).hexdigest()
+        return f"mem_{text_hash[:16]}"
+    
     def add(
         self, 
         texts: List[str], 
         metadatas: List[Dict[str, Any]] = None,
         ids: List[str] = None,
-        sqlite_store = None
+        sqlite_store = None,
+        upsert: bool = True
     ) -> List[str]:
         """
         添加文档到向量库
@@ -210,11 +229,17 @@ class VectorStore:
         Args:
             texts: 文本列表
             metadatas: 元数据列表
-            ids: 文档ID列表（不提供则自动生成）
+            ids: 文档ID列表（不提供则自动生成确定性ID）
             sqlite_store: SQLite存储实例（用于降级）
+            upsert: 是否使用 upsert 模式（幂等写入），默认 True
         
         Returns:
             文档ID列表
+        
+        幂等性保证：
+        - 使用确定性 ID：mem_{text_hash[:16]}
+        - upsert=True 时，相同 ID 的文档会被更新而非重复添加
+        - 崩溃恢复后重新写入不会产生重复向量
         
         降级策略：
         - 磁盘满时，降级到 SQLite 存储
@@ -224,8 +249,7 @@ class VectorStore:
             return []
         
         if ids is None:
-            import uuid
-            ids = [str(uuid.uuid4()) for _ in texts]
+            ids = [self._generate_deterministic_id(text) for text in texts]
         
         if metadatas is None:
             metadatas = [{
@@ -241,12 +265,20 @@ class VectorStore:
             embeddings = self.embedding_function(texts)
             
             with self.lock:
-                self.collection.add(
-                    documents=texts,
-                    embeddings=embeddings,
-                    metadatas=metadatas,
-                    ids=ids
-                )
+                if upsert:
+                    self.collection.upsert(
+                        documents=texts,
+                        embeddings=embeddings,
+                        metadatas=metadatas,
+                        ids=ids
+                    )
+                else:
+                    self.collection.add(
+                        documents=texts,
+                        embeddings=embeddings,
+                        metadatas=metadatas,
+                        ids=ids
+                    )
                 
                 print(f"添加 {len(texts)} 条记忆到向量库，当前总数: {self.collection.count()}")
                 

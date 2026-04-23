@@ -13,6 +13,7 @@ from event_bus import get_event_bus, EventType
 from memory_transaction import get_transaction_coordinator
 from memory_tags import MemoryTags, MemoryTagHelper, MemoryConstants
 from logger import get_logger
+from background_scheduler import get_background_scheduler
 
 
 @dataclass
@@ -116,7 +117,7 @@ class MemoryManager:
         统一搜索接口 - L1→L2→L3
         
         线程安全：
-        - 等待迁移操作完成后再执行检索
+        - 使用调度器读锁等待迁移操作完成后再执行检索
         - 使用版本号检测并发修改
         - 检测到修改时自动重试（最多2次）
         - 迁移超时时记录警告但继续执行
@@ -136,18 +137,28 @@ class MemoryManager:
         
         start_time = time.perf_counter()
         
-        if self._tx_coordinator.is_migration_active():
-            migration_type = self._tx_coordinator.get_migration_type()
-            acquired = self._tx_coordinator.wait_for_migration(timeout=5.0)
-            if acquired:
-                self._tx_coordinator.release_migration_wait()
-            else:
-                self._log.warning(
-                    "SEARCH_MIGRATION_TIMEOUT",
-                    migration_type=migration_type,
-                    message="迁移超时，继续执行检索（可能看到中间状态）"
-                )
+        scheduler = get_background_scheduler()
         
+        with scheduler.read_lock():
+            results = self._do_search_with_retry(query, top_k, include_l3, threshold, include_l1)
+        
+        duration_ms = (time.perf_counter() - start_time) * 1000
+        metrics = get_metrics_collector()
+        metrics.record_retrieval_latency(duration_ms)
+        metrics.record_retrieval_hits(
+            self.stats.get("l1_hits", 0),
+            self.stats.get("l2_hits", 0),
+            self.stats.get("l3_hits", 0)
+        )
+        
+        return results
+    
+    def _do_search_with_retry(self, query: str, top_k: int, include_l3: bool, threshold: float, include_l1: bool) -> List[MemorySearchResult]:
+        """
+        带重试的搜索（内部方法）
+        
+        使用版本号检测并发修改，检测到修改时自动重试。
+        """
         if top_k is None:
             top_k = config.max_retrieve_results
         
@@ -161,18 +172,9 @@ class MemoryManager:
             results = self._do_search(query, top_k, include_l3, threshold, include_l1)
             
             if self._write_version == start_version:
-                break
+                return results
             
             self.stats["retry_reads"] += 1
-        
-        duration_ms = (time.perf_counter() - start_time) * 1000
-        metrics = get_metrics_collector()
-        metrics.record_retrieval_latency(duration_ms)
-        metrics.record_retrieval_hits(
-            self.stats.get("l1_hits", 0),
-            self.stats.get("l2_hits", 0),
-            self.stats.get("l3_hits", 0)
-        )
         
         return results
     

@@ -17,6 +17,11 @@ class EventType(Enum):
     MEMORY_FORGOTTEN = "memory_forgotten"
     SEARCH_COMPLETED = "search_completed"
     BACKFILL_COMPLETED = "backfill_completed"
+    QUEUE_OVERFLOW = "queue_overflow"
+    QUEUE_RECOVERED = "queue_recovered"
+    QUEUE_DROPPED = "queue_dropped"
+    ORPHAN_CLEANUP_PROGRESS = "orphan_cleanup_progress"
+    ORPHAN_CLEANUP_COMPLETE = "orphan_cleanup_complete"
 
 
 @dataclass

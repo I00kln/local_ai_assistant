@@ -456,6 +456,12 @@ class TransactionCoordinator:
                     recovered += 1
                 else:
                     failed += 1
+            elif tx_record.operation_type == "add_memory_batch":
+                recovery_result = self._recover_add_memory_batch_transaction(tx_record)
+                if recovery_result:
+                    recovered += recovery_result
+                else:
+                    failed += 1
             else:
                 self._update_transaction_state(
                     tx_record.transaction_id, 
@@ -478,9 +484,12 @@ class TransactionCoordinator:
                         pass
                 
                 try:
+                    deterministic_id = self._vector_store._generate_deterministic_id(record.text)
+                    
                     vector_ids = self._vector_store.add(
                         [record.text],
-                        [record.metadata or {}]
+                        [record.metadata or {}],
+                        ids=[deterministic_id]
                     )
                     
                     if vector_ids:
@@ -543,7 +552,9 @@ class TransactionCoordinator:
                               transaction_id=tx_record.transaction_id)
                 return True
             
-            vector_ids = self._vector_store.add([text], [metadata])
+            deterministic_id = self._vector_store._generate_deterministic_id(text)
+            
+            vector_ids = self._vector_store.add([text], [metadata], ids=[deterministic_id])
             
             if vector_ids:
                 sqlite_id = metadata.get(MemoryTags.SQLITE_ID)
@@ -577,6 +588,80 @@ class TransactionCoordinator:
                            transaction_id=tx_record.transaction_id,
                            error=str(e))
             return False
+    
+    def _recover_add_memory_batch_transaction(self, tx_record: TransactionRecord) -> Optional[int]:
+        """
+        恢复 add_memory_batch 类型的批量事务
+        
+        恢复策略：
+        1. 检查 prepare_result 中是否有待向量化的数据
+        2. 尝试批量写入 ChromaDB
+        3. 成功后更新 SQLite 状态为 is_vectorized=1
+        4. 失败则标记事务失败
+        
+        Args:
+            tx_record: 事务记录
+        
+        Returns:
+            恢复成功的记录数，失败返回 None
+        """
+        data = tx_record.data
+        prepare_result = data.get("prepare_result", {})
+        
+        texts_to_vectorize = prepare_result.get("texts_to_vectorize", [])
+        metadatas_to_vectorize = prepare_result.get("metadatas_to_vectorize", [])
+        vector_ids = prepare_result.get("vector_ids", [])
+        sqlite_ids = prepare_result.get("sqlite_ids", [])
+        
+        if not texts_to_vectorize:
+            self._update_transaction_state(
+                tx_record.transaction_id,
+                TransactionState.COMMITTED
+            )
+            self._log.info("TRANSACTION_RECOVERY_EMPTY_BATCH",
+                          transaction_id=tx_record.transaction_id)
+            return 0
+        
+        try:
+            result_ids = self._vector_store.add(
+                texts_to_vectorize,
+                metadatas_to_vectorize,
+                ids=vector_ids
+            )
+            
+            if result_ids and len(result_ids) > 0:
+                if self._sqlite_store and sqlite_ids:
+                    for sid, vid in zip(sqlite_ids, result_ids):
+                        if sid and vid:
+                            self._sqlite_store.update_vector_status(sid, vid, is_vectorized=1)
+                
+                self._update_transaction_state(
+                    tx_record.transaction_id,
+                    TransactionState.COMMITTED
+                )
+                
+                self._log.info("TRANSACTION_BATCH_RECOVERY_SUCCESS",
+                              transaction_id=tx_record.transaction_id,
+                              count=len(result_ids))
+                return len(result_ids)
+            else:
+                self._update_transaction_state(
+                    tx_record.transaction_id,
+                    TransactionState.FAILED,
+                    "Vector store returned empty result"
+                )
+                return None
+                
+        except Exception as e:
+            self._update_transaction_state(
+                tx_record.transaction_id,
+                TransactionState.FAILED,
+                f"Batch recovery failed: {str(e)}"
+            )
+            self._log.error("TRANSACTION_BATCH_RECOVERY_EXCEPTION",
+                           transaction_id=tx_record.transaction_id,
+                           error=str(e))
+            return None
     
     def get_transaction_status(self, transaction_id: str) -> Optional[TransactionRecord]:
         """获取事务状态"""
