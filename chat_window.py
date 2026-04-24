@@ -9,6 +9,7 @@ from config import config
 from models import UIState
 from ui_state import UIStateManager
 from logger import TraceContext, get_trace_id, get_logger
+from thread_pool_manager import submit_io_task, get_thread_pool
 
 
 class ChatWindow:
@@ -56,8 +57,10 @@ class ChatWindow:
             return
         
         self.state_manager.set_state(UIState.INITIALIZING, "正在连接数据库...")
-        self._init_thread = threading.Thread(target=self._async_init, daemon=True)
-        self._init_thread.start()
+        self._init_future = submit_io_task(self._async_init)
+        
+        if self._init_future:
+            self._init_future.add_done_callback(self._on_init_complete)
     
     def _setup_ui(self):
         """设置界面"""
@@ -171,6 +174,8 @@ class ChatWindow:
         """
         安全的 window.after 调用
         
+        修复：回调执行后自动移除 after_id，防止内存泄漏
+        
         Args:
             delay: 延迟毫秒数
             callback: 回调函数
@@ -181,8 +186,15 @@ class ChatWindow:
         if self._closing:
             return None
         
+        def wrapped_callback():
+            try:
+                callback()
+            finally:
+                if after_id in self._after_ids:
+                    self._after_ids.remove(after_id)
+        
         try:
-            after_id = self.window.after(delay, callback)
+            after_id = self.window.after(delay, wrapped_callback)
             self._after_ids.append(after_id)
             return after_id
         except tk.TclError:
@@ -253,6 +265,26 @@ class ChatWindow:
             err_msg = str(e)
             self._safe_after(0, lambda msg=err_msg: self._append_message("system", f"初始化失败: {msg}"))
             self._safe_after(0, lambda: self.state_manager.set_state(UIState.ERROR, "初始化失败"))
+    
+    def _on_init_complete(self, future):
+        """
+        初始化任务完成回调
+        
+        处理 Future 异常，防止静默失败
+        
+        Args:
+            future: 完成的 Future 对象
+        """
+        try:
+            if future.exception() is not None:
+                exc = future.exception()
+                self._log.error(
+                    "INIT_TASK_FAILED",
+                    error=str(exc),
+                    error_type=type(exc).__name__
+                )
+        except Exception as e:
+            self._log.error("INIT_CALLBACK_ERROR", error=str(e))
     
     def _check_llm_health(self):
         """检查本地 LLM 服务健康状态"""
@@ -523,8 +555,7 @@ class ChatWindow:
             if not local_ok:
                 self._safe_after(0, lambda: self._append_message("system", "无法连接到 llama.cpp，请确保服务已启动"))
         
-        check_thread = threading.Thread(target=check_in_background, daemon=True)
-        check_thread.start()
+        submit_io_task(check_in_background)
     
     def _send_message(self):
         """发送用户消息"""
@@ -557,8 +588,42 @@ class ChatWindow:
             self._safe_after(0, lambda: self.send_button.config(state=tk.NORMAL))
             return
         
-        thread = threading.Thread(target=self._process_message, args=(user_input, use_local, use_cloud, show_memory, show_local), daemon=True)
-        thread.start()
+        self._message_future = submit_io_task(
+            self._process_message, 
+            user_input, 
+            use_local, 
+            use_cloud, 
+            show_memory, 
+            show_local
+        )
+        
+        if self._message_future:
+            self._message_future.add_done_callback(self._on_message_complete)
+    
+    def _on_message_complete(self, future):
+        """
+        消息处理任务完成回调
+        
+        处理 Future 异常，防止静默失败
+        
+        Args:
+            future: 完成的 Future 对象
+        """
+        try:
+            if future.exception() is not None:
+                exc = future.exception()
+                self._log.error(
+                    "MESSAGE_TASK_FAILED",
+                    error=str(exc),
+                    error_type=type(exc).__name__
+                )
+                self._safe_after(0, lambda: self._append_message(
+                    "system", 
+                    f"⚠️ 消息处理失败: {str(exc)}"
+                ))
+                self._safe_after(0, lambda: self.send_button.config(state=tk.NORMAL))
+        except Exception as e:
+            self._log.error("MESSAGE_CALLBACK_ERROR", error=str(e))
     
     def _build_retrieval_metadata(self, memories: List[Dict], memory_context: str) -> Dict[str, Any]:
         """
@@ -847,7 +912,7 @@ class ChatWindow:
                         "source": "cloud" if cloud_success else "local",
                         "sensitive_masked": True,
                         "trace_id": get_trace_id()
-                    })
+                    }, session_id=self.session_id)
                 
                 self._safe_after(0, lambda: self.state_manager.set_state(UIState.IDLE))
                 
@@ -862,6 +927,12 @@ class ChatWindow:
                     l2_count = len(self.memory.vector_store) if self.memory and self.memory.vector_store else 0
                     l3_count = len(self.memory.sqlite) if self.memory and self.memory.sqlite else 0
                     self._safe_after(0, lambda l2=l2_count, l3=l3_count: self.state_manager.set_memory_counts(l2, l3))
+                
+                if self.memory and self.memory.sqlite:
+                    try:
+                        self.memory.sqlite.close_thread_connection()
+                    except Exception:
+                        pass
     
     def _append_message(self, role: str, content: str):
         """向对话区域添加消息"""
@@ -952,16 +1023,28 @@ class ChatWindow:
         
         使用 LifecycleManager 集中管理资源释放：
         1. 设置关闭标志，阻止新请求
-        2. 取消所有待执行的 UI 回调
-        3. 保存当前会话状态
-        4. 调用 LifecycleManager.shutdown() 关闭所有服务
-        5. 销毁窗口
+        2. 发送 SHUTDOWN 事件，通知所有后台订阅者停止 IO
+        3. 取消所有待执行的 UI 回调
+        4. 保存当前会话状态
+        5. 调用 LifecycleManager.shutdown() 关闭所有服务
+        6. 销毁窗口
         """
         self._closing = True
+        
+        try:
+            from event_bus import get_event_bus, EventType
+            event_bus = get_event_bus()
+            event_bus.publish(EventType.SHUTDOWN, {"reason": "window_close"}, "ChatWindow")
+        except Exception:
+            pass
+        
         self._cancel_all_after()
         
-        if hasattr(self, '_init_thread') and self._init_thread.is_alive():
-            self._init_thread.join(timeout=2)
+        if hasattr(self, '_init_future') and self._init_future:
+            try:
+                self._init_future.result(timeout=2)
+            except Exception:
+                pass
         
         self._save_session()
         

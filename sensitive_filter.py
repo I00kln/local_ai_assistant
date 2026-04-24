@@ -79,14 +79,14 @@ class SensitiveFilter:
         ),
         FilterRule(
             name="password",
-            pattern=r'(密码|password|pwd|pass|口令)[是为：:＝\s]+[\w!@#$%^&*()\-+=\[\]{}|;:,.<>?/~`]{4,}',
+            pattern=r'(?:密码|password|pwd|pass|口令)[是为：:＝]\s*[\w!@#$%^&*()\-+=]{6,20}(?!\w)',
             replacement=r'\1****',
             description="密码"
         ),
         FilterRule(
             name="api_key",
-            pattern=r'(api[_-]?key|密钥|secret[_-]?key|token)[是为：:＝\s]+[\w\-]{10,}',
-            replacement=r'\1****',
+            pattern=r'(?:sk-[a-zA-Z0-9]{20,}|api[_-]?key[_-]?[a-zA-Z0-9]{16,}|secret[_-]?[a-zA-Z0-9]{16,})',
+            replacement=r'****',
             description="API密钥"
         ),
         FilterRule(
@@ -169,9 +169,18 @@ class SensitiveFilter:
         
         Returns:
             (脱敏后文本, 检测到的敏感信息统计)
+        
+        安全限制：
+        - 单次处理文本长度限制为 100KB，防止 ReDoS
+        - 超长文本分块处理
         """
         if not self._enabled or not text:
             return text, {}
+        
+        MAX_TEXT_LENGTH = 100 * 1024
+        
+        if len(text) > MAX_TEXT_LENGTH:
+            return self._mask_long_text(text, MAX_TEXT_LENGTH)
         
         for keyword in self._excluded_keywords:
             if keyword in text:
@@ -201,6 +210,30 @@ class SensitiveFilter:
         self._stats.last_process_time = datetime.now().isoformat()
         
         return masked, detected
+    
+    def _mask_long_text(self, text: str, chunk_size: int) -> Tuple[str, Dict[str, int]]:
+        """
+        分块处理超长文本
+        
+        Args:
+            text: 原始文本
+            chunk_size: 分块大小
+        
+        Returns:
+            (脱敏后文本, 检测到的敏感信息统计)
+        """
+        masked_chunks = []
+        total_detected: Dict[str, int] = {}
+        
+        for i in range(0, len(text), chunk_size):
+            chunk = text[i:i + chunk_size]
+            masked_chunk, detected = self.mask(chunk)
+            masked_chunks.append(masked_chunk)
+            
+            for rule_name, count in detected.items():
+                total_detected[rule_name] = total_detected.get(rule_name, 0) + count
+        
+        return ''.join(masked_chunks), total_detected
     
     def mask_dict(self, data: Dict) -> Tuple[Dict, Dict[str, int]]:
         """

@@ -96,7 +96,7 @@ class ContextBuilder:
             max_retrieve
         )
         
-        has_memories = len(retrieved) > 0
+        has_memories = len(retrieved) > 0 or len(conversation_history or []) > 0
         
         memory_context, processed_user_input, _ = self._control_context_length(
             retrieved, user_input, mode, conversation_history
@@ -218,17 +218,15 @@ class ContextBuilder:
         """
         多级记忆检索
         
-        L1: 内存中的最近对话历史
-        L2: 向量库（ChromaDB）
-        L3: 数据库（SQLite）
+        重构说明：
+        - 核心检索委托给 MemoryManager.search()，激活 RRF 融合和读锁保护
+        - 保留 Query 扩展、去重、时间窗口过滤等后处理逻辑
         
         检索策略：
         1. Query 扩展（可选）
-        2. 优先搜索L1，如果结果足够则返回
-        3. L1不足则搜索L2
-        4. L2结果不足则降低置信度重试
-        5. L2仍不足则搜索L3（SQLite全文搜索）
-        6. 去重处理
+        2. 调用 MemoryManager.search() 获取 L1/L2/L3 结果
+        3. 去重处理
+        4. 时间窗口过滤
         """
         if not self._is_valid_query(query):
             return []
@@ -245,31 +243,29 @@ class ContextBuilder:
         if enable_query_expansion and conversation_history:
             expanded_query = self._expand_query(query, conversation_history)
         
+        threshold = thresholds.get("l2", self.l2_default_threshold)
+        
+        search_results = self.memory.search(
+            query=expanded_query,
+            top_k=max_retrieve * 2,
+            include_l3=True,
+            threshold=threshold,
+            include_l1=True
+        )
+        
         results = []
+        for r in search_results:
+            results.append({
+                "text": r.text,
+                "similarity": r.similarity,
+                "source": r.source,
+                "weight": r.weight,
+                "metadata": r.metadata,
+                "rrf_score": r.rrf_score,
+                "rank": r.rank
+            })
         
-        l1_results = self._search_l1(query, conversation_history, thresholds["l1"])
-        if l1_results:
-            results.extend(l1_results)
-        
-        l1_count = len(results)
-        
-        if l1_count < self.l1_min_results:
-            l2_results = self._search_l2(expanded_query, thresholds["l2"])
-            
-            l2_results = self._deduplicate_against_l1(l2_results, conversation_history)
-            
-            if len(l2_results) < self.l1_min_results - l1_count:
-                l2_lower = self._search_l2(expanded_query, thresholds["l3"])
-                l2_lower = self._deduplicate_against_l1(l2_lower, conversation_history)
-                l2_results = self._merge_results(l2_results, l2_lower)
-            
-            results = self._merge_results(results, l2_results)
-        
-        if len(results) < self.l1_min_results:
-            l3_results = self._search_l3(expanded_query, thresholds["l3"])
-            l3_results = self._deduplicate_against_l1(l3_results, conversation_history)
-            results = self._merge_results(results, l3_results)
-        
+        results = self._deduplicate_against_l1(results, conversation_history)
         results = self._time_window_filter(results, conversation_history)
         
         return results[:max_retrieve]
@@ -277,6 +273,8 @@ class ContextBuilder:
     def _update_l1_tracking(self, conversation_history: List[Dict] = None):
         """
         更新 L1 追踪集合（用于去重）
+        
+        修复：使用组装后的 combined_text 计算哈希，与检索结果格式一致
         
         Args:
             conversation_history: 对话历史
@@ -293,13 +291,17 @@ class ContextBuilder:
             user_text = conv.get("user", "")
             assistant_text = conv.get("assistant", "")
             
+            combined_text = f"用户: {user_text}\n助理: {assistant_text}"
+            content_hash = hashlib.md5(combined_text.encode('utf-8')).hexdigest()[:16]
+            self._l1_content_hashes.add(content_hash)
+            
             if user_text:
-                content_hash = hashlib.md5(user_text.encode('utf-8')).hexdigest()[:16]
-                self._l1_content_hashes.add(content_hash)
+                user_hash = hashlib.md5(user_text.encode('utf-8')).hexdigest()[:16]
+                self._l1_content_hashes.add(user_hash)
             
             if assistant_text:
-                content_hash = hashlib.md5(assistant_text.encode('utf-8')).hexdigest()[:16]
-                self._l1_content_hashes.add(content_hash)
+                assistant_hash = hashlib.md5(assistant_text.encode('utf-8')).hexdigest()[:16]
+                self._l1_content_hashes.add(assistant_hash)
             
             conv_id = conv.get("id") or conv.get("conversation_id")
             if conv_id:
@@ -414,166 +416,6 @@ class ContextBuilder:
                     pass
             
             filtered.append(item)
-        
-        return filtered
-    
-    def _search_l1(self, query: str, conversation_history: List[Dict] = None, threshold: float = 0.9) -> List[Dict]:
-        """
-        L1: 搜索内存中的最近对话历史
-        
-        简单的关键词匹配，返回最近的对话
-        """
-        if not conversation_history:
-            return []
-        
-        results = []
-        query_lower = query.lower()
-        query_keywords = set(query_lower.split())
-        
-        for conv in reversed(conversation_history[-20:]):
-            user_text = conv.get("user", "").lower()
-            assistant_text = conv.get("assistant", "").lower()
-            
-            score = 0
-            matched_keywords = 0
-            for kw in query_keywords:
-                if kw in user_text:
-                    score += 2
-                    matched_keywords += 1
-                if kw in assistant_text:
-                    score += 1
-                    matched_keywords += 1
-            
-            if score > 0:
-                combined_text = f"用户: {conv.get('user', '')}\n助理: {conv.get('assistant', '')}"
-                max_possible_score = len(query_keywords) * 3
-                similarity = score / max_possible_score if max_possible_score > 0 else 0
-                
-                if similarity >= threshold:
-                    results.append({
-                        "text": combined_text,
-                        "similarity": similarity,
-                        "source": "L1",
-                        "timestamp": conv.get("timestamp", "")
-                    })
-        
-        results.sort(key=lambda x: x["similarity"], reverse=True)
-        return results[:5]
-    
-    def _search_l2(self, query: str, threshold: float) -> List[Dict]:
-        """
-        L2: 搜索向量库（ChromaDB）
-        """
-        try:
-            results = self.memory.search(query, top_k=10, threshold=threshold, include_l1=False)
-            formatted_results = []
-            for r in results:
-                formatted_results.append({
-                    "text": r.text,
-                    "similarity": r.similarity,
-                    "source": r.source,
-                    "weight": r.weight,
-                    "metadata": r.metadata
-                })
-            return formatted_results
-        except Exception as e:
-            self._log.warning("L2_SEARCH_FALLBACK",
-                             error=str(e),
-                             query_preview=query[:50] if query else "",
-                             fallback="L3_FTS5")
-            return []
-    
-    def _search_l3(self, query: str, threshold: float = 0.8) -> List[Dict]:
-        """
-        L3: 搜索SQLite数据库（全文搜索）
-        
-        使用FTS5进行全文搜索，作为向量检索的补充
-        """
-        try:
-            if not self.memory.sqlite:
-                return []
-            
-            results = self.memory.sqlite.search(query, limit=10)
-            formatted_results = []
-            
-            query_keywords = set(query.lower().split())
-            
-            for record in results:
-                text = record.compressed_text or record.text
-                text_lower = text.lower()
-                
-                matched_keywords = sum(1 for kw in query_keywords if kw in text_lower)
-                keyword_ratio = matched_keywords / len(query_keywords) if query_keywords else 0
-                similarity = keyword_ratio * 0.8
-                
-                if similarity >= threshold:
-                    formatted_results.append({
-                        "text": text,
-                        "similarity": similarity,
-                        "source": "L3",
-                        "weight": record.weight,
-                        "timestamp": record.created_time,
-                        "metadata": record.metadata
-                    })
-            
-            return formatted_results
-        except Exception as e:
-            self._log.warning("L3_SEARCH_FAILED",
-                             error=str(e),
-                             query_preview=query[:50] if query else "")
-            return []
-    
-    def _merge_results(self, existing: List[Dict], new_results: List[Dict]) -> List[Dict]:
-        """
-        合并检索结果，去重 + 多样性控制 + 来源权重排序
-        
-        策略：
-        1. 合并所有结果
-        2. 应用来源权重
-        3. 多样性过滤（文本重叠度 > 0.8 视为重复）
-        4. 按综合得分排序
-        """
-        seen = set()
-        merged = []
-        
-        all_items = existing + new_results
-        
-        for item in all_items:
-            text = item.get("text", "")
-            if not text or text in seen:
-                continue
-            
-            seen.add(text)
-            
-            similarity = item.get("similarity", 0.0)
-            weight = item.get("weight", 1.0)
-            source = item.get("source", "L3")
-            
-            source_weights = {
-                "L1": config.source_weight_l1,
-                "L2": config.source_weight_l2,
-                "L3": config.source_weight_l3,
-                "L3_LOW_QUALITY": config.source_weight_l3 * 0.5,
-            }
-            source_weight = source_weights.get(source, config.source_weight_l3)
-            
-            item["final_score"] = similarity * weight * source_weight
-            merged.append(item)
-        
-        merged.sort(key=lambda x: x.get("final_score", 0), reverse=True)
-        
-        filtered = []
-        for item in merged:
-            is_duplicate = False
-            item_text = item.get("text", "")
-            for selected in filtered:
-                selected_text = selected.get("text", "")
-                overlap = self._calculate_text_overlap(item_text, selected_text)
-                if overlap >= config.diversity_threshold:
-                    is_duplicate = True
-                    break
-            if not is_duplicate:
-                filtered.append(item)
         
         return filtered
     
@@ -952,12 +794,16 @@ class ContextBuilder:
         max_tokens: int
     ) -> str:
         """
-        按优先级填充 Token 预算（带硬性底线保护）
+        按优先级填充 Token 预算（带动态预算流转）
         
         分配策略：
-        - Bucket B (Recent L1): 30% 预算
-        - Bucket C (Important): 20% 预算（上限）
-        - Bucket D (Retrieved): 50% 预算（硬性底线：至少 20% 或 200 tokens）
+        - Bucket B (Recent L1): 初始 30% 预算，未用完流转给 D
+        - Bucket C (Important): 初始 20% 预算，未用完流转给 D
+        - Bucket D (Retrieved): 至少 50% 预算 + B/C 结余
+        
+        动态流转：
+        - 若 B/C 未用完预算，剩余部分自动滚入 D
+        - 确保不会因 B/C 内容少而浪费 Token 预算
         
         Args:
             buckets: 优先级分桶
@@ -984,22 +830,34 @@ class ContextBuilder:
             bucket_c_budget = max(int(bucket_c_budget - shortage * 0.4), 0)
         
         result_parts = []
+        total_used = 0
         
         bucket_b_texts = buckets.get(PRIORITY_BUCKET_B, [])
         if bucket_b_texts:
-            bucket_b_content, _ = self._compress_memories(bucket_b_texts, bucket_b_budget)
+            bucket_b_content, b_used = self._compress_memories(bucket_b_texts, bucket_b_budget)
             if bucket_b_content:
                 result_parts.append("【最近对话】\n" + bucket_b_content)
+                total_used += b_used
+            b_rollover = bucket_b_budget - b_used
+        else:
+            b_rollover = bucket_b_budget
         
         bucket_c_texts = buckets.get(PRIORITY_BUCKET_C, [])
         if bucket_c_texts:
-            bucket_c_content, _ = self._compress_memories(bucket_c_texts, bucket_c_budget)
+            bucket_c_content, c_used = self._compress_memories(bucket_c_texts, bucket_c_budget)
             if bucket_c_content:
                 result_parts.append("【重要记忆】\n" + bucket_c_content)
+                total_used += c_used
+            c_rollover = bucket_c_budget - c_used
+        else:
+            c_rollover = bucket_c_budget
+        
+        bucket_d_budget = bucket_d_budget + b_rollover + c_rollover
+        bucket_d_budget = min(bucket_d_budget, max_tokens - total_used)
         
         bucket_d_texts = buckets.get(PRIORITY_BUCKET_D, [])
         if bucket_d_texts:
-            bucket_d_content, _ = self._compress_memories(bucket_d_texts, bucket_d_budget)
+            bucket_d_content, d_used = self._compress_memories(bucket_d_texts, bucket_d_budget)
             if bucket_d_content:
                 result_parts.append("【历史参考】\n" + bucket_d_content)
         

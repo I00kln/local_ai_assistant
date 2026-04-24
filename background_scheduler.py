@@ -421,6 +421,48 @@ class BackgroundTaskScheduler:
         """检查是否有迁移操作正在进行"""
         return self._migration_active
     
+    def acquire_migration_lock(self, migration_type: str = "external", timeout: float = 10.0) -> bool:
+        """
+        获取迁移锁（写锁）
+        
+        用于外部操作（如记忆合并）需要独占访问时
+        
+        Args:
+            migration_type: 迁移类型标识
+            timeout: 超时时间（秒）
+        
+        Returns:
+            是否成功获取锁
+        """
+        from enum import Enum
+        
+        class ExternalTaskType(Enum):
+            EXTERNAL = "external"
+            MERGE = "merge"
+        
+        task_type = ExternalTaskType.MERGE if migration_type == "merge" else ExternalTaskType.EXTERNAL
+        
+        try:
+            self._begin_migration(task_type, timeout=timeout)
+            return True
+        except TimeoutError:
+            self._log.warning("MIGRATION_LOCK_ACQUIRE_TIMEOUT", migration_type=migration_type)
+            return False
+        except Exception as e:
+            self._log.error("MIGRATION_LOCK_ACQUIRE_FAILED", error=str(e))
+            return False
+    
+    def release_migration_lock(self):
+        """
+        释放迁移锁（写锁）
+        
+        必须与 acquire_migration_lock 配对使用
+        """
+        try:
+            self._end_migration()
+        except Exception as e:
+            self._log.warning("MIGRATION_LOCK_RELEASE_FAILED", error=str(e))
+    
     def get_current_task(self) -> Optional[TaskType]:
         """获取当前正在执行的任务类型"""
         return self._current_task

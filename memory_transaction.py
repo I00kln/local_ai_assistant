@@ -272,22 +272,34 @@ class TransactionCoordinator:
         """
         开始迁移操作
         
-        委托给 BackgroundScheduler 的统一锁管理
+        修复：真正获取 BackgroundScheduler 的写锁，确保读写隔离
         
         Args:
             migration_type: 迁移类型 (flush_buffer, l2_to_l3, l3_to_l2, merge, etc.)
         """
         self._migration_active = True
         self._migration_type = migration_type
+        
+        if self._scheduler:
+            acquired = self._scheduler.acquire_migration_lock(migration_type, timeout=10.0)
+            if not acquired:
+                self._log.warning("MIGRATION_LOCK_ACQUIRE_FAILED_FALLBACK", migration_type=migration_type)
+        
         self._log.debug("MIGRATION_STARTED", migration_type=migration_type)
     
     def end_migration(self):
         """
         结束迁移操作
+        
+        修复：真正释放 BackgroundScheduler 的写锁
         """
         migration_type = self._migration_type
         self._migration_active = False
         self._migration_type = None
+        
+        if self._scheduler:
+            self._scheduler.release_migration_lock()
+        
         self._log.debug("MIGRATION_ENDED", migration_type=migration_type)
     
     def is_migration_active(self) -> bool:

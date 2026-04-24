@@ -18,6 +18,7 @@ from models import MemoryRecord
 from logger import get_logger, set_trace_id
 from memory_tags import MemoryTags, MemoryTagHelper
 from memory_merger import get_merger
+from thread_pool_manager import submit_io_task
 from compression_strategies import (
     CompressionStrategy,
     CompressionStrategyChain,
@@ -117,8 +118,7 @@ class AsyncMemoryProcessor:
         self.thread = threading.Thread(target=self._process_loop, daemon=True)
         self.thread.start()
         
-        recovery_thread = threading.Thread(target=self._startup_recovery, daemon=True)
-        recovery_thread.start()
+        submit_io_task(self._startup_recovery)
         
         compression_thread = threading.Thread(target=self._compression_loop, daemon=True)
         compression_thread.start()
@@ -418,8 +418,7 @@ class AsyncMemoryProcessor:
             finally:
                 self._orphan_cleanup_running = False
         
-        cleanup_thread = threading.Thread(target=cleanup_task, daemon=True)
-        cleanup_thread.start()
+        submit_io_task(cleanup_task)
     
     def stop_orphan_cleanup(self):
         """
@@ -543,7 +542,7 @@ class AsyncMemoryProcessor:
         except Exception as e:
             self._log.error("SHUTDOWN_BUFFER_SAVE_FAILED", error=str(e))
     
-    def add_conversation(self, user_input: str, assistant_response: str, metadata: Dict = None):
+    def add_conversation(self, user_input: str, assistant_response: str, metadata: Dict = None, session_id: str = None):
         """
         添加一轮对话到处理队列
         
@@ -556,6 +555,9 @@ class AsyncMemoryProcessor:
         过滤机制：
         - 入口处提前进行nonsense过滤
         - 确保过滤覆盖所有路径
+        
+        会话持久化：
+        - 保存到 conversations 表用于会话恢复
         """
         if config.nonsense_filter_enabled:
             filter_result = get_nonsense_filter().filter(user_input, assistant_response)
@@ -583,7 +585,8 @@ class AsyncMemoryProcessor:
             "user": user_input,
             "assistant": assistant_response,
             "metadata": metadata or {},
-            "trace_id": (metadata or {}).get("trace_id")
+            "trace_id": (metadata or {}).get("trace_id"),
+            "session_id": session_id
         }
         
         self._queue_total_count += 1
@@ -726,7 +729,7 @@ class AsyncMemoryProcessor:
             
             for record_id in batch:
                 try:
-                    record = self.sqlite.get_by_id(record_id)
+                    record = self.sqlite.get(record_id)
                     if not record or record.is_vectorized != 0:
                         continue
                     
@@ -738,7 +741,7 @@ class AsyncMemoryProcessor:
                     metadata["preloaded"] = True
                     metadata["original_id"] = record_id
                     
-                    vector_id = f"preload_{record_id}_{int(time.time())}"
+                    vector_id = self.vector_store._generate_deterministic_id(text)
                     
                     self.vector_store.add(
                         texts=[text],
@@ -757,11 +760,40 @@ class AsyncMemoryProcessor:
             
             time.sleep(0.1)
         
+        self._cleanup_preload_ids(record_ids)
+        
         return {
             "success": success_count,
             "failed": failed_count,
             "total": len(record_ids)
         }
+    
+    def _cleanup_preload_ids(self, processed_ids: List[int]):
+        """
+        清理已处理的预加载 ID
+        
+        策略：
+        1. 移除已处理的 ID
+        2. 检查集合大小，超过限制时清理最旧的 ID
+        3. 使用 LRU 策略管理
+        
+        Args:
+            processed_ids: 已处理的 ID 列表
+        """
+        MAX_PENDING_IDS = 1000
+        
+        for rid in processed_ids:
+            self._pending_preload_ids.discard(rid)
+        
+        if len(self._pending_preload_ids) > MAX_PENDING_IDS:
+            excess = len(self._pending_preload_ids) - MAX_PENDING_IDS
+            to_remove = list(self._pending_preload_ids)[:excess]
+            for rid in to_remove:
+                self._pending_preload_ids.discard(rid)
+            
+            self._log.debug("PRELOAD_IDS_CLEANUP", 
+                           removed=excess,
+                           remaining=len(self._pending_preload_ids))
     
     def _handle_queue_full(self, conv_data: Dict):
         """
@@ -1059,6 +1091,7 @@ class AsyncMemoryProcessor:
         2. 空闲时检查并刷新缓冲区
         3. 空闲时恢复待处理数据
         4. 空闲时执行去重检查
+        5. 空闲时清理预加载 ID 缓存
         """
         while self.running:
             try:
@@ -1074,10 +1107,44 @@ class AsyncMemoryProcessor:
                     self._check_and_flush()
                     self._recover_pending_during_runtime()
                     self._check_and_dedup()
+                    if self._idle_count % 10 == 0:
+                        self._periodic_cleanup_preload_ids()
                     continue
                 
             except Exception as e:
                 print(f"异步处理异常: {e}")
+    
+    def _periodic_cleanup_preload_ids(self):
+        """
+        定期清理预加载 ID 缓存
+        
+        策略：
+        1. 检查已向量化但仍在缓存中的 ID
+        2. 清理超过 1 小时未处理的 ID
+        """
+        MAX_PENDING_IDS = 1000
+        MAX_AGE_SECONDS = 3600
+        
+        if len(self._pending_preload_ids) <= MAX_PENDING_IDS // 2:
+            return
+        
+        cleaned = 0
+        if self.sqlite:
+            try:
+                to_remove = []
+                for rid in list(self._pending_preload_ids):
+                    record = self.sqlite.get(rid)
+                    if record and record.is_vectorized != 0:
+                        to_remove.append(rid)
+                
+                for rid in to_remove:
+                    self._pending_preload_ids.discard(rid)
+                    cleaned += 1
+                
+                if cleaned > 0:
+                    self._log.debug("PERIODIC_PRELOAD_IDS_CLEANUP", cleaned=cleaned)
+            except Exception as e:
+                self._log.warning("PERIODIC_CLEANUP_FAILED", error=str(e))
     
     def _process_conversation(self, conv: Dict):
         """
@@ -1088,12 +1155,28 @@ class AsyncMemoryProcessor:
         - sqlite_only: 仅存SQLite（保持对话完整性，不污染向量空间）
         - discard: 完全丢弃（纯噪音）
         
+        会话持久化：
+        - 保存到 conversations 表用于会话恢复
+        
         注意：nonsense过滤已在add_conversation入口处完成
         """
         user_input = conv['user']
         assistant_response = conv['assistant']
         source = conv.get('metadata', {}).get('source', 'local')
         conv_metadata = conv.get('metadata', {})
+        session_id = conv.get('session_id')
+        
+        if session_id and self.sqlite:
+            try:
+                self.sqlite.add_conversation(
+                    session_id=session_id,
+                    user_input=user_input,
+                    assistant_response=assistant_response,
+                    source=source,
+                    metadata=conv_metadata
+                )
+            except Exception as e:
+                self._log.warning("SESSION_CONVERSATION_SAVE_FAILED", error=str(e))
         
         conversation_memory = f"用户: {user_input}\n助理: {assistant_response}"
         metadata = {

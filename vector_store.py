@@ -10,6 +10,7 @@ from datetime import datetime
 from config import config
 from memory_tags import MemoryTags
 from models import MemoryRecord
+from thread_pool_manager import submit_io_task
 
 
 def _serialize_metadata(metadata: Dict[str, Any]) -> Dict[str, Any]:
@@ -171,12 +172,7 @@ class VectorStore:
         self._warmup_started = True
         
         print("[向量存储] 正在后台预加载ONNX嵌入模型...")
-        prewarm_thread = threading.Thread(
-            target=self._prewarm_embedding,
-            daemon=True,
-            name="EmbeddingPrewarm"
-        )
-        prewarm_thread.start()
+        submit_io_task(self._prewarm_embedding)
     
     def _init_chroma(self):
         """初始化ChromaDB客户端和集合"""
@@ -308,11 +304,31 @@ class VectorStore:
         - 每批最多 500 条记录，防止 Payload 过大
         - 分块写入，单块失败不影响其他块
         
-        降级策略：
-        - 磁盘满时，降级到 SQLite 存储
-        - 连接失败时，记录错误并返回空列表
+        降级保护：
+        - 禁止写入随机向量，防止污染向量库
+        - 降级模式下仅存储到 SQLite，标记为 pending_embedding
         """
         if not texts:
+            return []
+        
+        if self.embedding_function.is_fallback_mode():
+            print(f"[警告] EmbeddingService 处于降级模式，禁止写入向量库，仅存储到 SQLite")
+            
+            if sqlite_store:
+                try:
+                    for i, text in enumerate(texts):
+                        meta = metadatas[i] if metadatas and i < len(metadatas) else {}
+                        meta["pending_embedding"] = True
+                        record = MemoryRecord(
+                            text=text,
+                            source=meta.get("source", "local"),
+                            metadata=meta,
+                            is_vectorized=-1
+                        )
+                        sqlite_store.add(record)
+                    print(f"[降级] 已将 {len(texts)} 条记录存储到 SQLite，标记为 pending_embedding")
+                except Exception as e:
+                    print(f"[错误] SQLite 降级存储失败: {e}")
             return []
         
         if ids is None:

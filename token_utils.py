@@ -31,8 +31,8 @@ except ImportError:
 
 
 def _get_cache_key(text: str) -> str:
-    """生成缓存键"""
-    return hashlib.md5(text.encode('utf-8')).hexdigest()
+    """生成缓存键（使用 SHA256 降低碰撞风险）"""
+    return hashlib.sha256(text.encode('utf-8')).hexdigest()
 
 
 def _cache_get(text: str) -> Tuple[bool, int]:

@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from config import config
 from memory_tags import MemoryTagHelper, MemoryConstants
+from thread_pool_manager import submit_cpu_task
 
 
 @dataclass
@@ -245,8 +246,7 @@ class NonsenseFilter:
             except Exception as e:
                 print(f"废话过滤器：后台向量计算失败: {e}")
         
-        thread = threading.Thread(target=compute_vectors_background, daemon=True)
-        thread.start()
+        submit_cpu_task(compute_vectors_background)
     
     def _save_nonsense_library(self):
         """保存废话库"""

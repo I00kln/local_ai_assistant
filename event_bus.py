@@ -17,6 +17,7 @@ class EventType(Enum):
     QUEUE_DROPPED = "queue_dropped"
     ORPHAN_CLEANUP_PROGRESS = "orphan_cleanup_progress"
     ORPHAN_CLEANUP_COMPLETE = "orphan_cleanup_complete"
+    SHUTDOWN = "shutdown"
 
 
 @dataclass
@@ -79,7 +80,8 @@ class EventBus:
         self._log = get_logger()
         self._subscribers: Dict[EventType, List[SubscriberInfo]] = {}
         self._subscribers_lock = threading.RLock()
-        self._event_queue: queue.Queue = queue.Queue()
+        self._event_queue: queue.Queue = queue.Queue(maxsize=1000)
+        self._queue_dropped_count = 0
         self._running = True
         self._worker_thread = threading.Thread(
             target=self._process_loop,
@@ -259,6 +261,10 @@ class EventBus:
         
         事件会被放入队列，由后台线程异步处理
         
+        队列满时丢弃策略：
+        - 队列满时丢弃新事件，防止内存膨胀
+        - 记录丢弃计数，供监控使用
+        
         Args:
             event_type: 事件类型
             data: 事件数据
@@ -270,7 +276,15 @@ class EventBus:
             data=data,
             source=source
         )
-        self._event_queue.put(event)
+        try:
+            self._event_queue.put_nowait(event)
+        except queue.Full:
+            self._queue_dropped_count += 1
+            self._log.warning(
+                "EVENT_QUEUE_FULL",
+                dropped_count=self._queue_dropped_count,
+                event_type=event_type.value
+            )
     
     def get_queue_size(self) -> int:
         """获取待处理事件队列大小"""
