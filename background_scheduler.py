@@ -314,12 +314,14 @@ class BackgroundTaskScheduler:
         """
         deadline = time.time() + timeout
         migration_lock_acquired = False
+        pending_writers_incremented = False
         
         with self._write_waiting:
-            self._pending_writers += 1
-            self._write_wait_start_time = time.time()
-            
             try:
+                self._pending_writers += 1
+                pending_writers_incremented = True
+                self._write_wait_start_time = time.time()
+                
                 while self._readers_count > 0:
                     remaining = deadline - time.time()
                     if remaining <= 0:
@@ -356,7 +358,8 @@ class BackgroundTaskScheduler:
                         pass
                 raise
             finally:
-                self._pending_writers -= 1
+                if pending_writers_incremented:
+                    self._pending_writers -= 1
     
     def _end_migration(self):
         """
