@@ -1,10 +1,11 @@
 # context_builder.py
 # 上下文构建器 - 使用三层记忆管理器
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Set, Optional
 from config import config
 from memory_tags import MemoryConstants
 from logger import get_logger
 import re
+from datetime import datetime, timedelta
 
 SHORT_QUERY_STOPWORDS = {
     "好", "好的", "嗯", "哦", "是", "对", "行", "可以", "继续",
@@ -12,8 +13,13 @@ SHORT_QUERY_STOPWORDS = {
     "ok", "yes", "no", "hi", "hello", "hey"
 }
 
+PRIORITY_BUCKET_A = "system_fixed"
+PRIORITY_BUCKET_B = "recent_l1"
+PRIORITY_BUCKET_C = "important_l1"
+PRIORITY_BUCKET_D = "retrieved_l2_l3"
+
 class ContextBuilder:
-    """上下文构建器：多级记忆检索 + 动态长度控制"""
+    """上下文构建器：多级记忆检索 + 动态长度控制 + 优先级聚合"""
     
     def __init__(self, memory_manager):
         self.memory = memory_manager
@@ -26,6 +32,10 @@ class ContextBuilder:
         self.l2_default_threshold = config.similarity_threshold
         self.l2_lower_threshold = config.l2_lower_threshold
         self._log = get_logger()
+        
+        self._recent_conversation_ids: Set[str] = set()
+        self._important_memory_ids: Set[str] = set()
+        self._l1_content_hashes: Set[str] = set()
     
     def get_thresholds(self, mode: str = "local") -> Dict[str, float]:
         """
@@ -89,7 +99,7 @@ class ContextBuilder:
         has_memories = len(retrieved) > 0
         
         memory_context, processed_user_input, _ = self._control_context_length(
-            retrieved, user_input, mode
+            retrieved, user_input, mode, conversation_history
         )
         
         return memory_context, processed_user_input, retrieved, has_memories
@@ -109,12 +119,101 @@ class ContextBuilder:
         
         return True
     
+    def _expand_query(
+        self, 
+        current_input: str, 
+        conversation_history: List[Dict] = None,
+        max_history_turns: int = 2
+    ) -> str:
+        """
+        Query 扩展：合并当前输入与前几轮对话核心实体
+        
+        策略：
+        1. 提取当前输入的关键词
+        2. 从前 N 轮对话中提取实体（名词短语）
+        3. 合并去重后作为扩展查询
+        
+        Args:
+            current_input: 当前用户输入
+            conversation_history: 对话历史
+            max_history_turns: 最多回溯的对话轮数
+        
+        Returns:
+            扩展后的查询字符串
+        """
+        if not conversation_history or len(conversation_history) == 0:
+            return current_input
+        
+        entities = set()
+        
+        current_entities = self._extract_entities(current_input)
+        entities.update(current_entities)
+        
+        recent_history = conversation_history[-max_history_turns:] if conversation_history else []
+        
+        for conv in recent_history:
+            user_text = conv.get("user", "")
+            assistant_text = conv.get("assistant", "")
+            
+            user_entities = self._extract_entities(user_text)
+            assistant_entities = self._extract_entities(assistant_text)
+            
+            entities.update(user_entities)
+            entities.update(assistant_entities)
+        
+        entities.difference_update(current_entities)
+        
+        if entities:
+            expanded = f"{current_input} {' '.join(list(entities)[:5])}"
+            return expanded
+        
+        return current_input
+    
+    def _extract_entities(self, text: str) -> Set[str]:
+        """
+        从文本中提取实体（名词短语）
+        
+        策略：
+        1. 提取中文名词短语（2-4字）
+        2. 提取英文单词（大写开头或全大写）
+        3. 提取数字+单位组合
+        4. 过滤停用词
+        
+        Args:
+            text: 输入文本
+        
+        Returns:
+            实体集合
+        """
+        if not text:
+            return set()
+        
+        entities = set()
+        
+        chinese_noun_pattern = r'[\u4e00-\u9fa5]{2,4}(?:项目|系统|模块|功能|文件|配置|服务|数据|接口|版本)'
+        chinese_matches = re.findall(chinese_noun_pattern, text)
+        entities.update(chinese_matches)
+        
+        english_pattern = r'\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\b|\b[A-Z]{2,}\b'
+        english_matches = re.findall(english_pattern, text)
+        entities.update(english_matches)
+        
+        number_unit_pattern = r'\d+(?:\.\d+)?(?:元|美元|块|万|千|百|亿|%|％|度|kg|ml|GB|MB|TB|ms|秒|分钟|小时|天|周|月|年)'
+        number_matches = re.findall(number_unit_pattern, text)
+        entities.update(number_matches)
+        
+        stopwords = {"这个", "那个", "什么", "怎么", "如何", "为什么", "是不是", "有没有", "可以", "能够", "需要", "应该"}
+        entities.difference_update(stopwords)
+        
+        return entities
+    
     def _multi_level_retrieve(
         self, 
         query: str, 
         conversation_history: List[Dict] = None,
         thresholds: Dict[str, float] = None,
-        max_retrieve: int = None
+        max_retrieve: int = None,
+        enable_query_expansion: bool = True
     ) -> List[Dict]:
         """
         多级记忆检索
@@ -124,11 +223,12 @@ class ContextBuilder:
         L3: 数据库（SQLite）
         
         检索策略：
-        1. 优先搜索L1，如果结果足够则返回
-        2. L1不足则搜索L2
-        3. L2结果不足则降低置信度重试
-        4. L2仍不足则搜索L3（SQLite全文搜索）
-        5. 都没有则返回空列表
+        1. Query 扩展（可选）
+        2. 优先搜索L1，如果结果足够则返回
+        3. L1不足则搜索L2
+        4. L2结果不足则降低置信度重试
+        5. L2仍不足则搜索L3（SQLite全文搜索）
+        6. 去重处理
         """
         if not self._is_valid_query(query):
             return []
@@ -139,6 +239,12 @@ class ContextBuilder:
         if max_retrieve is None:
             max_retrieve = config.max_retrieve_results
         
+        self._update_l1_tracking(conversation_history)
+        
+        expanded_query = query
+        if enable_query_expansion and conversation_history:
+            expanded_query = self._expand_query(query, conversation_history)
+        
         results = []
         
         l1_results = self._search_l1(query, conversation_history, thresholds["l1"])
@@ -148,19 +254,131 @@ class ContextBuilder:
         l1_count = len(results)
         
         if l1_count < self.l1_min_results:
-            l2_results = self._search_l2(query, thresholds["l2"])
+            l2_results = self._search_l2(expanded_query, thresholds["l2"])
+            
+            l2_results = self._deduplicate_against_l1(l2_results, conversation_history)
             
             if len(l2_results) < self.l1_min_results - l1_count:
-                l2_lower = self._search_l2(query, thresholds["l3"])
+                l2_lower = self._search_l2(expanded_query, thresholds["l3"])
+                l2_lower = self._deduplicate_against_l1(l2_lower, conversation_history)
                 l2_results = self._merge_results(l2_results, l2_lower)
             
             results = self._merge_results(results, l2_results)
         
         if len(results) < self.l1_min_results:
-            l3_results = self._search_l3(query, thresholds["l3"])
+            l3_results = self._search_l3(expanded_query, thresholds["l3"])
+            l3_results = self._deduplicate_against_l1(l3_results, conversation_history)
             results = self._merge_results(results, l3_results)
         
+        results = self._time_window_filter(results, conversation_history)
+        
         return results[:max_retrieve]
+    
+    def _update_l1_tracking(self, conversation_history: List[Dict] = None):
+        """
+        更新 L1 追踪集合（用于去重）
+        
+        Args:
+            conversation_history: 对话历史
+        """
+        self._l1_content_hashes.clear()
+        self._recent_conversation_ids.clear()
+        
+        if not conversation_history:
+            return
+        
+        import hashlib
+        
+        for conv in conversation_history[-10:]:
+            user_text = conv.get("user", "")
+            assistant_text = conv.get("assistant", "")
+            
+            if user_text:
+                content_hash = hashlib.md5(user_text.encode('utf-8')).hexdigest()[:16]
+                self._l1_content_hashes.add(content_hash)
+            
+            conv_id = conv.get("id") or conv.get("conversation_id")
+            if conv_id:
+                self._recent_conversation_ids.add(str(conv_id))
+    
+    def _deduplicate_against_l1(
+        self, 
+        results: List[Dict], 
+        conversation_history: List[Dict] = None
+    ) -> List[Dict]:
+        """
+        对检索结果进行 L1 去重
+        
+        策略：
+        1. ID 级硬去重：排除已存在于 L1 的记录
+        2. 内容哈希去重：排除内容相同的记录
+        3. 时间窗口过滤：排除最近 10 分钟内的记录
+        
+        Args:
+            results: 检索结果列表
+            conversation_history: L1 对话历史
+        
+        Returns:
+            去重后的结果列表
+        """
+        if not results:
+            return []
+        
+        import hashlib
+        
+        deduplicated = []
+        
+        for item in results:
+            item_id = item.get("id") or item.get("record_id")
+            if item_id and str(item_id) in self._recent_conversation_ids:
+                continue
+            
+            text = item.get("text", "")
+            if text:
+                content_hash = hashlib.md5(text.encode('utf-8')).hexdigest()[:16]
+                if content_hash in self._l1_content_hashes:
+                    continue
+            
+            deduplicated.append(item)
+        
+        return deduplicated
+    
+    def _time_window_filter(
+        self, 
+        results: List[Dict], 
+        conversation_history: List[Dict] = None,
+        window_minutes: int = 10
+    ) -> List[Dict]:
+        """
+        时间窗口过滤：排除最近 N 分钟内的检索结果
+        
+        Args:
+            results: 检索结果列表
+            conversation_history: L1 对话历史
+            window_minutes: 时间窗口（分钟）
+        
+        Returns:
+            过滤后的结果列表
+        """
+        if not results or not conversation_history:
+            return results
+        
+        cutoff_time = datetime.now() - timedelta(minutes=window_minutes)
+        
+        filtered = []
+        for item in results:
+            timestamp_str = item.get("timestamp") or item.get("created_time")
+            if timestamp_str:
+                try:
+                    item_time = datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
+                    if item_time.replace(tzinfo=None) > cutoff_time:
+                        continue
+                except (ValueError, TypeError):
+                    pass
+            
+            filtered.append(item)
+        
+        return filtered
     
     def _search_l1(self, query: str, conversation_history: List[Dict] = None, threshold: float = 0.9) -> List[Dict]:
         """
@@ -573,33 +791,41 @@ class ContextBuilder:
         self, 
         memories: List[Dict], 
         current_query: str,
-        mode: str = "local"
+        mode: str = "local",
+        conversation_history: List[Dict] = None
     ) -> Tuple[str, str, bool]:
         """
-        控制上下文长度
+        控制上下文长度（优先级聚合版）
+        
+        优先级分桶策略：
+        - Bucket A (System/Fixed): 系统提示词（由调用方处理）
+        - Bucket B (Recent L1): 最近 3-5 轮对话
+        - Bucket C (Important L1): 标记为重要的记忆
+        - Bucket D (Retrieved L2/L3): 检索到的历史记忆
+        
+        Token 分配：
+        - Bucket B: 30% 预算
+        - Bucket C: 20% 预算（上限）
+        - Bucket D: 50% 预算
         
         Args:
             memories: 检索到的记忆列表
             current_query: 当前用户输入
             mode: "local" (本地压缩) | "cloud_only" (仅云端) | "hybrid" (混合)
+            conversation_history: L1 对话历史
         
         返回：
         - memory_context: 记忆上下文
         - processed_user_input: 处理后的用户输入
         - skip_user_input: 是否跳过用户原文
-        
-        Token限制：
-        - 本地模式：总token不超过 max_context (默认8192)
-        - 云端模式：无硬性限制
         """
-        memory_texts = [m.get("text", "") for m in memories if m.get("text")]
-        
         if mode == "cloud_only":
+            memory_texts = [m.get("text", "") for m in memories if m.get("text")]
             memory_context = "\n".join([f"• {m}" for m in memory_texts])
             return memory_context, current_query, False
         
         max_memory_tokens, max_user_tokens, skip_user = self._calculate_available_tokens(
-            memory_texts, current_query
+            [], current_query
         )
         
         if mode == "local":
@@ -608,13 +834,126 @@ class ContextBuilder:
             max_memory_tokens = min(max_memory_tokens, hard_limit - user_tokens)
             max_memory_tokens = max(max_memory_tokens, 200)
         
-        memory_context, memory_used = self._compress_memories(
-            memory_texts, max_memory_tokens
-        )
+        buckets = self._build_priority_buckets(memories, conversation_history)
+        
+        memory_context = self._fill_by_priority(buckets, max_memory_tokens)
         
         processed_user_input = self._truncate_user_input(current_query, max_user_tokens)
         
         return memory_context, processed_user_input, skip_user
+    
+    def _build_priority_buckets(
+        self, 
+        memories: List[Dict], 
+        conversation_history: List[Dict] = None
+    ) -> Dict[str, List[str]]:
+        """
+        构建优先级分桶
+        
+        Args:
+            memories: 检索到的记忆列表
+            conversation_history: L1 对话历史
+        
+        Returns:
+            {
+                PRIORITY_BUCKET_B: 最近对话文本列表,
+                PRIORITY_BUCKET_C: 重要记忆文本列表,
+                PRIORITY_BUCKET_D: 检索记忆文本列表
+            }
+        """
+        buckets = {
+            PRIORITY_BUCKET_B: [],
+            PRIORITY_BUCKET_C: [],
+            PRIORITY_BUCKET_D: []
+        }
+        
+        if conversation_history:
+            recent_turns = conversation_history[-5:] if len(conversation_history) > 5 else conversation_history
+            for conv in recent_turns:
+                user_text = conv.get("user", "")
+                assistant_text = conv.get("assistant", "")
+                if user_text:
+                    buckets[PRIORITY_BUCKET_B].append(f"用户: {user_text}")
+                if assistant_text:
+                    buckets[PRIORITY_BUCKET_B].append(f"助理: {assistant_text}")
+        
+        important_memories = []
+        if self.memory and hasattr(self.memory, 'sqlite') and self.memory.sqlite:
+            try:
+                important_records = self.memory.sqlite.get_important_memories(limit=10)
+                for record in important_records:
+                    text = record.compressed_text or record.text
+                    if text:
+                        important_memories.append(text)
+            except Exception:
+                pass
+        
+        for m in memories:
+            if m.get("is_important") or m.get("metadata", {}).get("tags", {}).get("important"):
+                text = m.get("text", "")
+                if text and text not in important_memories:
+                    important_memories.append(text)
+        
+        buckets[PRIORITY_BUCKET_C] = important_memories
+        
+        retrieved_texts = []
+        seen_texts = set(buckets[PRIORITY_BUCKET_B] + buckets[PRIORITY_BUCKET_C])
+        
+        for m in memories:
+            text = m.get("text", "")
+            if text and text not in seen_texts:
+                retrieved_texts.append(text)
+                seen_texts.add(text)
+        
+        buckets[PRIORITY_BUCKET_D] = retrieved_texts
+        
+        return buckets
+    
+    def _fill_by_priority(
+        self, 
+        buckets: Dict[str, List[str]], 
+        max_tokens: int
+    ) -> str:
+        """
+        按优先级填充 Token 预算
+        
+        分配策略：
+        - Bucket B (Recent L1): 30% 预算
+        - Bucket C (Important): 20% 预算（上限）
+        - Bucket D (Retrieved): 50% 预算
+        
+        Args:
+            buckets: 优先级分桶
+            max_tokens: 最大 Token 数
+        
+        Returns:
+            格式化的记忆上下文
+        """
+        bucket_b_budget = int(max_tokens * 0.3)
+        bucket_c_budget = int(max_tokens * 0.2)
+        bucket_d_budget = max_tokens - bucket_b_budget - bucket_c_budget
+        
+        result_parts = []
+        
+        bucket_b_texts = buckets.get(PRIORITY_BUCKET_B, [])
+        if bucket_b_texts:
+            bucket_b_content, _ = self._compress_memories(bucket_b_texts, bucket_b_budget)
+            if bucket_b_content:
+                result_parts.append("【最近对话】\n" + bucket_b_content)
+        
+        bucket_c_texts = buckets.get(PRIORITY_BUCKET_C, [])
+        if bucket_c_texts:
+            bucket_c_content, _ = self._compress_memories(bucket_c_texts, bucket_c_budget)
+            if bucket_c_content:
+                result_parts.append("【重要记忆】\n" + bucket_c_content)
+        
+        bucket_d_texts = buckets.get(PRIORITY_BUCKET_D, [])
+        if bucket_d_texts:
+            bucket_d_content, _ = self._compress_memories(bucket_d_texts, bucket_d_budget)
+            if bucket_d_content:
+                result_parts.append("【历史参考】\n" + bucket_d_content)
+        
+        return "\n\n".join(result_parts)
     
     def truncate_for_local_llm(
         self, 

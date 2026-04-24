@@ -12,7 +12,7 @@ from logger import TraceContext, get_trace_id, get_logger
 
 
 class ChatWindow:
-    """本地AI助理对话窗口 - 支持本地+云端混合模式"""
+    """本地AI助理对话窗口 - 支持本地+云端混合模式 + 会话持久化"""
     
     def __init__(self):
         self._log = get_logger()
@@ -26,6 +26,9 @@ class ChatWindow:
         self._initialized = False
         self._closing = False
         self._after_ids: List[str] = []
+        
+        self.session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self._session_restored = False
         
         self.window = tk.Tk()
         self.window.title("本地AI助理 - ChromaDB + SQLite")
@@ -244,6 +247,8 @@ class ChatWindow:
             
             self._safe_after(0, self._enable_ui)
             
+            self._try_restore_session()
+            
         except Exception as e:
             err_msg = str(e)
             self._safe_after(0, lambda msg=err_msg: self._append_message("system", f"初始化失败: {msg}"))
@@ -316,6 +321,104 @@ class ChatWindow:
             err_msg = str(e)
             self._safe_after(0, lambda msg=err_msg: self._append_message("system", f"云端AI初始化失败: {msg}"))
             self._safe_after(0, lambda: self.cloud_btn.config(state=tk.NORMAL))
+    
+    def _try_restore_session(self):
+        """
+        尝试恢复上次会话
+        
+        策略：
+        1. 从 SQLite 加载最后一次活跃会话
+        2. 恢复对话历史到内存
+        3. 恢复 UI 状态
+        """
+        if not self.memory or not self.memory.sqlite:
+            return
+        
+        try:
+            session_data = self.memory.sqlite.load_latest_session()
+            
+            if not session_data:
+                return
+            
+            self.session_id = session_data.get("session_id", self.session_id)
+            
+            messages = self.memory.sqlite.get_session_messages(self.session_id, limit=50)
+            
+            if not messages:
+                return
+            
+            restored_count = 0
+            for msg in messages[-20:]:
+                user_text = msg.get("user", "")
+                assistant_text = msg.get("assistant", "")
+                
+                if user_text:
+                    self.conversation_history.append({
+                        "user": user_text,
+                        "assistant": assistant_text,
+                        "timestamp": msg.get("timestamp", "")
+                    })
+                    
+                    self._append_message("user", user_text)
+                    if assistant_text:
+                        source = msg.get("source", "local")
+                        tag = "cloud" if source == "cloud" else "assistant"
+                        self._append_message(tag, assistant_text)
+                    
+                    restored_count += 1
+            
+            self._session_restored = True
+            
+            ui_snapshot = session_data.get("ui_state_snapshot", {})
+            if ui_snapshot:
+                self.local_var.set(ui_snapshot.get("local_enabled", config.local.enabled))
+                self.cloud_var.set(ui_snapshot.get("cloud_enabled", config.cloud.enabled))
+                self.nonsense_var.set(ui_snapshot.get("nonsense_enabled", config.nonsense_filter_enabled))
+            
+            self._safe_after(0, lambda c=restored_count: self._append_message(
+                "system", f"已恢复上次会话 ({c} 条对话)"
+            ))
+            
+            self._log.info("SESSION_RESTORED", 
+                          session_id=self.session_id,
+                          message_count=restored_count)
+            
+        except Exception as e:
+            self._log.warning("SESSION_RESTORE_FAILED", error=str(e))
+    
+    def _save_session(self):
+        """
+        保存当前会话状态
+        
+        策略：
+        1. 保存 UI 状态快照
+        2. 保存上下文快照
+        3. 更新会话消息计数
+        """
+        if not self.memory or not self.memory.sqlite:
+            return
+        
+        try:
+            ui_snapshot = {
+                "local_enabled": self.local_var.get(),
+                "cloud_enabled": self.cloud_var.get(),
+                "nonsense_enabled": self.nonsense_var.get(),
+                "show_memory_enabled": self.show_memory_enabled.get(),
+                "show_local_enabled": self.show_local_enabled.get()
+            }
+            
+            context_snapshot = {
+                "conversation_count": len(self.conversation_history)
+            }
+            
+            self.memory.sqlite.save_session(
+                self.session_id,
+                ui_state_snapshot=ui_snapshot,
+                context_snapshot=context_snapshot
+            )
+            
+        except Exception as e:
+            self._log.warning("SESSION_SAVE_FAILED", error=str(e))
     
     def _enable_ui(self):
         """启用 UI 控件"""
@@ -776,14 +879,24 @@ class ChatWindow:
             ))
     
     def _clear_conversation(self):
-        """清空当前对话历史"""
+        """清空当前对话历史并结束当前会话"""
+        if self.memory and self.memory.sqlite:
+            try:
+                self.memory.sqlite.end_session(self.session_id)
+            except Exception as e:
+                self._log.warning("END_SESSION_FAILED", error=str(e))
+        
         self.conversation_history.clear()
         self.chat_display.config(state=tk.NORMAL)
         self.chat_display.delete("1.0", tk.END)
         self.chat_display.config(state=tk.DISABLED)
         self.send_button.config(state=tk.NORMAL)
         self.state_manager.set_state(UIState.IDLE)
-        self._append_message("system", "对话历史已清空")
+        
+        self.session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self._session_restored = False
+        
+        self._append_message("system", "对话历史已清空，已开始新会话")
     
     def _force_save(self):
         """强制保存记忆"""
@@ -813,14 +926,17 @@ class ChatWindow:
         使用 LifecycleManager 集中管理资源释放：
         1. 设置关闭标志，阻止新请求
         2. 取消所有待执行的 UI 回调
-        3. 调用 LifecycleManager.shutdown() 关闭所有服务
-        4. 销毁窗口
+        3. 保存当前会话状态
+        4. 调用 LifecycleManager.shutdown() 关闭所有服务
+        5. 销毁窗口
         """
         self._closing = True
         self._cancel_all_after()
         
         if hasattr(self, '_init_thread') and self._init_thread.is_alive():
             self._init_thread.join(timeout=2)
+        
+        self._save_session()
         
         try:
             from lifecycle_manager import get_lifecycle_manager

@@ -588,6 +588,167 @@ class AsyncMemoryProcessor:
             self.pending_queue.put_nowait(conv_data)
         except queue.Full:
             self._handle_queue_full(conv_data)
+        
+        self._trigger_preload(user_input)
+    
+    def _trigger_preload(self, user_input: str):
+        """
+        触发 L3 到 L2 的预加载
+        
+        策略：
+        1. 提取当前输入的关键词
+        2. 使用 FTS5 进行轻量级搜索
+        3. 异步提交预加载任务
+        
+        Args:
+            user_input: 用户输入
+        """
+        if not self.sqlite or not user_input:
+            return
+        
+        try:
+            keywords = self._extract_preload_keywords(user_input)
+            if not keywords:
+                return
+            
+            results = self.sqlite.search(keywords, limit=5)
+            
+            if results:
+                unvectorized_ids = []
+                for record in results:
+                    if record.is_vectorized == 0 and record.id:
+                        unvectorized_ids.append(record.id)
+                
+                if unvectorized_ids:
+                    self._schedule_preload_task(unvectorized_ids)
+                    
+        except Exception as e:
+            self._log.debug("PRELOAD_TRIGGER_FAILED", error=str(e))
+    
+    def _extract_preload_keywords(self, text: str) -> str:
+        """
+        提取预加载关键词
+        
+        策略：
+        1. 提取专有名词和实体
+        2. 提取数字+单位组合
+        3. 过滤停用词
+        
+        Args:
+            text: 输入文本
+        
+        Returns:
+            关键词字符串
+        """
+        if not text:
+            return ""
+        
+        keywords = []
+        
+        chinese_pattern = r'[\u4e00-\u9fa5]{2,4}(?:项目|系统|模块|功能|文件|配置|服务|数据|接口|版本)'
+        chinese_matches = re.findall(chinese_pattern, text)
+        keywords.extend(chinese_matches[:3])
+        
+        english_pattern = r'\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\b|\b[A-Z]{2,}\b'
+        english_matches = re.findall(english_pattern, text)
+        keywords.extend(english_matches[:2])
+        
+        number_pattern = r'\d+(?:\.\d+)?(?:元|美元|块|万|千|百|亿|%|％|度|kg|ml|GB|MB|TB)'
+        number_matches = re.findall(number_pattern, text)
+        keywords.extend(number_matches[:2])
+        
+        if keywords:
+            return " ".join(keywords)
+        
+        words = text.split()
+        filtered_words = [w for w in words if len(w) > 1 and w not in ["这个", "那个", "什么", "怎么"]]
+        return " ".join(filtered_words[:5]) if filtered_words else ""
+    
+    def _schedule_preload_task(self, record_ids: List[int]):
+        """
+        调度预加载任务
+        
+        Args:
+            record_ids: 需要预加载的记录ID列表
+        """
+        if not record_ids or not self._scheduler:
+            return
+        
+        def preload_callback():
+            return self._execute_preload(record_ids)
+        
+        self._scheduler.submit_task(
+            TaskType.PRELOAD_L3_TO_L2,
+            preload_callback,
+            priority=TaskPriority.LOW
+        )
+        
+        self._log.debug("PRELOAD_TASK_SCHEDULED", record_count=len(record_ids))
+    
+    def _execute_preload(self, record_ids: List[int]) -> Dict[str, Any]:
+        """
+        执行预加载操作
+        
+        策略：
+        1. 小批量处理（batch_size=2）
+        2. 每批次间释放锁
+        3. 错误隔离，单条失败不影响其他
+        
+        Args:
+            record_ids: 记录ID列表
+        
+        Returns:
+            执行结果
+        """
+        if not record_ids:
+            return {"success": 0, "failed": 0}
+        
+        success_count = 0
+        failed_count = 0
+        batch_size = 2
+        
+        for i in range(0, len(record_ids), batch_size):
+            batch = record_ids[i:i + batch_size]
+            
+            for record_id in batch:
+                try:
+                    record = self.sqlite.get_by_id(record_id)
+                    if not record or record.is_vectorized != 0:
+                        continue
+                    
+                    text = record.compressed_text or record.text
+                    if not text:
+                        continue
+                    
+                    metadata = record.metadata or {}
+                    metadata["preloaded"] = True
+                    metadata["original_id"] = record_id
+                    
+                    vector_id = f"preload_{record_id}_{int(time.time())}"
+                    self.vector_store.add(
+                        texts=[text],
+                        metadatas=[metadata],
+                        ids=[vector_id]
+                    )
+                    
+                    self.sqlite.update_vector_status(record_id, vector_id, 1)
+                    success_count += 1
+                    
+                    self._log.debug("PRELOAD_SUCCESS", record_id=record_id)
+                    
+                except Exception as e:
+                    failed_count += 1
+                    self._log.warning("PRELOAD_FAILED", 
+                                     record_id=record_id, 
+                                     error=str(e))
+            
+            time.sleep(0.1)
+        
+        return {
+            "success": success_count,
+            "failed": failed_count,
+            "total": len(record_ids)
+        }
     
     def _handle_queue_full(self, conv_data: Dict):
         """

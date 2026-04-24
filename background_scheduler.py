@@ -34,6 +34,7 @@ class TaskType(Enum):
     """后台任务类型"""
     MIGRATION_L2_TO_L3 = "migration_l2_to_l3"
     MIGRATION_L3_TO_L2 = "migration_l3_to_l2"
+    PRELOAD_L3_TO_L2 = "preload_l3_to_l2"
     COMPRESSION = "compression"
     MERGE = "merge"
     DEDUP = "dedup"

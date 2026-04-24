@@ -592,6 +592,11 @@ class SQLiteStore:
                     self._set_schema_version(conn, 1)
                     print(f"[SQLite] Schema 升级至版本 1")
                 
+                if current_version < 2:
+                    self._init_schema_v2(cursor)
+                    self._set_schema_version(conn, 2)
+                    print(f"[SQLite] Schema 升级至版本 2")
+                
                 conn.commit()
                 
                 if os.path.exists(self.db_path):
@@ -711,6 +716,52 @@ class SQLiteStore:
                 VALUES (new.id, new.text, COALESCE(new.compressed_text, ''));
             END
         """)
+    
+    def _init_schema_v2(self, cursor):
+        """
+        Schema 版本 2: 会话持久化与重要标记
+        
+        新增：
+        - memories 表增加 is_important, session_id, content_hash 字段
+        - sessions 表用于会话持久化
+        - 相关索引
+        """
+        try:
+            cursor.execute("ALTER TABLE memories ADD COLUMN is_important INTEGER DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass
+        
+        try:
+            cursor.execute("ALTER TABLE memories ADD COLUMN session_id TEXT DEFAULT ''")
+        except sqlite3.OperationalError:
+            pass
+        
+        try:
+            cursor.execute("ALTER TABLE memories ADD COLUMN content_hash TEXT DEFAULT ''")
+        except sqlite3.OperationalError:
+            pass
+        
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_is_important ON memories(is_important)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_session_id_memories ON memories(session_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_content_hash ON memories(content_hash)")
+        
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS sessions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL UNIQUE,
+                status TEXT DEFAULT 'active',
+                created_time TEXT NOT NULL,
+                updated_time TEXT NOT NULL,
+                message_count INTEGER DEFAULT 0,
+                ui_state_snapshot TEXT DEFAULT '{}',
+                context_snapshot TEXT DEFAULT '{}',
+                metadata TEXT DEFAULT '{}'
+            )
+        """)
+        
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_sessions_session_id ON sessions(session_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_sessions_status ON sessions(status)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_sessions_updated ON sessions(updated_time DESC)")
     
     def _rebuild_database(self):
         """
@@ -1458,7 +1509,10 @@ class SQLiteStore:
             metadata=metadata,
             vector_id=row["vector_id"] if "vector_id" in row_keys else None,
             is_vectorized=row["is_vectorized"] if "is_vectorized" in row_keys else 0,
-            bm25_score=row["bm25_score"] if "bm25_score" in row_keys else 0.0
+            bm25_score=row["bm25_score"] if "bm25_score" in row_keys else 0.0,
+            is_important=bool(row["is_important"]) if "is_important" in row_keys else False,
+            session_id=row["session_id"] if "session_id" in row_keys else "",
+            content_hash=row["content_hash"] if "content_hash" in row_keys else ""
         )
     
     def update_vector_status(self, record_id: int, vector_id: str, is_vectorized: int = 1):
@@ -2082,6 +2136,366 @@ class SQLiteStore:
                 return deleted
         
         return self._retry_on_connection_error(_do_cleanup)
+    
+    # ==================== 会话持久化管理 ====================
+    
+    def save_session(
+        self,
+        session_id: str,
+        ui_state_snapshot: Dict[str, Any] = None,
+        context_snapshot: Dict[str, Any] = None,
+        metadata: Dict[str, Any] = None
+    ) -> bool:
+        """
+        保存会话状态
+        
+        Args:
+            session_id: 会话ID
+            ui_state_snapshot: UI状态快照
+            context_snapshot: 上下文快照
+            metadata: 元数据
+        
+        Returns:
+            是否成功
+        """
+        from models import SessionRecord, SessionStatus
+        from datetime import datetime
+        
+        with self._get_write_connection() as conn:
+            cursor = conn.cursor()
+            
+            cursor.execute("""
+                SELECT id, message_count FROM sessions WHERE session_id = ?
+            """, (session_id,))
+            row = cursor.fetchone()
+            
+            now = datetime.now().isoformat()
+            
+            if row:
+                cursor.execute("""
+                    UPDATE sessions SET
+                        updated_time = ?,
+                        message_count = message_count + 1,
+                        ui_state_snapshot = ?,
+                        context_snapshot = ?,
+                        metadata = ?
+                    WHERE session_id = ?
+                """, (
+                    now,
+                    json.dumps(ui_state_snapshot or {}, ensure_ascii=False),
+                    json.dumps(context_snapshot or {}, ensure_ascii=False),
+                    json.dumps(metadata or {}, ensure_ascii=False),
+                    session_id
+                ))
+            else:
+                cursor.execute("""
+                    INSERT INTO sessions 
+                    (session_id, status, created_time, updated_time, message_count,
+                     ui_state_snapshot, context_snapshot, metadata)
+                    VALUES (?, ?, ?, ?, 1, ?, ?, ?)
+                """, (
+                    session_id,
+                    SessionStatus.ACTIVE.value,
+                    now,
+                    now,
+                    json.dumps(ui_state_snapshot or {}, ensure_ascii=False),
+                    json.dumps(context_snapshot or {}, ensure_ascii=False),
+                    json.dumps(metadata or {}, ensure_ascii=False)
+                ))
+            
+            conn.commit()
+            return True
+    
+    def load_latest_session(self) -> Optional[Dict[str, Any]]:
+        """
+        加载最近活跃的会话
+        
+        Returns:
+            会话数据字典或 None
+        """
+        from models import SessionRecord
+        
+        conn = self._get_read_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute("""
+            SELECT * FROM sessions 
+            WHERE status = 'active'
+            ORDER BY updated_time DESC
+            LIMIT 1
+        """)
+        
+        row = cursor.fetchone()
+        if not row:
+            return None
+        
+        return {
+            "id": row["id"],
+            "session_id": row["session_id"],
+            "status": row["status"],
+            "created_time": row["created_time"],
+            "updated_time": row["updated_time"],
+            "message_count": row["message_count"],
+            "ui_state_snapshot": json.loads(row["ui_state_snapshot"]) if row["ui_state_snapshot"] else {},
+            "context_snapshot": json.loads(row["context_snapshot"]) if row["context_snapshot"] else {},
+            "metadata": json.loads(row["metadata"]) if row["metadata"] else {}
+        }
+    
+    def load_session(self, session_id: str) -> Optional[Dict[str, Any]]:
+        """
+        加载指定会话
+        
+        Args:
+            session_id: 会话ID
+        
+        Returns:
+            会话数据字典或 None
+        """
+        conn = self._get_read_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute("""
+            SELECT * FROM sessions WHERE session_id = ?
+        """, (session_id,))
+        
+        row = cursor.fetchone()
+        if not row:
+            return None
+        
+        return {
+            "id": row["id"],
+            "session_id": row["session_id"],
+            "status": row["status"],
+            "created_time": row["created_time"],
+            "updated_time": row["updated_time"],
+            "message_count": row["message_count"],
+            "ui_state_snapshot": json.loads(row["ui_state_snapshot"]) if row["ui_state_snapshot"] else {},
+            "context_snapshot": json.loads(row["context_snapshot"]) if row["context_snapshot"] else {},
+            "metadata": json.loads(row["metadata"]) if row["metadata"] else {}
+        }
+    
+    def end_session(self, session_id: str) -> bool:
+        """
+        结束会话
+        
+        Args:
+            session_id: 会话ID
+        
+        Returns:
+            是否成功
+        """
+        from models import SessionStatus
+        from datetime import datetime
+        
+        with self._get_write_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                UPDATE sessions SET status = ?, updated_time = ?
+                WHERE session_id = ?
+            """, (SessionStatus.ENDED.value, datetime.now().isoformat(), session_id))
+            conn.commit()
+            return cursor.rowcount > 0
+    
+    def archive_session(self, session_id: str) -> bool:
+        """
+        归档会话
+        
+        Args:
+            session_id: 会话ID
+        
+        Returns:
+            是否成功
+        """
+        from models import SessionStatus
+        from datetime import datetime
+        
+        with self._get_write_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                UPDATE sessions SET status = ?, updated_time = ?
+                WHERE session_id = ?
+            """, (SessionStatus.ARCHIVED.value, datetime.now().isoformat(), session_id))
+            conn.commit()
+            return cursor.rowcount > 0
+    
+    def get_active_sessions(self, limit: int = 10) -> List[Dict[str, Any]]:
+        """
+        获取活跃会话列表
+        
+        Args:
+            limit: 返回数量
+        
+        Returns:
+            会话列表
+        """
+        conn = self._get_read_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute("""
+            SELECT id, session_id, status, created_time, updated_time, message_count
+            FROM sessions 
+            WHERE status = 'active'
+            ORDER BY updated_time DESC
+            LIMIT ?
+        """, (limit,))
+        
+        results = []
+        for row in cursor.fetchall():
+            results.append({
+                "id": row["id"],
+                "session_id": row["session_id"],
+                "status": row["status"],
+                "created_time": row["created_time"],
+                "updated_time": row["updated_time"],
+                "message_count": row["message_count"]
+            })
+        
+        return results
+    
+    def cleanup_old_sessions(self, max_age_days: int = 30) -> int:
+        """
+        清理过期会话
+        
+        Args:
+            max_age_days: 最大保留天数
+        
+        Returns:
+            删除的会话数量
+        """
+        from datetime import datetime, timedelta
+        
+        cutoff_time = (datetime.now() - timedelta(days=max_age_days)).isoformat()
+        
+        with self._get_write_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                DELETE FROM sessions 
+                WHERE status = 'ended' AND updated_time < ?
+            """, (cutoff_time,))
+            deleted = cursor.rowcount
+            conn.commit()
+            return deleted
+    
+    def get_session_messages(self, session_id: str, limit: int = 100) -> List[Dict[str, Any]]:
+        """
+        获取会话消息列表
+        
+        Args:
+            session_id: 会话ID
+            limit: 返回数量
+        
+        Returns:
+            消息列表
+        """
+        conn = self._get_read_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute("""
+            SELECT * FROM conversations 
+            WHERE session_id = ?
+            ORDER BY timestamp ASC
+            LIMIT ?
+        """, (session_id, limit))
+        
+        results = []
+        for row in cursor.fetchall():
+            results.append({
+                "id": row["id"],
+                "user": row["user_input"],
+                "assistant": row["assistant_response"],
+                "source": row["source"],
+                "timestamp": row["timestamp"],
+                "metadata": json.loads(row["metadata"]) if row["metadata"] else {}
+            })
+        
+        return results
+    
+    def get_memories_by_session(self, session_id: str, limit: int = 100) -> List[MemoryRecord]:
+        """
+        获取会话相关的记忆
+        
+        Args:
+            session_id: 会话ID
+            limit: 返回数量
+        
+        Returns:
+            记忆列表
+        """
+        conn = self._get_read_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute("""
+            SELECT * FROM memories 
+            WHERE session_id = ?
+            ORDER BY created_time DESC
+            LIMIT ?
+        """, (session_id, limit))
+        
+        return [self._row_to_record(row) for row in cursor.fetchall()]
+    
+    def mark_memory_important(self, record_id: int, important: bool = True) -> bool:
+        """
+        标记记忆为重要
+        
+        Args:
+            record_id: 记录ID
+            important: 是否重要
+        
+        Returns:
+            是否成功
+        """
+        with self._get_write_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                UPDATE memories SET is_important = ? WHERE id = ?
+            """, (1 if important else 0, record_id))
+            conn.commit()
+            return cursor.rowcount > 0
+    
+    def get_important_memories(self, limit: int = 50) -> List[MemoryRecord]:
+        """
+        获取重要记忆
+        
+        Args:
+            limit: 返回数量
+        
+        Returns:
+            重要记忆列表
+        """
+        conn = self._get_read_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute("""
+            SELECT * FROM memories 
+            WHERE is_important = 1
+            AND is_archived = 0
+            ORDER BY created_time DESC
+            LIMIT ?
+        """, (limit,))
+        
+        return [self._row_to_record(row) for row in cursor.fetchall()]
+    
+    def search_by_content_hash(self, content_hash: str) -> Optional[MemoryRecord]:
+        """
+        根据内容哈希查找记忆
+        
+        Args:
+            content_hash: 内容哈希
+        
+        Returns:
+            记忆或 None
+        """
+        conn = self._get_read_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute("""
+            SELECT * FROM memories WHERE content_hash = ?
+        """, (content_hash,))
+        
+        row = cursor.fetchone()
+        if row:
+            return self._row_to_record(row)
+        return None
 
 
 # 全局实例
