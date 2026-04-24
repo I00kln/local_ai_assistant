@@ -73,6 +73,10 @@ class AsyncMemoryProcessor:
         self._buffer_first_item_time: Optional[float] = None
         self._idle_count = 0
         
+        self._last_preload_time = 0
+        self._preload_cooldown = 5.0
+        self._pending_preload_ids = set()
+        
         self.sqlite = None
         self._merger = None
         if config.sqlite_enabled:
@@ -593,16 +597,21 @@ class AsyncMemoryProcessor:
     
     def _trigger_preload(self, user_input: str):
         """
-        触发 L3 到 L2 的预加载
+        触发 L3 到 L2 的预加载（带频率限制）
         
         策略：
-        1. 提取当前输入的关键词
-        2. 使用 FTS5 进行轻量级搜索
-        3. 异步提交预加载任务
+        1. 冷却时间检查（5秒）
+        2. 提取当前输入的关键词
+        3. 使用 FTS5 进行轻量级搜索
+        4. 异步提交预加载任务（排除已排队的 ID）
         
         Args:
             user_input: 用户输入
         """
+        current_time = time.time()
+        if current_time - self._last_preload_time < self._preload_cooldown:
+            return
+        
         if not self.sqlite or not user_input:
             return
         
@@ -617,10 +626,13 @@ class AsyncMemoryProcessor:
                 unvectorized_ids = []
                 for record in results:
                     if record.is_vectorized == 0 and record.id:
-                        unvectorized_ids.append(record.id)
+                        if record.id not in self._pending_preload_ids:
+                            unvectorized_ids.append(record.id)
+                            self._pending_preload_ids.add(record.id)
                 
                 if unvectorized_ids:
                     self._schedule_preload_task(unvectorized_ids)
+                    self._last_preload_time = current_time
                     
         except Exception as e:
             self._log.debug("PRELOAD_TRIGGER_FAILED", error=str(e))
@@ -689,9 +701,11 @@ class AsyncMemoryProcessor:
         """
         执行预加载操作
         
+        注意：此方法由调度器调用，调度器已自动获取写锁，无需额外锁保护。
+        
         策略：
         1. 小批量处理（batch_size=2）
-        2. 每批次间释放锁
+        2. 每批次间短暂休眠释放 CPU
         3. 错误隔离，单条失败不影响其他
         
         Args:
@@ -725,15 +739,14 @@ class AsyncMemoryProcessor:
                     metadata["original_id"] = record_id
                     
                     vector_id = f"preload_{record_id}_{int(time.time())}"
+                    
                     self.vector_store.add(
                         texts=[text],
                         metadatas=[metadata],
                         ids=[vector_id]
                     )
-                    
                     self.sqlite.update_vector_status(record_id, vector_id, 1)
                     success_count += 1
-                    
                     self._log.debug("PRELOAD_SUCCESS", record_id=record_id)
                     
                 except Exception as e:

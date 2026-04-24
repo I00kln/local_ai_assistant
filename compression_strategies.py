@@ -320,8 +320,17 @@ class RuleBasedCompressionStrategy(CompressionStrategy):
         self._mem_config = mem_config
     
     def compress(self, text: str) -> Optional[str]:
-        sentences = re.split(r'[。！？\n]', text)
-        sentences = [s.strip() for s in sentences if s.strip()]
+        parts = re.split(r'([。！？\n])', text)
+        
+        sentences = []
+        for i in range(0, len(parts) - 1, 2):
+            sentence = parts[i].strip()
+            punctuation = parts[i + 1] if i + 1 < len(parts) else ''
+            if sentence:
+                sentences.append(sentence + punctuation)
+        
+        if len(parts) % 2 == 1 and parts[-1].strip():
+            sentences.append(parts[-1].strip())
         
         key_sentences = []
         key_patterns = self._mem_config.compression.key_patterns.split('|')
@@ -337,7 +346,7 @@ class RuleBasedCompressionStrategy(CompressionStrategy):
         max_segment = self._mem_config.compression.max_segment_length
         
         if key_sentences:
-            compressed = '。'.join(key_sentences[:self.MAX_KEY_SENTENCES])
+            compressed = ''.join(key_sentences[:self.MAX_KEY_SENTENCES])
             if len(compressed) < len(text) * target_ratio:
                 return compressed
         

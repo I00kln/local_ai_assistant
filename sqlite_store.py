@@ -17,11 +17,12 @@ from models import MemoryRecord
 
 def escape_fts5_query(query: str) -> str:
     """
-    转义 FTS5 查询字符串
+    转义 FTS5 查询字符串（增强版）
     
     FTS5 对某些字符有特殊含义，需要进行转义：
     - 双引号需要转义
     - 特殊字符需要用双引号包裹整个查询
+    - 纯符号输入返回空查询
     
     Args:
         query: 原始查询字符串
@@ -32,7 +33,13 @@ def escape_fts5_query(query: str) -> str:
     if not query:
         return '""'
     
+    if re.match(r'^[\s\W]+$', query):
+        return '""'
+    
     escaped = query.replace('"', '""')
+    
+    if len(escaped) > 500:
+        escaped = escaped[:500]
     
     return f'"{escaped}"'
 
@@ -2020,6 +2027,33 @@ class SQLiteStore:
             except Exception:
                 pass
             self._local.read_conn = None
+    
+    def close_thread_connection(self):
+        """
+        关闭当前线程的数据库连接（线程池安全）
+        
+        用于线程池环境下显式释放连接，防止连接泄露。
+        在 FastAPI/Gunicorn/ThreadPoolExecutor 中应在请求结束时调用。
+        
+        使用场景：
+        - API 请求结束时（中间件或 finally 块）
+        - 后台任务完成时
+        - 线程归还线程池前
+        """
+        if hasattr(self._local, 'read_conn') and self._local.read_conn is not None:
+            try:
+                self._local.read_conn.close()
+            except Exception:
+                pass
+            finally:
+                self._local.read_conn = None
+        
+        if hasattr(self._local, 'last_use_time'):
+            self._local.last_use_time = 0
+        
+        thread_id = threading.get_ident()
+        if thread_id in self._last_connection_check:
+            del self._last_connection_check[thread_id]
     
     def enqueue_pending(self, data: Dict[str, Any]) -> int:
         """

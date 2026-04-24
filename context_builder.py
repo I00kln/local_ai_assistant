@@ -297,6 +297,10 @@ class ContextBuilder:
                 content_hash = hashlib.md5(user_text.encode('utf-8')).hexdigest()[:16]
                 self._l1_content_hashes.add(content_hash)
             
+            if assistant_text:
+                content_hash = hashlib.md5(assistant_text.encode('utf-8')).hexdigest()[:16]
+                self._l1_content_hashes.add(content_hash)
+            
             conv_id = conv.get("id") or conv.get("conversation_id")
             if conv_id:
                 self._recent_conversation_ids.add(str(conv_id))
@@ -311,8 +315,9 @@ class ContextBuilder:
         
         策略：
         1. ID 级硬去重：排除已存在于 L1 的记录
-        2. 内容哈希去重：排除内容相同的记录
-        3. 时间窗口过滤：排除最近 10 分钟内的记录
+        2. 内容哈希去重：排除内容与 L1 对话相同的记录
+        
+        注意：时间窗口过滤在 _time_window_filter 中单独处理
         
         Args:
             results: 检索结果列表
@@ -350,20 +355,44 @@ class ContextBuilder:
         window_minutes: int = 10
     ) -> List[Dict]:
         """
-        时间窗口过滤：排除最近 N 分钟内的检索结果
+        时间窗口过滤：仅排除与 L1 对话时间重叠的检索结果
+        
+        注意：此方法已重构，不再简单排除所有最近的记忆。
+        时间窗口过滤仅用于避免重复显示 L1 中已有对话时间段的内容。
+        
+        策略：
+        1. 获取 L1 对话的时间范围
+        2. 仅排除时间戳在 L1 时间范围内的检索结果
+        3. 保留所有其他结果（包括最近的记忆）
         
         Args:
             results: 检索结果列表
             conversation_history: L1 对话历史
-            window_minutes: 时间窗口（分钟）
+            window_minutes: 时间窗口（分钟），用于扩展 L1 时间范围
         
         Returns:
             过滤后的结果列表
         """
-        if not results or not conversation_history:
+        if not results:
             return results
         
-        cutoff_time = datetime.now() - timedelta(minutes=window_minutes)
+        if not conversation_history:
+            return results
+        
+        l1_time_ranges = []
+        for conv in conversation_history[-10:]:
+            timestamp_str = conv.get("timestamp")
+            if timestamp_str:
+                try:
+                    conv_time = datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
+                    time_start = conv_time.replace(tzinfo=None) - timedelta(minutes=2)
+                    time_end = conv_time.replace(tzinfo=None) + timedelta(minutes=2)
+                    l1_time_ranges.append((time_start, time_end))
+                except (ValueError, TypeError):
+                    pass
+        
+        if not l1_time_ranges:
+            return results
         
         filtered = []
         for item in results:
@@ -371,7 +400,15 @@ class ContextBuilder:
             if timestamp_str:
                 try:
                     item_time = datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
-                    if item_time.replace(tzinfo=None) > cutoff_time:
+                    item_time_naive = item_time.replace(tzinfo=None)
+                    
+                    in_l1_range = False
+                    for time_start, time_end in l1_time_ranges:
+                        if time_start <= item_time_naive <= time_end:
+                            in_l1_range = True
+                            break
+                    
+                    if in_l1_range:
                         continue
                 except (ValueError, TypeError):
                     pass
@@ -915,12 +952,12 @@ class ContextBuilder:
         max_tokens: int
     ) -> str:
         """
-        按优先级填充 Token 预算
+        按优先级填充 Token 预算（带硬性底线保护）
         
         分配策略：
         - Bucket B (Recent L1): 30% 预算
         - Bucket C (Important): 20% 预算（上限）
-        - Bucket D (Retrieved): 50% 预算
+        - Bucket D (Retrieved): 50% 预算（硬性底线：至少 20% 或 200 tokens）
         
         Args:
             buckets: 优先级分桶
@@ -929,9 +966,22 @@ class ContextBuilder:
         Returns:
             格式化的记忆上下文
         """
+        MIN_BUCKET_D_RATIO = 0.2
+        MIN_BUCKET_D_TOKENS = 200
+        
         bucket_b_budget = int(max_tokens * 0.3)
         bucket_c_budget = int(max_tokens * 0.2)
-        bucket_d_budget = max_tokens - bucket_b_budget - bucket_c_budget
+        
+        bucket_d_budget = max(
+            max_tokens - bucket_b_budget - bucket_c_budget,
+            int(max_tokens * MIN_BUCKET_D_RATIO),
+            MIN_BUCKET_D_TOKENS
+        )
+        
+        if bucket_d_budget > max_tokens - bucket_b_budget - bucket_c_budget:
+            shortage = bucket_d_budget - (max_tokens - bucket_b_budget - bucket_c_budget)
+            bucket_b_budget = max(int(bucket_b_budget - shortage * 0.6), 0)
+            bucket_c_budget = max(int(bucket_c_budget - shortage * 0.4), 0)
         
         result_parts = []
         

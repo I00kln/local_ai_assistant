@@ -328,9 +328,11 @@ class ChatWindow:
         
         策略：
         1. 从 SQLite 加载最后一次活跃会话
-        2. 恢复对话历史到内存
+        2. 恢复对话历史到内存（含去重标识）
         3. 恢复 UI 状态
         """
+        import hashlib
+        
         if not self.memory or not self.memory.sqlite:
             return
         
@@ -353,10 +355,16 @@ class ChatWindow:
                 assistant_text = msg.get("assistant", "")
                 
                 if user_text:
+                    content_hash = hashlib.md5(user_text.encode('utf-8')).hexdigest()[:16]
+                    record_id = msg.get("id") or f"restored_{content_hash}"
+                    
                     self.conversation_history.append({
                         "user": user_text,
                         "assistant": assistant_text,
-                        "timestamp": msg.get("timestamp", "")
+                        "timestamp": msg.get("timestamp", ""),
+                        "id": record_id,
+                        "content_hash": content_hash,
+                        "source": msg.get("source", "local")
                     })
                     
                     self._append_message("user", user_text)
@@ -379,12 +387,31 @@ class ChatWindow:
                 "system", f"已恢复上次会话 ({c} 条对话)"
             ))
             
+            self._safe_after(3000, self._delayed_preload_check)
+            
             self._log.info("SESSION_RESTORED", 
                           session_id=self.session_id,
                           message_count=restored_count)
             
         except Exception as e:
             self._log.warning("SESSION_RESTORE_FAILED", error=str(e))
+    
+    def _delayed_preload_check(self):
+        """
+        延迟预加载检查（冷启动优化）
+        
+        策略：
+        1. 延迟 3 秒后执行，避免冷启动时的锁竞争
+        2. 检查最近对话是否有相关深层记忆
+        3. 仅在系统初始化完成且未关闭时执行
+        """
+        if not self._initialized or self._closing:
+            return
+        
+        if self.conversation_history:
+            last_user_input = self.conversation_history[-1].get("user", "")
+            if last_user_input and self.async_processor:
+                self.async_processor._trigger_preload(last_user_input)
     
     def _save_session(self):
         """

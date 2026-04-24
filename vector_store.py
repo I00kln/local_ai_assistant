@@ -276,6 +276,8 @@ class VectorStore:
         text_hash = hashlib.sha256(text.encode('utf-8')).hexdigest()
         return f"mem_{text_hash[:16]}"
     
+    BATCH_SIZE = 500
+    
     def add(
         self, 
         texts: List[str], 
@@ -285,7 +287,7 @@ class VectorStore:
         upsert: bool = True
     ) -> List[str]:
         """
-        添加文档到向量库
+        添加文档到向量库（带分块处理）
         
         Args:
             texts: 文本列表
@@ -301,6 +303,10 @@ class VectorStore:
         - 使用确定性 ID：mem_{text_hash[:16]}
         - upsert=True 时，相同 ID 的文档会被更新而非重复添加
         - 崩溃恢复后重新写入不会产生重复向量
+        
+        分块策略：
+        - 每批最多 500 条记录，防止 Payload 过大
+        - 分块写入，单块失败不影响其他块
         
         降级策略：
         - 磁盘满时，降级到 SQLite 存储
@@ -324,71 +330,78 @@ class VectorStore:
         
         serialized_metadatas = [_serialize_metadata(meta) for meta in metadatas]
         
-        try:
-            embeddings = self.embedding_function(texts)
+        all_ids = []
+        total_count = len(texts)
+        
+        for batch_start in range(0, total_count, self.BATCH_SIZE):
+            batch_end = min(batch_start + self.BATCH_SIZE, total_count)
+            batch_texts = texts[batch_start:batch_end]
+            batch_ids = ids[batch_start:batch_end]
+            batch_metadatas = serialized_metadatas[batch_start:batch_end]
             
-            with self.lock:
-                if upsert:
-                    self.collection.upsert(
-                        documents=texts,
-                        embeddings=embeddings,
-                        metadatas=serialized_metadatas,
-                        ids=ids
-                    )
+            try:
+                embeddings = self.embedding_function(batch_texts)
+                
+                with self.lock:
+                    if upsert:
+                        self.collection.upsert(
+                            documents=batch_texts,
+                            embeddings=embeddings,
+                            metadatas=batch_metadatas,
+                            ids=batch_ids
+                        )
+                    else:
+                        self.collection.add(
+                            documents=batch_texts,
+                            embeddings=embeddings,
+                            metadatas=batch_metadatas,
+                            ids=batch_ids
+                        )
+                
+                all_ids.extend(batch_ids)
+                
+            except OSError as e:
+                error_msg = str(e).lower()
+                if "no space left" in error_msg or "disk full" in error_msg or "enospc" in error_msg:
+                    print(f"[严重] ChromaDB 磁盘满，降级到 SQLite 存储")
+                    
+                    if sqlite_store:
+                        try:
+                            for text, meta in zip(batch_texts, metadatas[batch_start:batch_end] or []):
+                                record = MemoryRecord(
+                                    text=text,
+                                    metadata=meta,
+                                    is_vectorized=-1
+                                )
+                                sqlite_store.add(record)
+                            print(f"[降级] {len(batch_texts)} 条记忆已存入 SQLite（待后续升级）")
+                        except Exception as sqlite_error:
+                            print(f"[错误] SQLite 降级存储失败: {sqlite_error}")
+                    else:
+                        print(f"[错误] 无 SQLite 存储，记忆丢失")
                 else:
-                    self.collection.add(
-                        documents=texts,
-                        embeddings=embeddings,
-                        metadatas=serialized_metadatas,
-                        ids=ids
-                    )
-                
-                print(f"添加 {len(texts)} 条记忆到向量库，当前总数: {self.collection.count()}")
-                
-                return ids
-                
-        except OSError as e:
-            error_msg = str(e).lower()
-            if "no space left" in error_msg or "disk full" in error_msg or "enospc" in error_msg:
-                print(f"[严重] ChromaDB 磁盘满，降级到 SQLite 存储")
+                    raise
+                    
+            except Exception as e:
+                print(f"[错误] ChromaDB 写入批次 {batch_start}-{batch_end} 失败: {e}")
                 
                 if sqlite_store:
                     try:
-                        for text, meta in zip(texts, metadatas or []):
+                        for text, meta in zip(batch_texts, metadatas[batch_start:batch_end] or []):
                             record = MemoryRecord(
                                 text=text,
                                 metadata=meta,
-                                is_vectorized=-1
+                                is_vectorized=0
                             )
                             sqlite_store.add(record)
-                        print(f"[降级] {len(texts)} 条记忆已存入 SQLite（待后续升级）")
-                        return []
-                    except Exception as sqlite_error:
-                        print(f"[错误] SQLite 降级存储失败: {sqlite_error}")
-                        return []
-                else:
-                    print(f"[错误] 无 SQLite 存储，记忆丢失")
-                    return []
-            raise
-            
-        except Exception as e:
-            print(f"[错误] ChromaDB 写入失败: {e}")
-            
-            if sqlite_store:
-                try:
-                    for text, meta in zip(texts, metadatas or []):
-                        record = MemoryRecord(
-                            text=text,
-                            metadata=meta,
-                            is_vectorized=0
-                        )
-                        sqlite_store.add(record)
-                    print(f"[降级] {len(texts)} 条记忆已存入 SQLite（待重试）")
-                    return []
-                except Exception:
-                    pass
-            
-            return []
+                        print(f"[降级] {len(batch_texts)} 条记忆已存入 SQLite（待重试）")
+                    except Exception:
+                        pass
+        
+        if all_ids:
+            print(f"添加 {len(all_ids)} 条记忆到向量库，当前总数: {self.collection.count()}")
+        
+        return all_ids
     
     def search(
         self, 

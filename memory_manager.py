@@ -125,7 +125,7 @@ class MemoryManager:
         - 使用调度器读锁等待迁移操作完成后再执行检索
         - 使用版本号检测并发修改
         - 检测到修改时自动重试（最多2次）
-        - 迁移超时时记录警告但继续执行
+        - 迁移超时时：若 include_l1=True 则降级为 L1 搜索，否则返回空列表
         
         Args:
             query: 搜索查询
@@ -141,6 +141,12 @@ class MemoryManager:
         
         start_time = time.perf_counter()
         
+        if top_k is None:
+            top_k = config.max_retrieve_results
+        
+        if threshold is None:
+            threshold = 0.0
+        
         scheduler = get_background_scheduler()
         
         lock_context = scheduler.read_lock(timeout=5.0)
@@ -151,9 +157,13 @@ class MemoryManager:
             else:
                 self._log.warning(
                     "SEARCH_LOCK_FALLBACK",
-                    message="读锁获取超时，降级为无锁搜索"
+                    message="读锁获取超时",
+                    include_l1=include_l1
                 )
-                results = self._do_search_with_retry(query, top_k, include_l3, threshold, include_l1)
+                if include_l1:
+                    results = self._search_l1_fallback(query, top_k, threshold)
+                else:
+                    results = []
         
         duration_ms = (time.perf_counter() - start_time) * 1000
         metrics = get_metrics_collector()
@@ -163,6 +173,53 @@ class MemoryManager:
             self.stats.get("l2_hits", 0),
             self.stats.get("l3_hits", 0)
         )
+        
+        return results
+    
+    def _search_l1_fallback(self, query: str, top_k: int, threshold: float = 0.0) -> List[MemorySearchResult]:
+        """
+        L1 安全降级搜索
+        
+        当读锁超时时，仅搜索 L1 内存层，避免读取不一致的向量库数据。
+        
+        Args:
+            query: 搜索查询
+            top_k: 返回结果数量
+            threshold: 相似度阈值
+        
+        Returns:
+            L1 搜索结果列表
+        """
+        results = []
+        query_lower = query.lower()
+        query_keywords = set(query_lower.split())
+        
+        for conv in reversed(self.conversation_history[-50:]):
+            user_text = conv.get("user", "").lower()
+            assistant_text = conv.get("assistant", "").lower()
+            
+            combined_text = f"{user_text} {assistant_text}"
+            
+            matched_keywords = sum(1 for kw in query_keywords if kw in combined_text)
+            if matched_keywords > 0:
+                similarity = matched_keywords / len(query_keywords) if query_keywords else 0
+                
+                if similarity >= threshold:
+                    results.append(MemorySearchResult(
+                        text=conv.get("user", ""),
+                        similarity=similarity,
+                        source="L1_fallback",
+                        metadata={
+                            "fallback": True,
+                            "assistant": conv.get("assistant", ""),
+                            "timestamp": conv.get("timestamp", "")
+                        }
+                    ))
+                    
+                    if len(results) >= top_k:
+                        break
+        
+        self.stats["l1_hits"] += len(results)
         
         return results
     
