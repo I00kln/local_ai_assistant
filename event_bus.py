@@ -1,7 +1,8 @@
 import threading
 import queue
 import weakref
-from typing import Dict, List, Callable, Any, Optional
+import time
+from typing import Dict, List, Callable, Any, Optional, Set
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
@@ -18,6 +19,8 @@ class EventType(Enum):
     ORPHAN_CLEANUP_PROGRESS = "orphan_cleanup_progress"
     ORPHAN_CLEANUP_COMPLETE = "orphan_cleanup_complete"
     SHUTDOWN = "shutdown"
+    HEARTBEAT = "heartbeat"
+    CRITICAL_SERVICE_DOWN = "critical_service_down"
 
 
 @dataclass
@@ -37,6 +40,8 @@ class SubscriberInfo:
     subscribed_at: datetime
     call_count: int = 0
     error_count: int = 0
+    is_weak_ref: bool = True
+    handler_name: str = ""
 
 
 EventHandler = Callable[[Event], None]
@@ -59,10 +64,13 @@ class EventBus:
     - 使用弱引用存储订阅者
     - 自动清理已销毁的订阅者
     - 订阅者生命周期追踪
+    - 定期清理死订阅者
     """
     
     _instance: Optional['EventBus'] = None
     _lock = threading.Lock()
+    
+    CLEANUP_INTERVAL_SECONDS = 60.0
     
     def __new__(cls):
         if cls._instance is None:
@@ -83,6 +91,9 @@ class EventBus:
         self._event_queue: queue.Queue = queue.Queue(maxsize=1000)
         self._queue_dropped_count = 0
         self._running = True
+        self._strong_refs: Set[int] = set()
+        self._last_cleanup_time = time.time()
+        
         self._worker_thread = threading.Thread(
             target=self._process_loop,
             daemon=True,
@@ -117,33 +128,64 @@ class EventBus:
                     continue
                 self.publish(event.event_type, event.data, event.source)
                 self._event_queue.task_done()
+                
+                self._maybe_cleanup()
+                
             except queue.Empty:
+                self._maybe_cleanup()
                 continue
             except Exception as e:
                 self._log.error("EVENT_PROCESS_ERROR", error=str(e))
     
-    def _create_handler_ref(self, handler: EventHandler) -> Any:
+    def _maybe_cleanup(self):
+        """定期清理死订阅者"""
+        now = time.time()
+        if now - self._last_cleanup_time >= self.CLEANUP_INTERVAL_SECONDS:
+            self._cleanup_all_dead_subscribers()
+            self._last_cleanup_time = now
+    
+    def _cleanup_all_dead_subscribers(self):
+        """清理所有事件类型的死订阅者"""
+        with self._subscribers_lock:
+            for event_type in list(self._subscribers.keys()):
+                self._cleanup_dead_subscribers(event_type)
+    
+    def _create_handler_ref(self, handler: EventHandler) -> tuple:
         """
         创建处理器引用
         
         优先使用弱引用，如果处理器不支持则使用强引用
+        
+        Returns:
+            (ref, is_weak_ref)
         """
+        handler_name = getattr(handler, '__name__', str(handler))
+        
         try:
             if hasattr(handler, '__self__'):
-                return weakref.WeakMethod(handler)
+                return weakref.WeakMethod(handler), True, handler_name
             else:
-                return weakref.ref(handler)
+                ref = weakref.ref(handler)
+                return ref, True, handler_name
         except TypeError:
-            return handler
+            handler_id = id(handler)
+            self._strong_refs.add(handler_id)
+            self._log.warning(
+                "EVENT_HANDLER_STRONG_REF",
+                handler=handler_name,
+                note="处理器不支持弱引用，使用强引用可能导致内存延迟释放"
+            )
+            return handler, False, handler_name
     
-    def _get_handler(self, ref: Any) -> Optional[EventHandler]:
+    def _get_handler(self, ref: Any, is_weak_ref: bool) -> Optional[EventHandler]:
         """从引用中获取处理器"""
-        if isinstance(ref, weakref.ref):
-            handler = ref()
-            return handler if handler is not None else None
-        elif callable(ref):
-            return ref
-        return None
+        if is_weak_ref:
+            if isinstance(ref, weakref.ref):
+                handler = ref()
+                return handler if handler is not None else None
+            return None
+        else:
+            return ref if callable(ref) else None
     
     def subscribe(self, event_type: EventType, handler: EventHandler, source: str = "unknown"):
         """
@@ -158,24 +200,27 @@ class EventBus:
             if event_type not in self._subscribers:
                 self._subscribers[event_type] = []
             
-            handler_ref = self._create_handler_ref(handler)
+            handler_ref, is_weak_ref, handler_name = self._create_handler_ref(handler)
             
             for info in self._subscribers[event_type]:
-                existing = self._get_handler(info.handler_ref)
+                existing = self._get_handler(info.handler_ref, info.is_weak_ref)
                 if existing == handler:
                     return
             
             info = SubscriberInfo(
                 handler_ref=handler_ref,
                 source=source,
-                subscribed_at=datetime.now()
+                subscribed_at=datetime.now(),
+                is_weak_ref=is_weak_ref,
+                handler_name=handler_name
             )
             self._subscribers[event_type].append(info)
             
             self._log.debug("EVENT_SUBSCRIBED", 
                            event_type=event_type.value, 
-                           handler=getattr(handler, '__name__', str(handler)),
-                           source=source)
+                           handler=handler_name,
+                           source=source,
+                           is_weak_ref=is_weak_ref)
     
     def unsubscribe(self, event_type: EventType, handler: EventHandler):
         """
@@ -189,7 +234,7 @@ class EventBus:
             if event_type in self._subscribers:
                 to_remove = []
                 for i, info in enumerate(self._subscribers[event_type]):
-                    existing = self._get_handler(info.handler_ref)
+                    existing = self._get_handler(info.handler_ref, info.is_weak_ref)
                     if existing is None or existing == handler:
                         to_remove.append(i)
                 
@@ -203,7 +248,7 @@ class EventBus:
         
         to_remove = []
         for i, info in enumerate(self._subscribers[event_type]):
-            handler = self._get_handler(info.handler_ref)
+            handler = self._get_handler(info.handler_ref, info.is_weak_ref)
             if handler is None:
                 to_remove.append(i)
         
@@ -211,7 +256,8 @@ class EventBus:
             removed = self._subscribers[event_type].pop(i)
             self._log.debug("SUBSCRIBER_CLEANED_UP",
                            event_type=event_type.value,
-                           source=removed.source)
+                           source=removed.source,
+                           handler=removed.handler_name)
     
     def publish(self, event_type: EventType, data: Dict[str, Any], source: str = "unknown"):
         """
@@ -234,7 +280,7 @@ class EventBus:
             self._cleanup_dead_subscribers(event_type)
             
             for info in self._subscribers.get(event_type, []):
-                handler = self._get_handler(info.handler_ref)
+                handler = self._get_handler(info.handler_ref, info.is_weak_ref)
                 if handler:
                     handlers.append((handler, info))
         
@@ -246,7 +292,7 @@ class EventBus:
                 info.error_count += 1
                 self._log.error("EVENT_HANDLER_ERROR",
                                event_type=event_type.value,
-                               handler=getattr(handler, '__name__', str(handler)),
+                               handler=info.handler_name,
                                source=info.source,
                                error=str(e))
         

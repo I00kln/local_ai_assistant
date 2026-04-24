@@ -36,6 +36,8 @@ class ServiceInfo:
     timeout: float = 5.0
     is_running: Callable[[], bool] = None
     stop_fn: Callable = None
+    force_stop_fn: Callable = None
+    thread: threading.Thread = None
 
 
 class LifecycleManager:
@@ -79,7 +81,9 @@ class LifecycleManager:
         priority: ServicePriority = ServicePriority.NORMAL,
         timeout: float = 5.0,
         is_running: Callable[[], bool] = None,
-        stop_fn: Callable = None
+        stop_fn: Callable = None,
+        force_stop_fn: Callable = None,
+        thread: threading.Thread = None
     ):
         """
         注册服务清理函数
@@ -91,6 +95,8 @@ class LifecycleManager:
             timeout: 清理超时时间（秒）
             is_running: 检查服务是否在运行的函数
             stop_fn: 停止服务的函数（在 cleanup_fn 之前调用）
+            force_stop_fn: 强制停止服务的函数（超时后调用）
+            thread: 服务的主线程引用（用于强制中断）
         """
         self._services[name] = ServiceInfo(
             name=name,
@@ -98,7 +104,9 @@ class LifecycleManager:
             priority=priority,
             timeout=timeout,
             is_running=is_running,
-            stop_fn=stop_fn
+            stop_fn=stop_fn,
+            force_stop_fn=force_stop_fn,
+            thread=thread
         )
         self._log.debug("SERVICE_REGISTERED", name=name, priority=priority.value)
     
@@ -184,6 +192,28 @@ class LifecycleManager:
             
             if service.is_running():
                 self._log.warning("SERVICE_STOP_TIMEOUT", name=service.name, timeout=timeout)
+                
+                if service.force_stop_fn:
+                    try:
+                        self._log.info("SERVICE_FORCE_STOP", name=service.name)
+                        service.force_stop_fn()
+                        
+                        force_deadline = time.time() + 2.0
+                        while time.time() < force_deadline and service.is_running():
+                            time.sleep(0.1)
+                        
+                        if service.is_running():
+                            self._log.error(
+                                "SERVICE_FORCE_STOP_FAILED",
+                                name=service.name,
+                                note="服务无法被强制停止，可能需要手动干预"
+                            )
+                    except Exception as e:
+                        self._log.error(
+                            "SERVICE_FORCE_STOP_ERROR",
+                            name=service.name,
+                            error=str(e)
+                        )
         
         if service.cleanup_fn:
             try:

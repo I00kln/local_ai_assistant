@@ -3,7 +3,6 @@
 
 from typing import Tuple
 from collections import OrderedDict
-import hashlib
 import threading
 
 _tiktoken_available = False
@@ -22,6 +21,12 @@ _TOKEN_CACHE_MAX_SIZE = 500
 _token_cache: OrderedDict = OrderedDict()
 _token_cache_lock = threading.Lock()
 
+_LENGTH_CACHE_MAX_SIZE = 100
+_length_cache: OrderedDict = OrderedDict()
+_length_cache_lock = threading.Lock()
+
+SHORT_TEXT_THRESHOLD = 100
+
 try:
     import tiktoken
     _tiktoken_available = True
@@ -31,8 +36,51 @@ except ImportError:
 
 
 def _get_cache_key(text: str) -> str:
-    """生成缓存键（使用 SHA256 降低碰撞风险）"""
-    return hashlib.sha256(text.encode('utf-8')).hexdigest()
+    """
+    生成缓存键（优化版）
+    
+    策略：
+    - 短文本（< 100 字符）：直接使用文本作为键
+    - 长文本：使用长度 + 前缀 + 后缀的组合
+    
+    避免对长文本进行 SHA256 计算
+    """
+    if len(text) < SHORT_TEXT_THRESHOLD:
+        return text
+    
+    return f"{len(text)}:{text[:32]}:{text[-32:]}"
+
+
+def _get_length_bucket(length: int) -> int:
+    """获取长度桶（用于二级缓存）"""
+    return (length // 100) * 100
+
+
+def _length_cache_get(length: int) -> Tuple[bool, float]:
+    """
+    从长度缓存获取平均 token/char 比率
+    
+    Returns:
+        (是否命中, 比率)
+    """
+    bucket = _get_length_bucket(length)
+    with _length_cache_lock:
+        if bucket in _length_cache:
+            _length_cache.move_to_end(bucket)
+            return True, _length_cache[bucket]
+    return False, 0.0
+
+
+def _length_cache_set(length: int, ratio: float):
+    """设置长度缓存"""
+    bucket = _get_length_bucket(length)
+    with _length_cache_lock:
+        if bucket in _length_cache:
+            _length_cache.move_to_end(bucket)
+        else:
+            if len(_length_cache) >= _LENGTH_CACHE_MAX_SIZE:
+                _length_cache.popitem(last=False)
+            _length_cache[bucket] = ratio
 
 
 def _cache_get(text: str) -> Tuple[bool, int]:
@@ -60,21 +108,31 @@ def _cache_set(text: str, tokens: int):
             if len(_token_cache) >= _TOKEN_CACHE_MAX_SIZE:
                 _token_cache.popitem(last=False)
             _token_cache[key] = tokens
+    
+    ratio = tokens / max(len(text), 1)
+    _length_cache_set(len(text), ratio)
 
 
 def clear_token_cache():
     """清空 token 缓存"""
     with _token_cache_lock:
         _token_cache.clear()
+    with _length_cache_lock:
+        _length_cache.clear()
 
 
 def get_token_cache_stats() -> dict:
     """获取缓存统计"""
     with _token_cache_lock:
-        return {
-            "size": len(_token_cache),
-            "max_size": _TOKEN_CACHE_MAX_SIZE
-        }
+        token_cache_size = len(_token_cache)
+    with _length_cache_lock:
+        length_cache_size = len(_length_cache)
+    return {
+        "token_cache_size": token_cache_size,
+        "token_cache_max_size": _TOKEN_CACHE_MAX_SIZE,
+        "length_cache_size": length_cache_size,
+        "length_cache_max_size": _LENGTH_CACHE_MAX_SIZE
+    }
 
 
 def estimate_tokens(text: str, use_tiktoken: bool = True, use_cache: bool = True) -> int:
@@ -224,6 +282,9 @@ def _estimate_tokens_fallback(text: str) -> int:
     - 英文：0.3 tokens/字符（适配现代BPE分词器）
     - 其他字符：0.5 tokens/字符（保守估计）
     
+    优化：
+    - 使用二级缓存（长度桶）加速相似长度文本的估算
+    
     Args:
         text: 输入文本
     
@@ -232,6 +293,11 @@ def _estimate_tokens_fallback(text: str) -> int:
     """
     if not text:
         return 0
+    
+    text_len = len(text)
+    hit, ratio = _length_cache_get(text_len)
+    if hit and ratio > 0:
+        return int(text_len * ratio)
     
     chinese_chars = 0
     ascii_chars = 0
@@ -245,7 +311,12 @@ def _estimate_tokens_fallback(text: str) -> int:
         else:
             other_chars += 1
     
-    return int(chinese_chars * 1.2 + ascii_chars * 0.3 + other_chars * 0.5)
+    tokens = int(chinese_chars * 1.2 + ascii_chars * 0.3 + other_chars * 0.5)
+    
+    ratio = tokens / max(text_len, 1)
+    _length_cache_set(text_len, ratio)
+    
+    return tokens
 
 
 def is_tiktoken_available() -> bool:

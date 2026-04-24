@@ -219,16 +219,16 @@ class DecayConfig:
 @dataclass
 class RetrievalConfig:
     """检索配置"""
-    max_retrieve_results: int = 5
+    max_retrieve_results: int = 10
     similarity_threshold: float = 0.90
     l1_min_results: int = 2
     l2_lower_threshold: float = 0.80
-    cloud_l1_threshold: float = 0.70
-    cloud_l2_threshold: float = 0.75
-    cloud_l3_threshold: float = 0.70
-    local_l1_threshold: float = 0.75
-    local_l2_threshold: float = 0.80
-    local_l3_threshold: float = 0.75
+    cloud_l1_threshold: float = 0.35
+    cloud_l2_threshold: float = 0.30
+    cloud_l3_threshold: float = 0.35
+    local_l1_threshold: float = 0.30
+    local_l2_threshold: float = 0.30
+    local_l3_threshold: float = 0.35
     source_weight_l1: float = 1.2
     source_weight_l2: float = 1.0
     source_weight_l3: float = 0.8
@@ -525,12 +525,12 @@ class Config:
         self.retrieval.similarity_threshold = _safe_float(os.environ.get("SIMILARITY_THRESHOLD", "0.90"), 0.90, "SIMILARITY_THRESHOLD")
         self.retrieval.l1_min_results = _safe_int(os.environ.get("L1_MIN_RESULTS", "2"), 2, "L1_MIN_RESULTS")
         self.retrieval.l2_lower_threshold = _safe_float(os.environ.get("L2_LOWER_THRESHOLD", "0.80"), 0.80, "L2_LOWER_THRESHOLD")
-        self.retrieval.cloud_l1_threshold = _safe_float(os.environ.get("CLOUD_L1_THRESHOLD", "0.70"), 0.70, "CLOUD_L1_THRESHOLD")
-        self.retrieval.cloud_l2_threshold = _safe_float(os.environ.get("CLOUD_L2_THRESHOLD", "0.75"), 0.75, "CLOUD_L2_THRESHOLD")
-        self.retrieval.cloud_l3_threshold = _safe_float(os.environ.get("CLOUD_L3_THRESHOLD", "0.70"), 0.70, "CLOUD_L3_THRESHOLD")
-        self.retrieval.local_l1_threshold = _safe_float(os.environ.get("LOCAL_L1_THRESHOLD", "0.75"), 0.75, "LOCAL_L1_THRESHOLD")
-        self.retrieval.local_l2_threshold = _safe_float(os.environ.get("LOCAL_L2_THRESHOLD", "0.80"), 0.80, "LOCAL_L2_THRESHOLD")
-        self.retrieval.local_l3_threshold = _safe_float(os.environ.get("LOCAL_L3_THRESHOLD", "0.75"), 0.75, "LOCAL_L3_THRESHOLD")
+        self.retrieval.cloud_l1_threshold = _safe_float(os.environ.get("CLOUD_L1_THRESHOLD", "0.35"), 0.35, "CLOUD_L1_THRESHOLD")
+        self.retrieval.cloud_l2_threshold = _safe_float(os.environ.get("CLOUD_L2_THRESHOLD", "0.30"), 0.30, "CLOUD_L2_THRESHOLD")
+        self.retrieval.cloud_l3_threshold = _safe_float(os.environ.get("CLOUD_L3_THRESHOLD", "0.35"), 0.35, "CLOUD_L3_THRESHOLD")
+        self.retrieval.local_l1_threshold = _safe_float(os.environ.get("LOCAL_L1_THRESHOLD", "0.30"), 0.30, "LOCAL_L1_THRESHOLD")
+        self.retrieval.local_l2_threshold = _safe_float(os.environ.get("LOCAL_L2_THRESHOLD", "0.30"), 0.30, "LOCAL_L2_THRESHOLD")
+        self.retrieval.local_l3_threshold = _safe_float(os.environ.get("LOCAL_L3_THRESHOLD", "0.35"), 0.35, "LOCAL_L3_THRESHOLD")
         self.retrieval.source_weight_l1 = _safe_float(os.environ.get("SOURCE_WEIGHT_L1", "1.2"), 1.2, "SOURCE_WEIGHT_L1")
         self.retrieval.source_weight_l2 = _safe_float(os.environ.get("SOURCE_WEIGHT_L2", "1.0"), 1.0, "SOURCE_WEIGHT_L2")
         self.retrieval.source_weight_l3 = _safe_float(os.environ.get("SOURCE_WEIGHT_L3", "0.8"), 0.8, "SOURCE_WEIGHT_L3")

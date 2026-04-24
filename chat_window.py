@@ -2,6 +2,7 @@
 import tkinter as tk
 from tkinter import scrolledtext, ttk
 import threading
+import time
 from datetime import datetime
 from typing import Optional, List, Dict, Any
 
@@ -186,15 +187,19 @@ class ChatWindow:
         if self._closing:
             return None
         
+        after_id_holder = [None]
+        
         def wrapped_callback():
             try:
                 callback()
             finally:
-                if after_id in self._after_ids:
+                after_id = after_id_holder[0]
+                if after_id is not None and after_id in self._after_ids:
                     self._after_ids.remove(after_id)
         
         try:
             after_id = self.window.after(delay, wrapped_callback)
+            after_id_holder[0] = after_id
             self._after_ids.append(after_id)
             return after_id
         except tk.TclError:
@@ -251,6 +256,8 @@ class ChatWindow:
             self.async_processor = AsyncMemoryProcessor()
             self.async_processor.start()
             
+            self._setup_heartbeat_monitor()
+            
             self._check_llm_health()
             
             self._init_cloud_client()
@@ -285,6 +292,86 @@ class ChatWindow:
                 )
         except Exception as e:
             self._log.error("INIT_CALLBACK_ERROR", error=str(e))
+    
+    def _setup_heartbeat_monitor(self):
+        """
+        设置心跳监听
+        
+        监听 AsyncProcessor 的心跳事件，
+        如果超过阈值未收到心跳则告警
+        """
+        try:
+            from event_bus import get_event_bus, EventType
+            
+            event_bus = get_event_bus()
+            
+            self._last_heartbeat_time = time.time()
+            self._heartbeat_timeout = 60
+            
+            event_bus.subscribe(EventType.HEARTBEAT, self._on_heartbeat, "ChatWindow")
+            event_bus.subscribe(EventType.CRITICAL_SERVICE_DOWN, self._on_critical_alert, "ChatWindow")
+            
+            self._start_heartbeat_checker()
+            
+        except Exception as e:
+            self._log.error("HEARTBEAT_MONITOR_SETUP_FAILED", error=str(e))
+    
+    def _on_heartbeat(self, event):
+        """
+        处理心跳事件
+        
+        Args:
+            event: 心跳事件
+        """
+        self._last_heartbeat_time = time.time()
+    
+    def _on_critical_alert(self, event):
+        """
+        处理关键服务告警
+        
+        Args:
+            event: 告警事件
+        """
+        data = event.data
+        service = data.get("service", "unknown")
+        error = data.get("error", "unknown error")
+        
+        self._safe_after(0, lambda s=service, e=error: self._append_message(
+            "system", 
+            f"⚠️ 关键服务异常: {s} - {e}"
+        ))
+        
+        self._log.error(
+            "CRITICAL_SERVICE_ALERT",
+            service=service,
+            error=error
+        )
+    
+    def _start_heartbeat_checker(self):
+        """
+        启动心跳检查器
+        
+        定期检查是否收到心跳，超时则告警
+        """
+        def check_heartbeat():
+            if self._closing:
+                return
+            
+            current_time = time.time()
+            if current_time - self._last_heartbeat_time > self._heartbeat_timeout:
+                self._safe_after(0, lambda: self._append_message(
+                    "system", 
+                    "⚠️ 后台处理器心跳超时，可能已停止运行"
+                ))
+                self._log.warning(
+                    "HEARTBEAT_TIMEOUT",
+                    last_heartbeat=self._last_heartbeat_time,
+                    timeout=self._heartbeat_timeout
+                )
+            
+            self._safe_after(30000, check_heartbeat)
+        
+        self._safe_after(30000, check_heartbeat)
     
     def _check_llm_health(self):
         """检查本地 LLM 服务健康状态"""
@@ -668,14 +755,12 @@ class ChatWindow:
         Returns:
             消息列表
         """
-        system_prompt = config.system_prompt
-        
         messages = [
-            {"role": "system", "content": system_prompt}
+            {"role": "system", "content": config.system_prompt}
         ]
         
         max_tokens = config.local.max_context
-        system_tokens = self._estimate_tokens(system_prompt)
+        system_tokens = self._estimate_tokens(config.system_prompt)
         format_overhead = 50
         
         available_for_memory = max_tokens - system_tokens - config.local.max_output_tokens - format_overhead
@@ -760,28 +845,42 @@ class ChatWindow:
                 
                 retrieval_metadata = self._build_retrieval_metadata(retrieved_memories, memory_context)
                 
-                if show_memory and retrieved_memories:
-                    try:
-                        from sensitive_filter import get_sensitive_filter
-                        sensitive_filter = get_sensitive_filter()
+                self._log.info(
+                    "RETRIEVAL_RESULT",
+                    show_memory=show_memory,
+                    show_local=show_local,
+                    retrieved_count=len(retrieved_memories),
+                    has_memories=has_memories,
+                    context_length=len(memory_context) if memory_context else 0
+                )
+                
+                if show_memory:
+                    if retrieved_memories:
+                        try:
+                            from sensitive_filter import get_sensitive_filter
+                            sensitive_filter = get_sensitive_filter()
+                            
+                            memory_lines = []
+                            for m in retrieved_memories[:5]:
+                                text = m.get('text', '')
+                                masked_text, _ = sensitive_filter.mask(text)
+                                memory_lines.append(
+                                    f"  [{m.get('similarity', 0):.2f}][{m.get('source', '?')}] {masked_text[:50]}..."
+                                )
+                            memory_info = "\n".join(memory_lines)
+                        except Exception:
+                            memory_info = "\n".join([
+                                f"  [{m.get('similarity', 0):.2f}][{m.get('source', '?')}] {m.get('text', '')[:50]}..."
+                                for m in retrieved_memories[:5]
+                            ])
                         
-                        memory_lines = []
-                        for m in retrieved_memories[:5]:
-                            text = m.get('text', '')
-                            masked_text, _ = sensitive_filter.mask(text)
-                            memory_lines.append(
-                                f"  [{m.get('similarity', 0):.2f}][{m.get('source', '?')}] {masked_text[:50]}..."
-                            )
-                        memory_info = "\n".join(memory_lines)
-                    except Exception:
-                        memory_info = "\n".join([
-                            f"  [{m.get('similarity', 0):.2f}][{m.get('source', '?')}] {m.get('text', '')[:50]}..."
-                            for m in retrieved_memories[:5]
-                        ])
-                    
-                    self._safe_after(0, lambda info=memory_info: self._append_message(
-                        "memory", f"检索到的记忆:\n{info}"
-                    ))
+                        self._safe_after(0, lambda info=memory_info: self._append_message(
+                            "memory", f"📚 检索到的记忆 ({len(retrieved_memories)}条):\n{info}"
+                        ))
+                    else:
+                        self._safe_after(0, lambda: self._append_message(
+                            "memory", "📚 未检索到相关记忆"
+                        ))
                 
                 local_response = ""
                 final_response = ""

@@ -108,7 +108,7 @@ class BackgroundTaskScheduler:
         self._initialized = True
         self._log = get_logger()
         
-        self._task_queue: queue.PriorityQueue = queue.PriorityQueue()
+        self._task_queue: queue.PriorityQueue = queue.PriorityQueue(maxsize=1000)
         self._running = False
         self._worker_thread: Optional[threading.Thread] = None
         
@@ -129,6 +129,9 @@ class BackgroundTaskScheduler:
         self._read_write_lock = threading.Lock()
         self._write_waiting = threading.Condition(self._read_write_lock)
         self._write_in_progress = False
+        self._pending_writers = 0
+        self._write_wait_start_time: Optional[float] = None
+        self._MAX_WRITE_WAIT_SECONDS = 10.0
     
     def start(self):
         """启动调度器"""
@@ -310,33 +313,50 @@ class BackgroundTaskScheduler:
             TimeoutError: 等待读者超时
         """
         deadline = time.time() + timeout
+        migration_lock_acquired = False
         
         with self._write_waiting:
-            while self._readers_count > 0:
-                remaining = deadline - time.time()
-                if remaining <= 0:
-                    self._log.error(
-                        "MIGRATION_WAIT_READERS_TIMEOUT",
-                        task_type=task_type.value,
-                        readers_count=self._readers_count,
-                        timeout=timeout
-                    )
-                    raise TimeoutError(f"等待读者完成超时 ({timeout}秒)，当前读者数: {self._readers_count}")
+            self._pending_writers += 1
+            self._write_wait_start_time = time.time()
+            
+            try:
+                while self._readers_count > 0:
+                    remaining = deadline - time.time()
+                    if remaining <= 0:
+                        self._log.error(
+                            "MIGRATION_WAIT_READERS_TIMEOUT",
+                            task_type=task_type.value,
+                            readers_count=self._readers_count,
+                            timeout=timeout
+                        )
+                        raise TimeoutError(f"等待读者完成超时 ({timeout}秒)，当前读者数: {self._readers_count}")
+                    
+                    self._write_waiting.wait(timeout=min(remaining, 0.5))
                 
-                self._write_waiting.wait(timeout=min(remaining, 0.5))
-            
-            self._write_in_progress = True
-            self._migration_active = True
-            self._current_task = task_type
-            self._migration_start_time = time.time()
-            
-            self._migration_lock.acquire()
-            
-            self._log.debug(
-                "MIGRATION_STARTED",
-                task_type=task_type.value,
-                queue_size=self._task_queue.qsize()
-            )
+                self._migration_lock.acquire()
+                migration_lock_acquired = True
+                
+                self._write_in_progress = True
+                self._migration_active = True
+                self._current_task = task_type
+                self._migration_start_time = time.time()
+                
+                self._log.debug(
+                    "MIGRATION_STARTED",
+                    task_type=task_type.value,
+                    queue_size=self._task_queue.qsize()
+                )
+                
+            except Exception as e:
+                self._write_wait_start_time = None
+                if migration_lock_acquired:
+                    try:
+                        self._migration_lock.release()
+                    except RuntimeError:
+                        pass
+                raise
+            finally:
+                self._pending_writers -= 1
     
     def _end_migration(self):
         """
@@ -350,17 +370,23 @@ class BackgroundTaskScheduler:
         self._migration_active = False
         self._current_task = None
         self._migration_start_time = None
+        self._write_wait_start_time = None
         
         try:
             self._migration_lock.release()
-        except RuntimeError:
-            pass
+        except RuntimeError as e:
+            self._log.warning(
+                "MIGRATION_LOCK_RELEASE_ERROR",
+                task_type=task_type.value if task_type else "unknown",
+                error=str(e)
+            )
         
         with self._write_waiting:
             self._write_in_progress = False
             self._write_waiting.notify_all()
         
-        self._last_task_times[task_type] = time.time()
+        if task_type:
+            self._last_task_times[task_type] = time.time()
         
         self._log.debug(
             "MIGRATION_ENDED",
@@ -406,6 +432,16 @@ class BackgroundTaskScheduler:
                 
                 self._write_waiting.wait(timeout=min(remaining, 0.1))
             
+            if self._pending_writers > 0 and self._write_wait_start_time is not None:
+                wait_duration = time.time() - self._write_wait_start_time
+                if wait_duration > self._MAX_WRITE_WAIT_SECONDS:
+                    self._log.warning(
+                        "READ_DEFERRED_FOR_WRITER",
+                        wait_duration=round(wait_duration, 2),
+                        pending_writers=self._pending_writers
+                    )
+                    return False
+            
             self._readers_count += 1
         
         return True
@@ -414,6 +450,12 @@ class BackgroundTaskScheduler:
         """释放读锁"""
         with self._write_waiting:
             self._readers_count -= 1
+            if self._readers_count < 0:
+                self._log.warning(
+                    "READERS_COUNT_NEGATIVE",
+                    readers_count=self._readers_count
+                )
+                self._readers_count = 0
             if self._readers_count == 0:
                 self._write_waiting.notify_all()
     
@@ -508,6 +550,9 @@ class BackgroundTaskScheduler:
             "migration_active": self._migration_active,
             "current_task": self._current_task.value if self._current_task else None,
             "queue_size": self._task_queue.qsize(),
+            "readers_count": self._readers_count,
+            "pending_writers": self._pending_writers,
+            "write_in_progress": self._write_in_progress,
             "task_stats": {
                 t.value: stats for t, stats in self._task_stats.items()
             },

@@ -27,14 +27,24 @@ class TaskType(Enum):
     UI = auto()
 
 
+class RejectionPolicy(Enum):
+    """拒绝策略"""
+    REJECT = "reject"
+    DROP_OLDEST = "drop_oldest"
+    CALLER_RUNS = "caller_runs"
+    BLOCK = "block"
+
+
 @dataclass
 class PoolStats:
     """线程池统计信息"""
     submitted: int = 0
     completed: int = 0
     failed: int = 0
+    rejected: int = 0
     active: int = 0
     queue_size: int = 0
+    queue_high_watermark: int = 0
 
 
 class ThreadPoolManager:
@@ -59,15 +69,24 @@ class ThreadPoolManager:
     DEFAULT_CONFIG: Dict[TaskType, Dict[str, Any]] = {
         TaskType.IO_BOUND: {
             "max_workers": 8,
-            "thread_name_prefix": "io_worker"
+            "thread_name_prefix": "io_worker",
+            "max_queue_size": 100,
+            "rejection_policy": RejectionPolicy.CALLER_RUNS,
+            "high_watermark_ratio": 0.8
         },
         TaskType.CPU_BOUND: {
             "max_workers": 4,
-            "thread_name_prefix": "cpu_worker"
+            "thread_name_prefix": "cpu_worker",
+            "max_queue_size": 50,
+            "rejection_policy": RejectionPolicy.REJECT,
+            "high_watermark_ratio": 0.8
         },
         TaskType.UI: {
             "max_workers": 2,
-            "thread_name_prefix": "ui_worker"
+            "thread_name_prefix": "ui_worker",
+            "max_queue_size": 20,
+            "rejection_policy": RejectionPolicy.DROP_OLDEST,
+            "high_watermark_ratio": 0.8
         },
     }
     
@@ -86,14 +105,19 @@ class ThreadPoolManager:
         self._initialized = True
         self._log = get_logger()
         self._pools: Dict[TaskType, ThreadPoolExecutor] = {}
+        self._custom_config: Dict[TaskType, Dict[str, Any]] = {}
         self._stats: Dict[TaskType, PoolStats] = {
             t: PoolStats() for t in TaskType
         }
         self._stats_lock = threading.Lock()
         self._shutdown_requested = False
         
+        EXECUTOR_PARAMS = {"max_workers", "thread_name_prefix"}
+        
         for task_type, config in self.DEFAULT_CONFIG.items():
-            self._pools[task_type] = ThreadPoolExecutor(**config)
+            executor_config = {k: v for k, v in config.items() if k in EXECUTOR_PARAMS}
+            self._pools[task_type] = ThreadPoolExecutor(**executor_config)
+            self._custom_config[task_type] = {k: v for k, v in config.items() if k not in EXECUTOR_PARAMS}
         
         self._register_lifecycle()
         
@@ -151,6 +175,67 @@ class ThreadPoolManager:
             self._log.error("UNKNOWN_TASK_TYPE", task_type=str(task_type))
             return None
         
+        config = self._custom_config.get(task_type, {})
+        queue_size = self.get_queue_size(task_type)
+        max_queue_size = config.get("max_queue_size", 100)
+        rejection_policy = config.get("rejection_policy", RejectionPolicy.REJECT)
+        high_watermark_ratio = config.get("high_watermark_ratio", 0.8)
+        
+        with self._stats_lock:
+            self._stats[task_type].queue_size = queue_size
+            if queue_size > self._stats[task_type].queue_high_watermark:
+                self._stats[task_type].queue_high_watermark = queue_size
+        
+        if queue_size >= max_queue_size:
+            if rejection_policy == RejectionPolicy.REJECT:
+                with self._stats_lock:
+                    self._stats[task_type].rejected += 1
+                self._log.warning(
+                    "TASK_REJECTED_QUEUE_FULL",
+                    task_type=task_type.name,
+                    queue_size=queue_size,
+                    max_queue_size=max_queue_size
+                )
+                return None
+            
+            elif rejection_policy == RejectionPolicy.DROP_OLDEST:
+                self._drop_oldest_task(pool)
+                self._log.info(
+                    "TASK_DROPPED_OLDEST",
+                    task_type=task_type.name,
+                    queue_size=queue_size
+                )
+            
+            elif rejection_policy == RejectionPolicy.CALLER_RUNS:
+                self._log.info(
+                    "TASK_CALLER_RUNS",
+                    task_type=task_type.name,
+                    queue_size=queue_size
+                )
+                try:
+                    fn(*args, **kwargs)
+                except Exception as e:
+                    with self._stats_lock:
+                        self._stats[task_type].failed += 1
+                    self._log.error(
+                        "CALLER_RUNS_FAILED",
+                        task_type=task_type.name,
+                        error=str(e)
+                    )
+                return None
+            
+            elif rejection_policy == RejectionPolicy.BLOCK:
+                pass
+        
+        if queue_size >= max_queue_size * high_watermark_ratio:
+            self._log.warning(
+                "QUEUE_HIGH_WATERMARK",
+                task_type=task_type.name,
+                queue_size=queue_size,
+                max_queue_size=max_queue_size,
+                ratio=high_watermark_ratio
+            )
+        
         with self._stats_lock:
             self._stats[task_type].submitted += 1
         
@@ -166,6 +251,29 @@ class ThreadPoolManager:
                 self._log.warning("THREAD_POOL_CLOSED", task_type=task_type.name)
                 return None
             raise
+    
+    def _drop_oldest_task(self, pool: ThreadPoolExecutor) -> bool:
+        """
+        尝试丢弃最旧的任务
+        
+        Args:
+            pool: 线程池实例
+        
+        Returns:
+            是否成功丢弃
+        """
+        try:
+            if hasattr(pool, '_work_queue'):
+                work_queue = pool._work_queue
+                if hasattr(work_queue, 'get_nowait'):
+                    try:
+                        work_queue.get_nowait()
+                        return True
+                    except queue.Empty:
+                        return False
+        except Exception:
+            pass
+        return False
     
     def _wrap_task(self, task_type: TaskType, fn: Callable) -> Callable:
         """
@@ -203,6 +311,14 @@ class ThreadPoolManager:
             finally:
                 with self._stats_lock:
                     self._stats[task_type].active -= 1
+                
+                try:
+                    from sqlite_store import get_sqlite_store
+                    sqlite_store = get_sqlite_store()
+                    if sqlite_store:
+                        sqlite_store.close_thread_connection()
+                except Exception:
+                    pass
         
         return wrapper
     
@@ -244,18 +360,25 @@ class ThreadPoolManager:
             for task_type in TaskType:
                 pool = self._pools.get(task_type)
                 stats = self._stats[task_type]
+                config = self.DEFAULT_CONFIG[task_type]
                 
                 result[task_type.name] = {
                     "submitted": stats.submitted,
                     "completed": stats.completed,
                     "failed": stats.failed,
+                    "rejected": stats.rejected,
                     "active": stats.active,
-                    "max_workers": self.DEFAULT_CONFIG[task_type]["max_workers"],
+                    "queue_size": stats.queue_size,
+                    "queue_high_watermark": stats.queue_high_watermark,
+                    "max_workers": config["max_workers"],
+                    "max_queue_size": config.get("max_queue_size", 100),
+                    "rejection_policy": config.get("rejection_policy", RejectionPolicy.REJECT).value,
                 }
             
             result["total_submitted"] = sum(s.submitted for s in self._stats.values())
             result["total_completed"] = sum(s.completed for s in self._stats.values())
             result["total_failed"] = sum(s.failed for s in self._stats.values())
+            result["total_rejected"] = sum(s.rejected for s in self._stats.values())
             result["shutdown_requested"] = self._shutdown_requested
             
             return result

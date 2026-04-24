@@ -642,6 +642,16 @@ class SQLiteStore:
             )
         """)
         
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS pending_queue (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                data TEXT NOT NULL,
+                created_time TEXT NOT NULL,
+                retry_count INTEGER DEFAULT 0,
+                status TEXT DEFAULT 'pending'
+            )
+        """)
+        
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_pending_queue_status ON pending_queue(status, created_time)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_weight ON memories(weight DESC)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_created_time ON memories(created_time DESC)")
@@ -654,16 +664,6 @@ class SQLiteStore:
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_weight_access ON memories(weight DESC, last_access_time DESC)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_vectorized_weight ON memories(is_vectorized, weight DESC)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_source_weight ON memories(source, weight DESC)")
-        
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS pending_queue (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                data TEXT NOT NULL,
-                created_time TEXT NOT NULL,
-                retry_count INTEGER DEFAULT 0,
-                status TEXT DEFAULT 'pending'
-            )
-        """)
         
         try:
             cursor.execute("""
@@ -778,14 +778,43 @@ class SQLiteStore:
         """
         import os
         import shutil
+        import gc
         
         try:
+            self.close()
+            
+            gc.collect()
+            
+            if self._write_lock.locked():
+                try:
+                    self._write_lock.release()
+                except RuntimeError:
+                    pass
+            
             if os.path.exists(self.db_path):
                 corrupt_path = self.db_path + ".corrupt." + str(int(time.time()))
-                shutil.move(self.db_path, corrupt_path)
-                print(f"[备份] 损坏数据库已保存为: {corrupt_path}")
+                
+                moved = False
+                for attempt in range(3):
+                    try:
+                        shutil.move(self.db_path, corrupt_path)
+                        moved = True
+                        print(f"[备份] 损坏数据库已保存为: {corrupt_path}")
+                        break
+                    except OSError as e:
+                        if attempt < 2:
+                            time.sleep(0.5)
+                            gc.collect()
+                        else:
+                            print(f"[警告] 无法移动损坏数据库: {e}，尝试删除...")
+                            try:
+                                os.remove(self.db_path)
+                            except OSError as e2:
+                                print(f"[严重] 无法删除损坏数据库: {e2}")
+                                raise
             
-            with self._get_write_connection() as conn:
+            conn = self._create_connection()
+            try:
                 cursor = conn.cursor()
                 cursor.execute("""
                     CREATE TABLE IF NOT EXISTS memories (
@@ -805,6 +834,8 @@ class SQLiteStore:
                     )
                 """)
                 conn.commit()
+            finally:
+                conn.close()
             
             print("[完成] 数据库重建成功")
             

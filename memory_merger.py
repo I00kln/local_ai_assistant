@@ -216,6 +216,42 @@ class MemoryMerger:
         else:
             return base_threshold
     
+    def _parse_timestamp(self, memory: Dict) -> Optional[datetime]:
+        """
+        解析记忆的时间戳
+        
+        Args:
+            memory: 记忆字典
+        
+        Returns:
+            datetime 对象或 None
+        """
+        from memory_tags import MemoryTags
+        
+        metadata = memory.get("metadata", {})
+        ts_str = (
+            metadata.get(MemoryTags.TIMESTAMP) or
+            metadata.get("timestamp") or
+            memory.get("timestamp") or
+            memory.get("created_time")
+        )
+        
+        if not ts_str:
+            return None
+        
+        for fmt in [
+            "%Y-%m-%dT%H:%M:%S.%f",
+            "%Y-%m-%dT%H:%M:%S",
+            "%Y-%m-%d %H:%M:%S",
+            "%Y-%m-%d"
+        ]:
+            try:
+                return datetime.strptime(ts_str[:len(datetime.now().strftime(fmt))], fmt)
+            except (ValueError, TypeError):
+                continue
+        
+        return None
+    
     def _detect_conflicts(self, texts: List[str]) -> Tuple[bool, str]:
         """
         检测文本间的冲突
@@ -737,6 +773,21 @@ class MemoryMerger:
                 effective_threshold = max(threshold_i, thresholds[j])
                 
                 if similarity_matrix[i, j] >= effective_threshold:
+                    time_i = self._parse_timestamp(valid_memories[i])
+                    time_j = self._parse_timestamp(valid_memories[j])
+                    
+                    MAX_TIME_GAP_HOURS = 24
+                    if time_i and time_j:
+                        time_gap_hours = abs((time_i - time_j).total_seconds()) / 3600
+                        if time_gap_hours > MAX_TIME_GAP_HOURS:
+                            self._log.info(
+                                "MERGE_SKIPPED_TIME_GAP",
+                                time_gap_hours=f"{time_gap_hours:.1f}",
+                                text_i=valid_memories[i].get("text", "")[:50],
+                                text_j=valid_memories[j].get("text", "")[:50]
+                            )
+                            continue
+                    
                     group.append(valid_memories[j])
                     used.add(j)
             
@@ -1228,11 +1279,10 @@ class MemoryMerger:
         原子化应用合并结果到存储
         
         流程：
-        1. 备份主记录原始状态（用于回滚）
-        2. 收集所有待删除记录的 vector_id
-        3. 更新主记录（标记需要重新向量化）
-        4. 删除旧记录
-        5. 同步清理向量库（失败不影响一致性，孤立向量会在启动补偿中清理）
+        1. 备份所有受影响记录的完整状态
+        2. 先删除向量（可恢复性低，优先执行）
+        3. 更新 SQLite 记录（可回滚）
+        4. 如果 SQLite 失败，尝试恢复向量（尽力而为）
         
         事务保护：
         - 使用 TransactionCoordinator 确保原子性
@@ -1264,8 +1314,8 @@ class MemoryMerger:
                 
                 primary_backup = sqlite_store.get(primary_id)
                 
-                vector_ids_to_delete = []
                 records_to_delete_backup = []
+                vector_ids_deleted = []
                 
                 for oid in other_ids:
                     rec = sqlite_store.get(oid)
@@ -1274,16 +1324,39 @@ class MemoryMerger:
                             "id": rec.id,
                             "text": rec.text,
                             "metadata": dict(rec.metadata) if rec.metadata else {},
-                            "vector_id": rec.vector_id
+                            "vector_id": rec.vector_id,
+                            "weight": rec.weight,
+                            "access_count": rec.access_count,
+                            "created_time": rec.created_time,
+                            "is_vectorized": rec.is_vectorized
                         })
-                        if rec.vector_id:
-                            vector_ids_to_delete.append(rec.vector_id)
                 
+                vector_ids_to_delete = []
+                for rec_backup in records_to_delete_backup:
+                    if rec_backup.get("vector_id"):
+                        vector_ids_to_delete.append(rec_backup["vector_id"])
                 vector_ids_to_delete.extend(merged.get("vector_ids_to_delete", []))
                 
                 merge_failed = False
                 
                 try:
+                    if vector_ids_to_delete:
+                        try:
+                            vector_store.delete(ids=vector_ids_to_delete)
+                            vector_ids_deleted = list(vector_ids_to_delete)
+                            self._log.info(
+                                "MERGE_DELETE_VECTORS",
+                                count=len(vector_ids_to_delete),
+                                primary_id=primary_id
+                            )
+                        except Exception as e:
+                            self._log.warning(
+                                "MERGE_DELETE_VECTORS_FAILED",
+                                error=str(e),
+                                vector_ids=vector_ids_to_delete,
+                                note="孤立向量将在启动补偿中清理"
+                            )
+                    
                     existing = sqlite_store.get(primary_id)
                     if existing:
                         existing.text = merged["text"]
@@ -1331,22 +1404,6 @@ class MemoryMerger:
                     
                     for oid in other_ids:
                         sqlite_store.delete_memory(oid)
-                    
-                    if vector_ids_to_delete:
-                        try:
-                            vector_store.delete(ids=vector_ids_to_delete)
-                            self._log.info(
-                                "MERGE_DELETE_VECTORS",
-                                count=len(vector_ids_to_delete),
-                                primary_id=primary_id
-                            )
-                        except Exception as e:
-                            self._log.warning(
-                                "MERGE_DELETE_VECTORS_FAILED",
-                                error=str(e),
-                                vector_ids=vector_ids_to_delete,
-                                note="孤立向量将在启动补偿中清理"
-                            )
                             
                 except Exception as e:
                     merge_failed = True
@@ -1375,7 +1432,9 @@ class MemoryMerger:
                                     text=rec_backup["text"],
                                     metadata=rec_backup["metadata"],
                                     vector_id=rec_backup["vector_id"],
-                                    is_vectorized=1 if rec_backup["vector_id"] else 0
+                                    weight=rec_backup.get("weight", 1.0),
+                                    access_count=rec_backup.get("access_count", 0),
+                                    is_vectorized=rec_backup.get("is_vectorized", 0)
                                 )
                                 restored.id = rec_backup["id"]
                                 sqlite_store.add(restored)
@@ -1389,6 +1448,13 @@ class MemoryMerger:
                                 record_id=rec_backup["id"],
                                 error=str(rb_e)
                             )
+                    
+                    if vector_ids_deleted:
+                        self._log.warning(
+                            "MERGE_VECTORS_MAY_BE_LOST",
+                            vector_ids=vector_ids_deleted,
+                            note="向量已删除但 SQLite 回滚，需要手动检查或等待重新向量化"
+                        )
                     
                     raise
                         

@@ -4,13 +4,38 @@ import os
 import json
 import time
 import threading
+import shutil
 from typing import List, Dict, Any, Optional, Tuple
 from datetime import datetime
 
 from config import config
+from logger import get_logger
 from memory_tags import MemoryTags
 from models import MemoryRecord
 from thread_pool_manager import submit_io_task
+
+
+MIN_DISK_SPACE_MB = 100
+MIN_DISK_SPACE_RATIO = 0.05
+
+
+def check_disk_space(path: str, min_mb: int = MIN_DISK_SPACE_MB) -> Tuple[bool, int]:
+    """
+    检查磁盘空间是否足够
+    
+    Args:
+        path: 检查路径
+        min_mb: 最小所需空间（MB）
+    
+    Returns:
+        (是否足够, 可用空间MB)
+    """
+    try:
+        usage = shutil.disk_usage(path)
+        free_mb = usage.free // (1024 * 1024)
+        return free_mb >= min_mb, free_mb
+    except Exception:
+        return True, -1
 
 
 def _serialize_metadata(metadata: Dict[str, Any]) -> Dict[str, Any]:
@@ -102,7 +127,7 @@ class ONNXEmbeddingFunction:
         委托给共享的 EmbeddingService
         """
         self._ensure_initialized()
-        return self._embedding_service.embed(texts, use_cache=True)
+        return self._embedding_service.embed(texts, use_cache=True, allow_fallback=True)
 
 
 class VectorStore:
@@ -134,6 +159,7 @@ class VectorStore:
         
         os.makedirs(persist_directory, exist_ok=True)
         
+        self._log = get_logger()
         self._prewarm_complete = False
         self._prewarm_error: Optional[str] = None
         self._prewarm_lock = threading.Lock()
@@ -266,11 +292,15 @@ class VectorStore:
             text: 文本内容
         
         Returns:
-            格式为 "mem_{hash[:16]}" 的确定性 ID
+            格式为 "mem_{hash[:32]}" 的确定性 ID
+            
+        Note:
+            使用 32 位 16 进制字符（128 bit），根据生日悖论，
+            在百万级记录时碰撞概率极低。
         """
         import hashlib
         text_hash = hashlib.sha256(text.encode('utf-8')).hexdigest()
-        return f"mem_{text_hash[:16]}"
+        return f"mem_{text_hash[:32]}"
     
     BATCH_SIZE = 500
     
@@ -307,8 +337,35 @@ class VectorStore:
         降级保护：
         - 禁止写入随机向量，防止污染向量库
         - 降级模式下仅存储到 SQLite，标记为 pending_embedding
+        - 磁盘空间不足时预检查并降级
         """
         if not texts:
+            return []
+        
+        chroma_path = getattr(self, 'persist_directory', None)
+        if chroma_path is None:
+            chroma_path = getattr(config, 'chroma_persist_dir', 'chroma_db')
+        has_space, free_mb = check_disk_space(chroma_path)
+        
+        if not has_space:
+            print(f"[警告] 磁盘空间不足（可用 {free_mb}MB），降级到 SQLite 存储")
+            
+            if sqlite_store:
+                try:
+                    for i, text in enumerate(texts):
+                        meta = metadatas[i] if metadatas and i < len(metadatas) else {}
+                        meta["pending_embedding"] = True
+                        meta["disk_full_fallback"] = True
+                        record = MemoryRecord(
+                            text=text,
+                            source=meta.get("source", "local"),
+                            metadata=meta,
+                            is_vectorized=-1
+                        )
+                        sqlite_store.add(record)
+                    print(f"[降级] 已将 {len(texts)} 条记录存储到 SQLite（磁盘空间不足）")
+                except Exception as e:
+                    print(f"[错误] SQLite 降级存储失败: {e}")
             return []
         
         if self.embedding_function.is_fallback_mode():
@@ -415,7 +472,11 @@ class VectorStore:
                         pass
         
         if all_ids:
-            print(f"添加 {len(all_ids)} 条记忆到向量库，当前总数: {self.collection.count()}")
+            self._log.debug(
+                "VECTOR_STORE_ADDED",
+                count=len(all_ids),
+                total=self.collection.count()
+            )
         
         return all_ids
     
@@ -437,35 +498,59 @@ class VectorStore:
         
         Returns:
             搜索结果列表
+        
+        注意：
+            ChromaDB 使用内积空间 (hnsw:space: ip)，返回的 distances 是负内积值。
+            对于归一化向量，内积 = 余弦相似度，范围 [-1, 1]。
+            因此 similarity = 1 - distance，将距离转换为相似度。
         """
         if n_results is None:
             n_results = config.max_retrieve_results
         
-        if self.collection.count() == 0:
+        collection_count = self.collection.count()
+        if collection_count == 0:
+            self._log.info("VECTOR_SEARCH_EMPTY", message="collection is empty")
             return []
         
-        # 生成查询嵌入
         query_embedding = self.embedding_function([query])[0]
         
-        # 执行搜索
         results = self.collection.query(
             query_embeddings=[query_embedding],
-            n_results=min(n_results, self.collection.count()),
+            n_results=min(n_results, collection_count),
             where=where,
             where_document=where_document,
             include=["documents", "metadatas", "distances"]
         )
         
-        # 格式化结果
         formatted_results = []
         if results and results["ids"]:
             for i, doc_id in enumerate(results["ids"][0]):
+                distance = results["distances"][0][i] if results["distances"] else 0.0
+                similarity = 1 - distance
+                
                 formatted_results.append({
                     "id": doc_id,
                     "text": results["documents"][0][i] if results["documents"] else "",
                     "metadata": results["metadatas"][0][i] if results["metadatas"] else {},
-                    "similarity": results["distances"][0][i] if results["distances"] else 0.0
+                    "similarity": similarity
                 })
+        
+        if formatted_results:
+            similarities = [r["similarity"] for r in formatted_results]
+            self._log.info(
+                "VECTOR_SEARCH_RESULTS",
+                query=query[:50],
+                collection_count=collection_count,
+                result_count=len(formatted_results),
+                max_similarity=max(similarities) if similarities else 0,
+                min_similarity=min(similarities) if similarities else 0
+            )
+        else:
+            self._log.info(
+                "VECTOR_SEARCH_EMPTY",
+                query=query[:50],
+                collection_count=collection_count
+            )
         
         return formatted_results
     
@@ -485,6 +570,10 @@ class VectorStore:
         
         Returns:
             搜索结果列表
+        
+        注意：
+            ChromaDB 使用内积空间 (hnsw:space: ip)，返回的 distances 是 1 - cosine_similarity。
+            因此 similarity = 1 - distance，将距离转换为相似度。
         """
         if n_results is None:
             n_results = config.max_retrieve_results
@@ -502,11 +591,14 @@ class VectorStore:
         formatted_results = []
         if results and results["ids"]:
             for i, doc_id in enumerate(results["ids"][0]):
+                distance = results["distances"][0][i] if results["distances"] else 0.0
+                similarity = 1 - distance
+                
                 formatted_results.append({
                     "id": doc_id,
                     "text": results["documents"][0][i] if results["documents"] else "",
                     "metadata": results["metadatas"][0][i] if results["metadatas"] else {},
-                    "similarity": results["distances"][0][i] if results["distances"] else 0.0
+                    "similarity": similarity
                 })
         
         return formatted_results

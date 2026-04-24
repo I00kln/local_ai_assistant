@@ -18,6 +18,18 @@ class TransactionState(Enum):
     FAILED = "failed"
 
 
+class TransactionPhase(Enum):
+    """事务阶段 - 用于精确恢复"""
+    INIT = "init"
+    PREPARING = "preparing"
+    PREPARED = "prepared"
+    COMMITTING = "committing"
+    COMMITTED = "committed"
+    ROLLING_BACK = "rolling_back"
+    ROLLED_BACK = "rolled_back"
+    FAILED = "failed"
+
+
 @dataclass
 class TransactionRecord:
     """事务记录"""
@@ -27,6 +39,7 @@ class TransactionRecord:
     created_time: datetime
     updated_time: datetime
     data: Dict[str, Any]
+    phase: TransactionPhase = TransactionPhase.INIT
     error_message: Optional[str] = None
 
 
@@ -66,6 +79,7 @@ class TransactionCoordinator:
             transaction_id TEXT PRIMARY KEY,
             operation_type TEXT NOT NULL,
             state TEXT NOT NULL,
+            phase TEXT NOT NULL DEFAULT 'init',
             created_time TEXT NOT NULL,
             updated_time TEXT NOT NULL,
             data TEXT,
@@ -76,6 +90,10 @@ class TransactionCoordinator:
     TRANSACTION_INDEX_SQL = """
         CREATE INDEX IF NOT EXISTS idx_transactions_state 
         ON transactions(state, updated_time)
+    """
+    
+    TRANSACTION_PHASE_MIGRATION_SQL = """
+        ALTER TABLE transactions ADD COLUMN phase TEXT NOT NULL DEFAULT 'init'
     """
     
     def __new__(cls):
@@ -117,6 +135,13 @@ class TransactionCoordinator:
                 cursor = conn.cursor()
                 cursor.execute(self.TRANSACTION_TABLE_SQL)
                 cursor.execute(self.TRANSACTION_INDEX_SQL)
+                
+                try:
+                    cursor.execute(self.TRANSACTION_PHASE_MIGRATION_SQL)
+                    self._log.debug("TRANSACTION_TABLE_PHASE_MIGRATED")
+                except Exception:
+                    pass
+                
                 conn.commit()
                 self._tx_table_initialized = True
                 self._log.debug("TRANSACTION_TABLE_INITIALIZED")
@@ -141,13 +166,14 @@ class TransactionCoordinator:
                 cursor = conn.cursor()
                 cursor.execute("""
                     INSERT OR REPLACE INTO transactions 
-                    (transaction_id, operation_type, state, created_time, 
+                    (transaction_id, operation_type, state, phase, created_time, 
                      updated_time, data, error_message)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
                     tx_record.transaction_id,
                     tx_record.operation_type,
                     tx_record.state.value,
+                    tx_record.phase.value,
                     tx_record.created_time.isoformat(),
                     tx_record.updated_time.isoformat(),
                     json.dumps(tx_record.data, ensure_ascii=False),
@@ -162,6 +188,7 @@ class TransactionCoordinator:
             return False
     
     def _update_transaction_state(self, tx_id: str, state: TransactionState, 
+                                   phase: TransactionPhase = None,
                                    error_message: str = None) -> bool:
         """
         更新事务状态
@@ -169,6 +196,7 @@ class TransactionCoordinator:
         Args:
             tx_id: 事务ID
             state: 新状态
+            phase: 新阶段（可选）
             error_message: 错误信息（可选）
         
         Returns:
@@ -181,17 +209,31 @@ class TransactionCoordinator:
             with self._sqlite_store._get_write_connection() as conn:
                 cursor = conn.cursor()
                 if error_message:
-                    cursor.execute("""
-                        UPDATE transactions 
-                        SET state = ?, updated_time = ?, error_message = ?
-                        WHERE transaction_id = ?
-                    """, (state.value, datetime.now().isoformat(), error_message, tx_id))
+                    if phase:
+                        cursor.execute("""
+                            UPDATE transactions 
+                            SET state = ?, phase = ?, updated_time = ?, error_message = ?
+                            WHERE transaction_id = ?
+                        """, (state.value, phase.value, datetime.now().isoformat(), error_message, tx_id))
+                    else:
+                        cursor.execute("""
+                            UPDATE transactions 
+                            SET state = ?, updated_time = ?, error_message = ?
+                            WHERE transaction_id = ?
+                        """, (state.value, datetime.now().isoformat(), error_message, tx_id))
                 else:
-                    cursor.execute("""
-                        UPDATE transactions 
-                        SET state = ?, updated_time = ?
-                        WHERE transaction_id = ?
-                    """, (state.value, datetime.now().isoformat(), tx_id))
+                    if phase:
+                        cursor.execute("""
+                            UPDATE transactions 
+                            SET state = ?, phase = ?, updated_time = ?
+                            WHERE transaction_id = ?
+                        """, (state.value, phase.value, datetime.now().isoformat(), tx_id))
+                    else:
+                        cursor.execute("""
+                            UPDATE transactions 
+                            SET state = ?, updated_time = ?
+                            WHERE transaction_id = ?
+                        """, (state.value, datetime.now().isoformat(), tx_id))
                 conn.commit()
                 return True
         except Exception as e:
@@ -239,7 +281,7 @@ class TransactionCoordinator:
             conn = self._sqlite_store._get_read_connection()
             cursor = conn.cursor()
             cursor.execute("""
-                SELECT transaction_id, operation_type, state, created_time,
+                SELECT transaction_id, operation_type, state, phase, created_time,
                        updated_time, data, error_message
                 FROM transactions
                 WHERE state IN ('pending', 'preparing')
@@ -249,14 +291,21 @@ class TransactionCoordinator:
             records = []
             for row in cursor.fetchall():
                 try:
+                    phase_str = row[3] if len(row) > 3 else 'init'
+                    try:
+                        phase = TransactionPhase(phase_str)
+                    except ValueError:
+                        phase = TransactionPhase.INIT
+                    
                     records.append(TransactionRecord(
                         transaction_id=row[0],
                         operation_type=row[1],
                         state=TransactionState(row[2]),
-                        created_time=datetime.fromisoformat(row[3]),
-                        updated_time=datetime.fromisoformat(row[4]),
-                        data=json.loads(row[5]) if row[5] else {},
-                        error_message=row[6]
+                        phase=phase,
+                        created_time=datetime.fromisoformat(row[4]),
+                        updated_time=datetime.fromisoformat(row[5]),
+                        data=json.loads(row[6]) if row[6] else {},
+                        error_message=row[7] if len(row) > 7 else None
                     ))
                 except (ValueError, json.JSONDecodeError) as e:
                     self._log.error("TRANSACTION_PARSE_FAILED", 
@@ -349,11 +398,17 @@ class TransactionCoordinator:
         执行事务（带持久化）
         
         两阶段提交流程：
-        1. 创建事务记录，状态为 PENDING，持久化到 SQLite
-        2. 执行准备阶段，状态更新为 PREPARING，持久化
-        3. 执行提交阶段（ChromaDB 写入）
-        4. 成功则状态更新为 COMMITTED，持久化
-        5. 失败则执行回滚，状态更新为 FAILED 或 ROLLED_BACK
+        1. 创建事务记录，状态为 PENDING，phase 为 INIT，持久化到 SQLite
+        2. 执行准备阶段，状态更新为 PREPARING，phase 为 PREPARING，持久化
+        3. 准备完成，phase 更新为 PREPARED，持久化
+        4. 执行提交阶段（ChromaDB 写入），phase 为 COMMITTING
+        5. ChromaDB 写入成功后，phase 更新为 COMMITTED，持久化
+        6. 最后状态更新为 COMMITTED
+        
+        恢复策略：
+        - phase=INIT/PREPARING: 从头开始
+        - phase=PREPARED: 重新执行 commit_fn
+        - phase=COMMITTING: 检查 ChromaDB 是否已写入，决定重试或标记完成
         
         Args:
             operation_type: 操作类型
@@ -377,9 +432,10 @@ class TransactionCoordinator:
             transaction_id=tx_id,
             operation_type=operation_type,
             state=TransactionState.PENDING,
+            phase=TransactionPhase.INIT,
             created_time=datetime.now(),
             updated_time=datetime.now(),
-            data=data
+            data={"phase": "init", **data}
         )
         
         self._transactions[tx_id] = tx_record
@@ -388,18 +444,32 @@ class TransactionCoordinator:
         
         try:
             tx_record.state = TransactionState.PREPARING
+            tx_record.phase = TransactionPhase.PREPARING
             tx_record.updated_time = datetime.now()
-            self._update_transaction_state(tx_id, TransactionState.PREPARING)
+            tx_record.data["phase"] = "preparing"
+            self._update_transaction_state(tx_id, TransactionState.PREPARING, TransactionPhase.PREPARING)
             
             prepare_result = prepare_fn(data)
             tx_record.data["prepare_result"] = prepare_result
             
+            tx_record.phase = TransactionPhase.PREPARED
+            tx_record.data["phase"] = "prepared"
+            self._update_transaction_state(tx_id, TransactionState.PREPARING, TransactionPhase.PREPARED)
+            
+            tx_record.phase = TransactionPhase.COMMITTING
+            tx_record.data["phase"] = "committing"
+            self._update_transaction_state(tx_id, TransactionState.PREPARING, TransactionPhase.COMMITTING)
+            
             commit_result = commit_fn(data)
             tx_record.data["commit_result"] = commit_result
             
+            tx_record.phase = TransactionPhase.COMMITTED
+            tx_record.data["phase"] = "committed"
+            self._update_transaction_state(tx_id, TransactionState.PREPARING, TransactionPhase.COMMITTED)
+            
             tx_record.state = TransactionState.COMMITTED
             tx_record.updated_time = datetime.now()
-            self._update_transaction_state(tx_id, TransactionState.COMMITTED)
+            self._update_transaction_state(tx_id, TransactionState.COMMITTED, TransactionPhase.COMMITTED)
             
             self._log.debug("TRANSACTION_COMMITTED", 
                            transaction_id=tx_id, 
@@ -413,9 +483,11 @@ class TransactionCoordinator:
             
         except Exception as e:
             tx_record.state = TransactionState.FAILED
+            tx_record.phase = TransactionPhase.FAILED
             tx_record.error_message = str(e)
             tx_record.updated_time = datetime.now()
-            self._update_transaction_state(tx_id, TransactionState.FAILED, str(e))
+            tx_record.data["phase"] = "failed"
+            self._update_transaction_state(tx_id, TransactionState.FAILED, TransactionPhase.FAILED, str(e))
             
             self._log.error("TRANSACTION_FAILED",
                            transaction_id=tx_id,
@@ -424,9 +496,15 @@ class TransactionCoordinator:
             
             if rollback_fn:
                 try:
+                    tx_record.phase = TransactionPhase.ROLLING_BACK
+                    tx_record.data["phase"] = "rolling_back"
+                    self._update_transaction_state(tx_id, TransactionState.FAILED, TransactionPhase.ROLLING_BACK)
+                    
                     rollback_fn(tx_record.data)
+                    
                     tx_record.state = TransactionState.ROLLED_BACK
-                    self._update_transaction_state(tx_id, TransactionState.ROLLED_BACK)
+                    tx_record.phase = TransactionPhase.ROLLED_BACK
+                    self._update_transaction_state(tx_id, TransactionState.ROLLED_BACK, TransactionPhase.ROLLED_BACK)
                 except Exception as rb_error:
                     self._log.error("ROLLBACK_FAILED",
                                    transaction_id=tx_id,
@@ -442,13 +520,14 @@ class TransactionCoordinator:
         """
         恢复未完成的事务
         
+        根据 phase 精确恢复：
+        - phase=INIT/PREPARING: 从头开始执行
+        - phase=PREPARED: 跳过 prepare，直接执行 commit
+        - phase=COMMITTING: 检查 ChromaDB 是否已写入，决定重试或标记完成
+        
         检查：
         1. SQLite 事务表中的 PREPARING 状态事务
         2. SQLite 中 is_vectorized=2 的记录（旧兼容）
-        
-        恢复策略：
-        - add_memory 操作：尝试重新向量化
-        - 其他操作：标记为需要手动干预
         
         Returns:
             恢复的记录数
@@ -464,7 +543,8 @@ class TransactionCoordinator:
             self._log.info("TRANSACTION_RECOVERY_PENDING", 
                           transaction_id=tx_record.transaction_id,
                           operation_type=tx_record.operation_type,
-                          state=tx_record.state.value)
+                          state=tx_record.state.value,
+                          phase=tx_record.phase.value)
             
             if tx_record.operation_type == "add_memory":
                 recovery_result = self._recover_add_memory_transaction(tx_record)
@@ -488,6 +568,7 @@ class TransactionCoordinator:
                 self._update_transaction_state(
                     tx_record.transaction_id, 
                     TransactionState.FAILED,
+                    TransactionPhase.FAILED,
                     "Unknown operation type - requires manual intervention"
                 )
                 failed += 1
@@ -539,6 +620,10 @@ class TransactionCoordinator:
         """
         恢复 add_memory 类型的事务
         
+        根据 phase 精确恢复：
+        - phase=INIT/PREPARING: 从头开始
+        - phase=PREPARED/COMMITTING: 检查 ChromaDB 是否已写入
+        
         Args:
             tx_record: 事务记录
         
@@ -553,11 +638,30 @@ class TransactionCoordinator:
             self._update_transaction_state(
                 tx_record.transaction_id,
                 TransactionState.FAILED,
+                TransactionPhase.FAILED,
                 "Missing text data"
             )
             return False
         
         try:
+            if tx_record.phase in (TransactionPhase.COMMITTING, TransactionPhase.COMMITTED):
+                existing = self._vector_store.search(text, n_results=1)
+                if existing and existing[0].get("similarity", 0) > 0.99:
+                    existing_id = existing[0].get("id")
+                    sqlite_id = metadata.get(MemoryTags.SQLITE_ID)
+                    if sqlite_id:
+                        self._sqlite_store.update_vector_status(
+                            sqlite_id, existing_id, is_vectorized=1
+                        )
+                    self._update_transaction_state(
+                        tx_record.transaction_id,
+                        TransactionState.COMMITTED,
+                        TransactionPhase.COMMITTED
+                    )
+                    self._log.info("TRANSACTION_RECOVERY_ALREADY_COMMITTED",
+                                  transaction_id=tx_record.transaction_id)
+                    return True
+            
             existing = self._vector_store.search(text, n_results=1)
             if existing and existing[0].get("similarity", 0) > 0.99:
                 existing_id = existing[0].get("id")
@@ -568,7 +672,8 @@ class TransactionCoordinator:
                     )
                 self._update_transaction_state(
                     tx_record.transaction_id,
-                    TransactionState.COMMITTED
+                    TransactionState.COMMITTED,
+                    TransactionPhase.COMMITTED
                 )
                 self._log.info("TRANSACTION_RECOVERY_REUSE_VECTOR",
                               transaction_id=tx_record.transaction_id)
@@ -587,7 +692,8 @@ class TransactionCoordinator:
                 
                 self._update_transaction_state(
                     tx_record.transaction_id,
-                    TransactionState.COMMITTED
+                    TransactionState.COMMITTED,
+                    TransactionPhase.COMMITTED
                 )
                 self._log.info("TRANSACTION_RECOVERY_SUCCESS",
                               transaction_id=tx_record.transaction_id)
@@ -596,6 +702,7 @@ class TransactionCoordinator:
                 self._update_transaction_state(
                     tx_record.transaction_id,
                     TransactionState.FAILED,
+                    TransactionPhase.FAILED,
                     "Vector store returned empty result"
                 )
                 return False
@@ -604,6 +711,7 @@ class TransactionCoordinator:
             self._update_transaction_state(
                 tx_record.transaction_id,
                 TransactionState.FAILED,
+                TransactionPhase.FAILED,
                 f"Recovery failed: {str(e)}"
             )
             self._log.error("TRANSACTION_RECOVERY_EXCEPTION",

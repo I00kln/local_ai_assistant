@@ -183,24 +183,7 @@ class LLMCompressionStrategy(CompressionStrategy):
             
             memory_list = [line.strip() for line in text.split('\n') if line.strip()]
             
-            if len(memory_list) > 1:
-                messages = prompt_manager.get_compression_prompt(memory_list)
-            else:
-                messages = [
-                    {"role": "system", "content": "你是一个记忆压缩专家。"},
-                    {"role": "user", "content": f"""请将以下对话记录压缩为简洁的摘要，保留所有关键信息。
-
-原始内容：
-{text}
-
-压缩要求：
-1. 保留所有专有名词、人名、地名、数值
-2. 保留因果关系和关键决策
-3. 去除冗余和修饰性内容
-4. 压缩后长度约为原文的30%-50%
-
-压缩结果："""}
-                ]
+            messages = prompt_manager.get_compression_prompt(memory_list)
             
             result = self._llm_client.chat(messages, max_tokens=500)
             return result.strip() if result else None

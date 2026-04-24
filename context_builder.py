@@ -96,10 +96,19 @@ class ContextBuilder:
             max_retrieve
         )
         
-        has_memories = len(retrieved) > 0 or len(conversation_history or []) > 0
-        
         memory_context, processed_user_input, _ = self._control_context_length(
             retrieved, user_input, mode, conversation_history
+        )
+        
+        has_memories = bool(memory_context and memory_context.strip())
+        
+        self._log.info(
+            "BUILD_CONTEXT_COMPLETE",
+            query=user_input[:50],
+            retrieved_count=len(retrieved),
+            has_memories=has_memories,
+            context_length=len(memory_context) if memory_context else 0,
+            mode=mode
         )
         
         return memory_context, processed_user_input, retrieved, has_memories
@@ -229,6 +238,7 @@ class ContextBuilder:
         4. 时间窗口过滤
         """
         if not self._is_valid_query(query):
+            self._log.info("QUERY_INVALID", query=query[:50])
             return []
         
         if thresholds is None:
@@ -244,6 +254,14 @@ class ContextBuilder:
             expanded_query = self._expand_query(query, conversation_history)
         
         threshold = thresholds.get("l2", self.l2_default_threshold)
+        
+        self._log.info(
+            "MULTI_LEVEL_RETRIEVE_START",
+            query=query[:50],
+            expanded_query=expanded_query[:50] if expanded_query != query else "same",
+            threshold=threshold,
+            max_retrieve=max_retrieve
+        )
         
         search_results = self.memory.search(
             query=expanded_query,
@@ -267,6 +285,12 @@ class ContextBuilder:
         
         results = self._deduplicate_against_l1(results, conversation_history)
         results = self._time_window_filter(results, conversation_history)
+        
+        self._log.info(
+            "MULTI_LEVEL_RETRIEVE_COMPLETE",
+            raw_count=len(search_results),
+            final_count=len(results[:max_retrieve])
+        )
         
         return results[:max_retrieve]
     

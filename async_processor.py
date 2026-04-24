@@ -6,6 +6,7 @@ import re
 import json
 import os
 import glob
+import uuid
 from typing import List, Dict, Any, Tuple, Optional
 from datetime import datetime, timedelta
 from vector_store import VectorStore, get_vector_store
@@ -77,6 +78,9 @@ class AsyncMemoryProcessor:
         self._last_preload_time = 0
         self._preload_cooldown = 5.0
         self._pending_preload_ids = set()
+        
+        self._last_heartbeat = time.time()
+        self._heartbeat_interval = 30
         
         self.sqlite = None
         self._merger = None
@@ -1092,7 +1096,12 @@ class AsyncMemoryProcessor:
         3. 空闲时恢复待处理数据
         4. 空闲时执行去重检查
         5. 空闲时清理预加载 ID 缓存
+        6. 空闲时执行跨库核对任务
+        7. 定期发送心跳事件
         """
+        SYNC_CHECKER_INTERVAL = 1800
+        self._last_sync_check = time.time()
+        
         while self.running:
             try:
                 try:
@@ -1102,6 +1111,7 @@ class AsyncMemoryProcessor:
                         set_trace_id(trace_id)
                     self._process_conversation(conv)
                     self._idle_count = 0
+                    self._last_heartbeat = time.time()
                 except queue.Empty:
                     self._idle_count += 1
                     self._check_and_flush()
@@ -1109,10 +1119,63 @@ class AsyncMemoryProcessor:
                     self._check_and_dedup()
                     if self._idle_count % 10 == 0:
                         self._periodic_cleanup_preload_ids()
+                    
+                    current_time = time.time()
+                    if current_time - self._last_sync_check >= SYNC_CHECKER_INTERVAL:
+                        self._sync_checker_task()
+                        self._last_sync_check = current_time
+                    
+                    if current_time - self._last_heartbeat >= self._heartbeat_interval:
+                        self._send_heartbeat()
+                        self._last_heartbeat = current_time
+                    
                     continue
                 
             except Exception as e:
                 print(f"异步处理异常: {e}")
+                self._send_critical_alert(str(e))
+    
+    def _send_heartbeat(self):
+        """
+        发送心跳事件
+        
+        通知订阅者后台处理循环正常运行
+        """
+        try:
+            self._event_bus.publish(
+                EventType.HEARTBEAT,
+                {
+                    "timestamp": time.time(),
+                    "pending_queue_size": self.pending_queue.qsize(),
+                    "buffer_size": len(self.batch_buffer),
+                    "idle_count": self._idle_count
+                },
+                source="AsyncProcessor"
+            )
+        except Exception:
+            pass
+    
+    def _send_critical_alert(self, error: str):
+        """
+        发送关键服务告警
+        
+        当后台处理循环异常退出时通知订阅者
+        
+        Args:
+            error: 错误信息
+        """
+        try:
+            self._event_bus.publish(
+                EventType.CRITICAL_SERVICE_DOWN,
+                {
+                    "service": "AsyncProcessor",
+                    "error": error,
+                    "timestamp": time.time()
+                },
+                source="AsyncProcessor"
+            )
+        except Exception:
+            pass
     
     def _periodic_cleanup_preload_ids(self):
         """
@@ -1660,6 +1723,77 @@ class AsyncMemoryProcessor:
                     
         except Exception as e:
             self._log.error("VECTOR_RETRY_ERROR", error=str(e))
+    
+    def _sync_checker_task(self):
+        """
+        核对任务（Sync Checker）
+        
+        定期扫描 SQLite 中状态为 vectorized 但在 ChromaDB 中缺失 ID 的记录，
+        修复跨库不一致问题（幽灵记忆）。
+        
+        触发条件：
+        - 每 30 分钟执行一次
+        
+        修复策略：
+        1. 检查 vectorized=1 的记录
+        2. 验证 vector_id 在 ChromaDB 中是否存在
+        3. 不存在则重新向量化
+        """
+        if not self.sqlite:
+            return
+        
+        try:
+            vectorized_records = self.sqlite.get_records_by_vector_status(is_vectorized=1, limit=100)
+            
+            if not vectorized_records:
+                return
+            
+            ghost_count = 0
+            fixed_count = 0
+            
+            for record in vectorized_records:
+                if not record.vector_id:
+                    ghost_count += 1
+                    continue
+                
+                try:
+                    existing = self.vector_store.get_by_id(record.vector_id)
+                    if not existing:
+                        ghost_count += 1
+                        
+                        try:
+                            vector_ids = self.vector_store.add([record.text], [record.metadata or {}])
+                            if vector_ids:
+                                self.sqlite.update_vector_status(record.id, vector_ids[0], is_vectorized=1)
+                                fixed_count += 1
+                                self._log.info(
+                                    "GHOST_MEMORY_FIXED",
+                                    record_id=record.id,
+                                    old_vector_id=record.vector_id,
+                                    new_vector_id=vector_ids[0]
+                                )
+                        except Exception as e:
+                            self._log.error(
+                                "GHOST_MEMORY_FIX_FAILED",
+                                record_id=record.id,
+                                error=str(e)
+                            )
+                except Exception as e:
+                    self._log.warning(
+                        "VECTOR_ID_CHECK_FAILED",
+                        record_id=record.id,
+                        error=str(e)
+                    )
+            
+            if ghost_count > 0 or fixed_count > 0:
+                self._log.info(
+                    "SYNC_CHECKER_COMPLETE",
+                    ghost_count=ghost_count,
+                    fixed_count=fixed_count
+                )
+                    
+        except Exception as e:
+            self._log.error("SYNC_CHECKER_ERROR", error=str(e))
     
     def _check_and_flush(self):
         """

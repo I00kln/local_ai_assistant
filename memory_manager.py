@@ -4,7 +4,7 @@ import threading
 import time
 import json
 import re
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 from datetime import datetime
 from dataclasses import dataclass
 
@@ -227,7 +227,7 @@ class MemoryManager:
         """
         带重试的搜索（内部方法）
         
-        使用版本号检测并发修改，检测到修改时自动重试。
+        注意：外层已有 scheduler.read_lock() 保护，无需版本号重试机制。
         """
         if top_k is None:
             top_k = config.max_retrieve_results
@@ -235,18 +235,7 @@ class MemoryManager:
         if threshold is None:
             threshold = 0.0
         
-        max_retries = 3
-        for attempt in range(max_retries):
-            start_version = self._write_version
-            
-            results = self._do_search(query, top_k, include_l3, threshold, include_l1)
-            
-            if self._write_version == start_version:
-                return results
-            
-            self.stats["retry_reads"] += 1
-        
-        return results
+        return self._do_search(query, top_k, include_l3, threshold, include_l1)
     
     def _do_search(self, query: str, top_k: int, include_l3: bool, threshold: float, include_l1: bool) -> List[MemorySearchResult]:
         """
@@ -257,6 +246,7 @@ class MemoryManager:
         2. ChromaDB where 过滤器预过滤 forgotten 记忆
         3. 早停机制：高质量结果足够时提前终止
         4. RRF (Reciprocal Rank Fusion) 分数融合替代简单乘法
+        5. 并行检索：L2 和 L3 并行执行，减少 TTFT
         
         相似度分数统一：
         - L1: 关键词覆盖率 + 时间衰减（0-1）
@@ -268,6 +258,9 @@ class MemoryManager:
         - 公式: RRF_Score = Σ weight/(k + Rank)
         - 解决异构分数直接相加的问题
         """
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        from thread_pool_manager import submit_cpu_task
+        
         results_by_source: Dict[str, List[MemorySearchResult]] = {
             "L1": [], "L2": [], "L3": []
         }
@@ -296,38 +289,99 @@ class MemoryManager:
         
         if total_results < recall_limit and high_quality_count < min_high_quality:
             remaining = recall_limit - total_results
-            l2_results = self._search_l2(query, remaining, time_context)
-            for r in l2_results:
-                if not MemoryTagHelper.is_forgotten(r.metadata):
-                    time_decay = self._apply_time_decay(r, time_context)
-                    r.combined_score = r.similarity * time_decay * r.weight
-                    results_by_source["L2"].append(r)
-            self.stats["l2_hits"] += len(l2_results)
-        
-        total_results = sum(len(v) for v in results_by_source.values())
-        high_quality_count = sum(
-            1 for results in results_by_source.values() 
-            for r in results if r.similarity >= high_quality_threshold
-        )
-        
-        if include_l3 and total_results < recall_limit and high_quality_count < min_high_quality and config.sqlite_enabled:
-            remaining = recall_limit - total_results
-            l3_results = self._search_l3(query, remaining)
-            for r in l3_results:
-                if not MemoryTagHelper.is_forgotten(r.metadata):
-                    time_decay = self._apply_time_decay(r, time_context)
-                    r.combined_score = r.similarity * time_decay * r.weight
-                    results_by_source["L3"].append(r)
             
-            for result in l3_results:
-                if not MemoryTagHelper.is_forgotten(result.metadata):
-                    self._backfill_to_l2(result)
+            need_l2 = True
+            need_l3 = include_l3 and config.sqlite_enabled
+            
+            if need_l2 and need_l3:
+                l2_results, l3_results = self._parallel_search_l2_l3(query, remaining, time_context)
+                
+                for r in l2_results:
+                    if not MemoryTagHelper.is_forgotten(r.metadata):
+                        time_decay = self._apply_time_decay(r, time_context)
+                        r.combined_score = r.similarity * time_decay * r.weight
+                        results_by_source["L2"].append(r)
+                self.stats["l2_hits"] += len(l2_results)
+                
+                for r in l3_results:
+                    if not MemoryTagHelper.is_forgotten(r.metadata):
+                        time_decay = self._apply_time_decay(r, time_context)
+                        r.combined_score = r.similarity * time_decay * r.weight
+                        results_by_source["L3"].append(r)
+                self.stats["l3_hits"] += len(l3_results)
+                
+                for result in l3_results:
+                    if not MemoryTagHelper.is_forgotten(result.metadata):
+                        self._backfill_to_l2(result)
+            elif need_l2:
+                l2_results = self._search_l2(query, remaining, time_context)
+                for r in l2_results:
+                    if not MemoryTagHelper.is_forgotten(r.metadata):
+                        time_decay = self._apply_time_decay(r, time_context)
+                        r.combined_score = r.similarity * time_decay * r.weight
+                        results_by_source["L2"].append(r)
+                self.stats["l2_hits"] += len(l2_results)
         
         fused_results = self._reciprocal_rank_fusion(results_by_source)
         
         filtered_results = [r for r in fused_results if r.similarity >= threshold]
         
+        self._log.info(
+            "MEMORY_SEARCH_COMPLETE",
+            query=query[:50],
+            l1_count=len(results_by_source["L1"]),
+            l2_count=len(results_by_source["L2"]),
+            l3_count=len(results_by_source["L3"]),
+            fused_count=len(fused_results),
+            filtered_count=len(filtered_results),
+            threshold=threshold
+        )
+        
         return filtered_results[:top_k]
+    
+    def _parallel_search_l2_l3(
+        self, 
+        query: str, 
+        top_k: int, 
+        time_context: Dict
+    ) -> Tuple[List[MemorySearchResult], List[MemorySearchResult]]:
+        """
+        并行搜索 L2 和 L3
+        
+        使用线程池并行执行，减少检索延迟
+        
+        Args:
+            query: 搜索查询
+            top_k: 返回结果数量
+            time_context: 时间上下文
+        
+        Returns:
+            (L2结果列表, L3结果列表)
+        """
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        
+        l2_results: List[MemorySearchResult] = []
+        l3_results: List[MemorySearchResult] = []
+        
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            l2_future = executor.submit(self._search_l2, query, top_k, time_context)
+            l3_future = executor.submit(self._search_l3, query, top_k)
+            
+            for future in as_completed([l2_future, l3_future]):
+                try:
+                    result = future.result(timeout=5.0)
+                    if future == l2_future:
+                        l2_results = result
+                    else:
+                        l3_results = result
+                except Exception as e:
+                    self._log.warning(
+                        "PARALLEL_SEARCH_FAILED",
+                        source="L2" if future == l2_future else "L3",
+                        error=str(e)
+                    )
+        
+        return l2_results, l3_results
     
     def search_by_tag(
         self,
@@ -823,12 +877,22 @@ class MemoryManager:
         results = []
         
         try:
+            collection_count = self.vector_store.collection.count()
+            
             where_filter = {"forgotten": {"$ne": True}}
             
             l2_results = self.vector_store.search(
                 query, 
                 n_results=top_k,
                 where=where_filter
+            )
+            
+            self._log.info(
+                "L2_SEARCH_DETAIL",
+                query=query[:50],
+                collection_count=collection_count,
+                returned_count=len(l2_results),
+                top_k=top_k
             )
             
             for r in l2_results:
@@ -845,6 +909,7 @@ class MemoryManager:
                 ))
         except Exception as e:
             print(f"L2搜索失败: {e}")
+            self._log.error("L2_SEARCH_FAILED", error=str(e))
         
         return results
     
@@ -966,6 +1031,10 @@ class MemoryManager:
         同时增加L3中的权重
         
         注意：sqlite_only 记录不会被回填（保持低质量记忆不污染向量空间）
+        
+        水位线机制：
+        - 只有当 L2 占用率低于 80% 时才允许回流
+        - 防止回流触发压缩迁移导致震荡
         """
         if result.source != "L3":
             return
@@ -978,6 +1047,22 @@ class MemoryManager:
             return
         
         try:
+            l2_count = len(self.vector_store)
+            l2_max = getattr(config, 'l2_max_capacity', 10000)
+            l2_usage = l2_count / l2_max if l2_max > 0 else 0
+            
+            HIGH_WATERMARK = 0.8
+            
+            if l2_usage >= HIGH_WATERMARK:
+                self._log.info(
+                    "BACKFLOW_BLOCKED_BY_WATERMARK",
+                    l2_count=l2_count,
+                    l2_max=l2_max,
+                    usage=f"{l2_usage:.1%}",
+                    watermark=f"{HIGH_WATERMARK:.0%}"
+                )
+                return
+            
             self.vector_store.add([result.text], [{
                 MemoryTags.TIMESTAMP: datetime.now().isoformat(),
                 "type": "backfill",
@@ -988,10 +1073,14 @@ class MemoryManager:
             self.sqlite.update_weight(record_id, boost=True)
             
             self.stats["l3_backfills"] += 1
-            print(f"L3回填: 记录 {record_id} 已存入L2并提升权重")
+            self._log.debug(
+                "L3_BACKFILL_SUCCESS",
+                record_id=record_id,
+                l2_usage=f"{l2_usage:.1%}"
+            )
             
         except Exception as e:
-            print(f"L3回填失败: {e}")
+            self._log.error("L3_BACKFILL_FAILED", error=str(e))
     
     def get_stats(self) -> Dict[str, Any]:
         """获取统计信息"""
