@@ -171,21 +171,27 @@ class ChatWindow:
         
         self._append_message("system", "正在初始化系统组件，请稍候...")
     
-    def _safe_after(self, delay: int, callback) -> Optional[str]:
+    def _safe_after(self, delay: int, callback, throttle: bool = False) -> Optional[str]:
         """
         安全的 window.after 调用
         
-        修复：回调执行后自动移除 after_id，防止内存泄漏
+        修复：
+        - 回调执行后自动移除 after_id，防止内存泄漏
+        - 支持 throttle 参数防止事件风暴
         
         Args:
             delay: 延迟毫秒数
             callback: 回调函数
+            throttle: 是否启用节流（默认 False）
         
         Returns:
             after_id 或 None（如果窗口正在关闭）
         """
         if self._closing:
             return None
+        
+        if throttle and delay == 0:
+            delay = 16
         
         after_id_holder = [None]
         
@@ -204,6 +210,20 @@ class ChatWindow:
             return after_id
         except tk.TclError:
             return None
+    
+    def _safe_after_throttled(self, callback) -> Optional[str]:
+        """
+        节流版 _safe_after
+        
+        用于高频 UI 更新，自动添加 16ms 延迟（约 60fps）
+        
+        Args:
+            callback: 回调函数
+        
+        Returns:
+            after_id 或 None
+        """
+        return self._safe_after(16, callback, throttle=True)
     
     def _cancel_all_after(self):
         """取消所有待执行的 after 回调"""

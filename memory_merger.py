@@ -21,15 +21,21 @@
 - 元数据深度合并：保留所有非冲突键值对
 - 事务保护：确保 SQLite 操作原子性
 - 冲突检测：检测时间/地点等实体冲突
+
+性能优化：
+- LSH (Locality Sensitive Hashing): O(n) 复杂度近似最近邻搜索
+- MinHash: 快速集合相似度估计
 """
 
 import threading
 import re
 import json
 import time
+import hashlib
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Dict, List, Optional, Tuple, Any, Set
+from collections import defaultdict
 import numpy as np
 
 from memory_tags import MemoryTags, MemoryTagHelper
@@ -62,6 +68,166 @@ class ConflictRecord:
     conflict_type: str = ""
     conflict_detail: str = ""
     timestamp: str = ""
+
+
+class MinHashLSH:
+    """
+    局部敏感哈希 (LSH) 实现
+    
+    用于快速近似最近邻搜索，将 O(n²) 复杂度降低到 O(n)
+    
+    设计原则：
+    - SRP: 仅负责 MinHash 签名生成和 LSH 索引
+    - 使用 MinHash 进行集合相似度估计
+    - 使用 LSH 进行快速候选筛选
+    
+    性能：
+    - 签名生成: O(k * n)，k 为哈希函数数量
+    - 候选查询: O(1) 平均时间
+    - 空间复杂度: O(n * k)
+    """
+    
+    def __init__(self, num_perm: int = 128, threshold: float = 0.5):
+        """
+        初始化 MinHash LSH
+        
+        Args:
+            num_perm: 排列数量（哈希函数数量）
+            threshold: 相似度阈值
+        """
+        self.num_perm = num_perm
+        self.threshold = threshold
+        self._bands = int(num_perm / 8)
+        self._rows = int(num_perm / self._bands)
+        self._index: Dict[int, Set[int]] = defaultdict(set)
+        self._signatures: Dict[int, List[int]] = {}
+        self._memory_map: Dict[int, Dict] = {}
+    
+    def _tokenize(self, text: str) -> Set[str]:
+        """
+        文本分词
+        
+        Args:
+            text: 输入文本
+        
+        Returns:
+            词元集合
+        """
+        words = re.findall(r'\w+', text.lower())
+        shingles = set()
+        for i in range(len(words) - 1):
+            shingles.add(f"{words[i]}_{words[i+1]}")
+        shingles.update(words)
+        return shingles
+    
+    def _compute_signature(self, tokens: Set[str]) -> List[int]:
+        """
+        计算 MinHash 签名
+        
+        Args:
+            tokens: 词元集合
+        
+        Returns:
+            MinHash 签名
+        """
+        signature = []
+        for i in range(self.num_perm):
+            min_hash = float('inf')
+            for token in tokens:
+                hash_val = int(hashlib.md5(f"{i}_{token}".encode()).hexdigest(), 16)
+                min_hash = min(min_hash, hash_val)
+            signature.append(min_hash)
+        return signature
+    
+    def _get_band_hashes(self, signature: List[int]) -> List[int]:
+        """
+        获取分带哈希值
+        
+        Args:
+            signature: MinHash 签名
+        
+        Returns:
+            分带哈希值列表
+        """
+        band_hashes = []
+        for b in range(self._bands):
+            start = b * self._rows
+            end = start + self._rows
+            band = tuple(signature[start:end])
+            band_hashes.append(hash(band))
+        return band_hashes
+    
+    def add(self, idx: int, text: str, memory: Dict = None):
+        """
+        添加记忆到索引
+        
+        Args:
+            idx: 记忆索引
+            text: 记忆文本
+            memory: 记忆对象
+        """
+        tokens = self._tokenize(text)
+        if not tokens:
+            return
+        
+        signature = self._compute_signature(tokens)
+        self._signatures[idx] = signature
+        self._memory_map[idx] = memory or {"text": text}
+        
+        band_hashes = self._get_band_hashes(signature)
+        for band_hash in band_hashes:
+            self._index[band_hash].add(idx)
+    
+    def query(self, text: str) -> List[Tuple[int, float]]:
+        """
+        查询相似记忆
+        
+        Args:
+            text: 查询文本
+        
+        Returns:
+            [(idx, similarity), ...] 相似记忆列表
+        """
+        tokens = self._tokenize(text)
+        if not tokens:
+            return []
+        
+        signature = self._compute_signature(tokens)
+        band_hashes = self._get_band_hashes(signature)
+        
+        candidates = set()
+        for band_hash in band_hashes:
+            candidates.update(self._index.get(band_hash, set()))
+        
+        results = []
+        for idx in candidates:
+            if idx in self._signatures:
+                similarity = self._estimate_similarity(signature, self._signatures[idx])
+                if similarity >= self.threshold:
+                    results.append((idx, similarity))
+        
+        results.sort(key=lambda x: x[1], reverse=True)
+        return results
+    
+    def _estimate_similarity(self, sig1: List[int], sig2: List[int]) -> float:
+        """
+        估计 Jaccard 相似度
+        
+        Args:
+            sig1: 签名1
+            sig2: 签名2
+        
+        Returns:
+            估计的相似度
+        """
+        matches = sum(1 for a, b in zip(sig1, sig2) if a == b)
+        return matches / len(sig1)
+    
+    def clear(self):
+        """清空索引"""
+        self._index.clear()
+        self._signatures.clear()
+        self._memory_map.clear()
 
 
 @dataclass
@@ -641,12 +807,62 @@ class MemoryMerger:
         self._ensure_embedding_service()
         
         if not self._embedding_service.is_available:
-            return [[m] for m in memories]
+            return self._find_similar_groups_lsh(memories)
         
         if use_ann and len(memories) > self.config.ann_threshold:
             return self._find_similar_groups_ann(memories)
         
         return self._find_similar_groups_exact(memories)
+    
+    def _find_similar_groups_lsh(self, memories: List[Dict]) -> List[List[Dict]]:
+        """
+        使用 LSH (局部敏感哈希) 聚类相似记忆
+        
+        当嵌入服务不可用时，使用 MinHashLSH 进行快速近似聚类
+        
+        时间复杂度: O(n * k) 其中 k 是签名长度
+        
+        Args:
+            memories: 记忆列表
+        
+        Returns:
+            相似记忆分组列表
+        """
+        if len(memories) < 2:
+            return [[m] for m in memories]
+        
+        lsh = MinHashLSH(num_perm=64, threshold=self.config.similarity_threshold - 0.1)
+        
+        for i, memory in enumerate(memories):
+            text = memory.get("text", "")
+            if text:
+                lsh.add(i, text, memory)
+        
+        groups = []
+        used = set()
+        
+        for i, memory in enumerate(memories):
+            if i in used:
+                continue
+            
+            text = memory.get("text", "")
+            if not text:
+                groups.append([memory])
+                continue
+            
+            similar = lsh.query(text)
+            group = [memory]
+            used.add(i)
+            
+            for idx, similarity in similar:
+                if idx not in used and idx < len(memories):
+                    group.append(memories[idx])
+                    used.add(idx)
+            
+            groups.append(group)
+        
+        lsh.clear()
+        return groups
     
     def _find_similar_groups_ann(self, memories: List[Dict]) -> List[List[Dict]]:
         """

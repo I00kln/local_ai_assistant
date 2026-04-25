@@ -26,8 +26,25 @@ import queue
 from typing import Dict, Any, Callable, Optional, List
 from dataclasses import dataclass, field
 from enum import Enum
-from datetime import datetime
 from logger import get_logger
+
+
+class RetrievalTimeoutError(Exception):
+    """
+    检索超时错误
+    
+    当读锁获取超时时抛出，表示数据状态不确定
+    
+    设计原则：
+    - 明确错误类型，便于上层处理
+    - 包含超时时间信息
+    - 支持安全降级（如只搜索 L1 内存）
+    """
+    
+    def __init__(self, timeout: float, message: str = None):
+        self.timeout = timeout
+        self.message = message or f"检索锁获取超时 ({timeout}s)，数据状态不确定"
+        super().__init__(self.message)
 
 
 class TaskType(Enum):
@@ -63,15 +80,57 @@ class TaskResult:
     details: Dict[str, Any] = field(default_factory=dict)
 
 
+PRIORITY_BOOST_THRESHOLD_SECONDS = 300.0
+STARVATION_THRESHOLD_SECONDS = 600.0
+
+
 @dataclass(order=True)
 class PrioritizedTask:
-    """优先级任务"""
+    """
+    优先级任务（支持优先级提升与饥饿检测）
+    
+    设计原则：
+    - 等待超过阈值时间的任务自动提升优先级
+    - 防止低优先级任务饥饿
+    - 饥饿检测：等待超过 STARVATION_THRESHOLD 的任务强制执行
+    """
     priority: int
     task_type: TaskType = field(compare=False)
     callback: Callable = field(compare=False)
     args: tuple = field(compare=False, default=())
     kwargs: dict = field(compare=False, default_factory=dict)
     submitted_at: float = field(compare=False, default_factory=time.time)
+    original_priority: int = field(compare=False, default=0)
+    
+    def __post_init__(self):
+        if self.original_priority == 0:
+            self.original_priority = self.priority
+    
+    def get_effective_priority(self) -> int:
+        """
+        获取有效优先级（考虑等待时间提升）
+        
+        Returns:
+            调整后的优先级
+        """
+        wait_time = time.time() - self.submitted_at
+        
+        if wait_time >= PRIORITY_BOOST_THRESHOLD_SECONDS:
+            boost_levels = int(wait_time / PRIORITY_BOOST_THRESHOLD_SECONDS)
+            new_priority = max(1, self.original_priority - boost_levels)
+            return new_priority
+        
+        return self.priority
+    
+    def is_starving(self) -> bool:
+        """
+        检测任务是否饥饿
+        
+        Returns:
+            是否处于饥饿状态
+        """
+        wait_time = time.time() - self.submitted_at
+        return wait_time >= STARVATION_THRESHOLD_SECONDS
 
 
 class BackgroundTaskScheduler:
@@ -213,6 +272,26 @@ class BackgroundTaskScheduler:
                 
                 if task.priority == 0:
                     continue
+                
+                if task.is_starving():
+                    wait_time = time.time() - task.submitted_at
+                    self._log.warning(
+                        "TASK_STARVATION_DETECTED",
+                        task_type=task.task_type.value,
+                        wait_time_seconds=round(wait_time, 1),
+                        original_priority=task.original_priority
+                    )
+                
+                effective_priority = task.get_effective_priority()
+                if effective_priority < task.original_priority:
+                    wait_time = time.time() - task.submitted_at
+                    self._log.info(
+                        "TASK_PRIORITY_BOOSTED",
+                        task_type=task.task_type.value,
+                        original_priority=task.original_priority,
+                        new_priority=effective_priority,
+                        wait_time_seconds=round(wait_time, 1)
+                    )
                 
                 result = self._execute_task(task)
                 
@@ -587,7 +666,11 @@ class _ReadLockContext:
     """
     读锁上下文管理器
     
-    支持超时机制，超时后可选择降级执行
+    支持超时机制，超时后抛出 RetrievalTimeoutError
+    
+    设计原则：
+    - 不在超时时静默降级，避免读取不一致数据
+    - 抛出明确异常，由上层决定降级策略
     """
     
     def __init__(self, scheduler: BackgroundTaskScheduler, timeout: float = 5.0):
@@ -599,9 +682,11 @@ class _ReadLockContext:
         self._acquired = self._scheduler.acquire_read(self._timeout)
         if not self._acquired:
             self._scheduler._log.warning(
-                "READ_LOCK_FALLBACK",
-                message="读锁获取超时，降级为无锁搜索"
+                "READ_LOCK_TIMEOUT",
+                timeout=self._timeout,
+                message="读锁获取超时，抛出 RetrievalTimeoutError"
             )
+            raise RetrievalTimeoutError(self._timeout)
         return self
     
     def __exit__(self, exc_type, exc_val, exc_tb):

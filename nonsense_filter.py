@@ -3,6 +3,7 @@
 import os
 import re
 import json
+import time
 import threading
 import numpy as np
 from typing import List, Dict, Tuple, Optional
@@ -11,6 +12,7 @@ from datetime import datetime
 from config import config
 from memory_tags import MemoryTagHelper, MemoryConstants
 from thread_pool_manager import submit_cpu_task
+from logger import get_logger, get_trace_id
 
 
 @dataclass
@@ -127,6 +129,7 @@ class NonsenseFilter:
     def __init__(self, nonsense_db_path: str = "nonsense_library.json"):
         self.nonsense_db_path = nonsense_db_path
         self.dimension = config.embedding_dimension
+        self._log = get_logger()
         
         self._embedding_service = None
         self._model_lock = threading.Lock()
@@ -140,9 +143,9 @@ class NonsenseFilter:
         
         self._exact_hashes = self._build_exact_hashes()
         
-        self.length_threshold = 10
-        self.density_threshold = 0.15
-        self.similarity_threshold = 0.85
+        self.length_threshold = config.nonsense_filter.length_threshold
+        self.density_threshold = config.nonsense_filter.density_threshold
+        self.similarity_threshold = config.nonsense_filter.similarity_threshold
         
         self.stats = {
             "total_checked": 0,
@@ -222,13 +225,29 @@ class NonsenseFilter:
     def _start_vector_precompute_thread(self):
         """启动后台线程预计算向量"""
         def compute_vectors_background():
-            """后台计算向量"""
+            """后台计算向量（无硬编码超时）"""
             try:
-                self._ready_event.wait(timeout=30.0)
+                max_wait_iterations = config.nonsense_filter.model_wait_max_iterations
+                wait_interval = config.nonsense_filter.model_wait_interval
+                iterations = 0
+                
+                while iterations < max_wait_iterations:
+                    if self._ready_event.is_set():
+                        break
+                    
+                    if self._embedding_service is not None:
+                        break
+                    
+                    time.sleep(wait_interval)
+                    iterations += 1
+                    
+                    if iterations % 10 == 0:
+                        print(f"废话过滤器：等待模型加载... ({iterations}s)")
                 
                 self._ensure_model_loaded()
                 
                 if not self._embedding_service.is_available:
+                    print("废话过滤器：模型不可用，稍后重试")
                     return
                 
                 vectors = []
@@ -495,6 +514,7 @@ class NonsenseFilter:
         - discard: 完全丢弃
         """
         import hashlib
+        trace_id = get_trace_id()
         self.stats["total_checked"] += 1
         
         combined_text = f"用户: {user_input}\n助理: {assistant_response}"
@@ -502,6 +522,10 @@ class NonsenseFilter:
         if self._check_protected(combined_text):
             self.stats["passed"] += 1
             protected_metadata = MemoryTagHelper.mark_protected({}, "auto_detected_by_filter")
+            self._log.debug("NONSENSE_FILTER_PROTECTED",
+                          trace_id=trace_id,
+                          reason="受保护内容",
+                          preview=combined_text[:50])
             return FilterResult(
                 is_nonsense=False,
                 reason="受保护内容（纠错/情感/重要信息）",
@@ -513,6 +537,10 @@ class NonsenseFilter:
         text_hash = hashlib.md5(combined_text.strip().encode('utf-8')).hexdigest()
         if text_hash in self._exact_hashes:
             self.stats["hash_filtered"] += 1
+            self._log.debug("NONSENSE_FILTER_HASH_MATCH",
+                          trace_id=trace_id,
+                          reason="Hash精确匹配",
+                          storage_type="discard")
             return FilterResult(
                 is_nonsense=True,
                 reason="Hash精确匹配：高频废话",
@@ -524,6 +552,11 @@ class NonsenseFilter:
         if is_nonsense:
             self.stats["rule_filtered"] += 1
             storage_type = "discard" if confidence > 0.9 else "sqlite_only"
+            self._log.debug("NONSENSE_FILTER_RULE_MATCH",
+                          trace_id=trace_id,
+                          reason="规则过滤",
+                          confidence=round(confidence, 2),
+                          storage_type=storage_type)
             return FilterResult(
                 is_nonsense=True,
                 reason="规则过滤：明显无意义内容",

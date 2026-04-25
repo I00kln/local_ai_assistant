@@ -96,6 +96,10 @@ class MemoryTags:
     SQLITE_ID = "sqlite_id"
     IS_SQLITE_ONLY = "is_sqlite_only"
     
+    # Token 计数缓存
+    TOKEN_COUNT = "token_count"
+    TOKEN_COUNT_UPDATED = "token_count_updated"
+    
     # 过滤相关
     NONSENSE_FILTER_RESULT = "nonsense_filter_result"
     
@@ -197,6 +201,43 @@ class MemoryTagHelper:
         metadata.pop(MemoryTags.PENDING_COMPRESSION, None)
         metadata.pop(MemoryTags.PENDING_SINCE, None)
         return metadata
+    
+    @staticmethod
+    def set_token_count(metadata: dict, token_count: int) -> dict:
+        """
+        设置 Token 计数缓存
+        
+        设计原则：
+        - 在记忆创建或压缩时计算并缓存 token 数
+        - 避免重复计算，提升上下文构建性能
+        
+        Args:
+            metadata: 记忆元数据
+            token_count: token 数量
+        
+        Returns:
+            更新后的元数据
+        """
+        if metadata is None:
+            metadata = {}
+        metadata[MemoryTags.TOKEN_COUNT] = token_count
+        metadata[MemoryTags.TOKEN_COUNT_UPDATED] = datetime.now().isoformat()
+        return metadata
+    
+    @staticmethod
+    def get_token_count(metadata: dict) -> Optional[int]:
+        """
+        获取缓存的 Token 计数
+        
+        Args:
+            metadata: 记忆元数据
+        
+        Returns:
+            token 数量，如果未缓存则返回 None
+        """
+        if metadata is None:
+            return None
+        return metadata.get(MemoryTags.TOKEN_COUNT)
     
     @staticmethod
     def is_compressed(metadata: dict) -> bool:

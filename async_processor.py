@@ -68,6 +68,9 @@ class AsyncMemoryProcessor:
         self.batch_buffer: List[Dict] = []
         self.batch_size = self._mem_config.async_processor.batch_size
         
+        self._wal_path = "memory_buffer.wal"
+        self._wal_lock = threading.Lock()
+        
         self._last_dedup_time = time.time()
         self._last_compression_time = time.time()
         self._last_forget_time = time.time()
@@ -203,11 +206,13 @@ class AsyncMemoryProcessor:
         3. L2→L3迁移崩溃导致的迁移中记录（is_vectorized=3）
         4. L3→L2回流崩溃导致的回流中记录（is_vectorized=4）
         5. 队列满时溢出到文件缓冲的数据
+        6. WAL 文件中未持久化的记忆
         
         防重复机制：
         - 添加向量前先搜索是否已存在相同文本（相似度>0.99）
         - 如果存在则更新SQLite状态，不重复添加
         """
+        self._recover_from_wal()
         self._recover_overflow_buffer()
         
         if not self.sqlite:
@@ -496,6 +501,7 @@ class AsyncMemoryProcessor:
         remaining = self.pending_queue.qsize()
         
         self._flush_buffer()
+        self._clear_wal()
         
         if remaining > 0:
             self._save_remaining_to_overflow_buffer()
@@ -1262,6 +1268,7 @@ class AsyncMemoryProcessor:
                 "text": conversation_memory,
                 "metadata": metadata
             })
+            self._write_to_wal(conversation_memory, metadata)
             
             if len(self.batch_buffer) >= self.batch_size:
                 should_flush = True
@@ -1328,6 +1335,7 @@ class AsyncMemoryProcessor:
         
         if not tx_coordinator or not tx_coordinator._sqlite_store:
             self._flush_buffer_without_transaction(texts, metadatas)
+            self._clear_wal()
             return
         
         text_hashes = [self.sqlite.compute_text_hash(text) for text in texts] if self.sqlite else []
@@ -1508,6 +1516,7 @@ class AsyncMemoryProcessor:
                           count=len(texts_to_vectorize),
                           transaction_id=result["transaction_id"])
             self._last_flush_time = time.time()
+            self._clear_wal()
             
             self._event_bus.publish(
                 EventType.MEMORY_WRITTEN,
@@ -1670,6 +1679,98 @@ class AsyncMemoryProcessor:
         except Exception as e:
             self._log.warning("FALLBACK_TX_UPDATE_FAILED", 
                             transaction_id=tx_id, error=str(e))
+    
+    def _write_to_wal(self, text: str, metadata: Dict):
+        """
+        写入预写式日志 (WAL)
+        
+        设计原则：
+        - 在添加到 batch_buffer 的同时写入 WAL
+        - 确保崩溃后可恢复未持久化的记忆
+        - 使用 JSON Lines 格式，每行一条记录
+        
+        Args:
+            text: 记忆文本
+            metadata: 元数据
+        """
+        with self._wal_lock:
+            try:
+                with open(self._wal_path, 'a', encoding='utf-8') as f:
+                    record = {
+                        "text": text,
+                        "metadata": metadata,
+                        "timestamp": time.time()
+                    }
+                    f.write(json.dumps(record, ensure_ascii=False) + "\n")
+            except Exception as e:
+                self._log.error("WAL_WRITE_FAILED", error=str(e))
+    
+    def _clear_wal(self):
+        """
+        清除预写式日志
+        
+        在缓冲区成功刷入磁盘后调用
+        """
+        with self._wal_lock:
+            try:
+                if os.path.exists(self._wal_path):
+                    os.remove(self._wal_path)
+            except Exception as e:
+                self._log.warning("WAL_CLEAR_FAILED", error=str(e))
+    
+    def _recover_from_wal(self):
+        """
+        从预写式日志恢复未持久化的记忆
+        
+        在系统启动时调用，检查是否存在未完成的 WAL 文件
+        """
+        if not os.path.exists(self._wal_path):
+            return 0
+        
+        recovered_count = 0
+        
+        with self._wal_lock:
+            try:
+                with open(self._wal_path, 'r', encoding='utf-8') as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        
+                        try:
+                            record = json.loads(line)
+                            text = record.get("text", "")
+                            metadata = record.get("metadata", {})
+                            
+                            if text:
+                                if self.sqlite:
+                                    memory_record = MemoryRecord(
+                                        text=text,
+                                        metadata=metadata,
+                                        source="wal_recovery"
+                                    )
+                                    self.sqlite.add(memory_record)
+                                    recovered_count += 1
+                        except json.JSONDecodeError:
+                            continue
+                
+                if recovered_count > 0:
+                    self._log.info("WAL_RECOVERY_COMPLETE", count=recovered_count)
+                    os.remove(self._wal_path)
+                    
+            except Exception as e:
+                self._log.error("WAL_RECOVERY_FAILED", error=str(e))
+        
+        return recovered_count
+    
+    def flush_buffer(self):
+        """
+        显式刷新缓冲区
+        
+        用于优雅退出时确保所有数据持久化
+        """
+        self._flush_buffer()
+        self._clear_wal()
     
     def _retry_failed_vectorizations(self):
         """

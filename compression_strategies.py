@@ -2,6 +2,7 @@
 # 压缩策略模块 - 从 async_processor.py 拆分
 import re
 import time
+import threading
 from abc import ABC, abstractmethod
 from typing import Optional, Tuple, List
 
@@ -32,30 +33,37 @@ class CompressionStrategy(ABC):
 
 class LLMCompressionStrategy(CompressionStrategy):
     """
-    LLM 压缩策略 - 带熔断器
+    LLM 压缩策略 - 带全局熔断器
     
     熔断器状态机：
     - CLOSED: 正常状态，允许请求
     - OPEN: 熔断状态，拒绝请求
     - HALF_OPEN: 半开状态，允许探测请求
     
+    设计原则：
+    - 熔断器状态为类变量，所有实例共享
+    - 使用类锁确保线程安全
+    - 保护 LLM 接口免受过载
+    
     常量说明：
     - COMPRESSOR_CHECK_INTERVAL: 压缩器可用性检查间隔（秒）
-    - LONG_TEXT_THRESHOLD: 长文本阈值，超过此值使用云端压缩
-    - CHUNK_TEXT_THRESHOLD: 分块压缩阈值，超过此值分块处理
-    - CHUNK_SIZE: 分块大小
     """
     
     COMPRESSOR_CHECK_INTERVAL = 300
-    LONG_TEXT_THRESHOLD = 10000
-    CHUNK_TEXT_THRESHOLD = 6000
-    CHUNK_SIZE = 3000
-    MAX_COMPRESSION_RATIO = 0.7
     LONG_TEXT_COMPRESSION_RATIO = 0.8
     
     _DEFAULT_CB_THRESHOLD = 5
     _DEFAULT_CB_RESET_TIMEOUT = 300
     _DEFAULT_CB_HALF_OPEN_WINDOW = 30
+    
+    _class_lock = threading.Lock()
+    _shared_circuit_breaker = {
+        "failures": 0,
+        "last_failure": 0,
+        "open_until": 0,
+        "threshold": _DEFAULT_CB_THRESHOLD,
+        "reset_timeout": _DEFAULT_CB_RESET_TIMEOUT
+    }
     
     def __init__(self, mem_config):
         self._mem_config = mem_config
@@ -67,17 +75,16 @@ class LLMCompressionStrategy(CompressionStrategy):
         
         self._cb_half_open_window = self._DEFAULT_CB_HALF_OPEN_WINDOW
         
-        self._circuit_breaker = {
-            "failures": 0,
-            "last_failure": 0,
-            "open_until": 0,
-            "threshold": self._DEFAULT_CB_THRESHOLD,
-            "reset_timeout": self._DEFAULT_CB_RESET_TIMEOUT
-        }
+        self._long_text_threshold = mem_config.compression.long_text_threshold
+        self._chunk_text_threshold = mem_config.compression.chunk_text_threshold
+        self._chunk_size = mem_config.compression.chunk_size
+        self._max_compression_ratio = mem_config.compression.max_compression_ratio
+        
         try:
             async_config = mem_config.async_processor
-            self._circuit_breaker["threshold"] = getattr(async_config, 'circuit_breaker_threshold', self._DEFAULT_CB_THRESHOLD)
-            self._circuit_breaker["reset_timeout"] = getattr(async_config, 'circuit_breaker_reset_timeout', self._DEFAULT_CB_RESET_TIMEOUT)
+            with self._class_lock:
+                self._shared_circuit_breaker["threshold"] = getattr(async_config, 'circuit_breaker_threshold', self._DEFAULT_CB_THRESHOLD)
+                self._shared_circuit_breaker["reset_timeout"] = getattr(async_config, 'circuit_breaker_reset_timeout', self._DEFAULT_CB_RESET_TIMEOUT)
         except Exception:
             pass
     
@@ -95,12 +102,13 @@ class LLMCompressionStrategy(CompressionStrategy):
     def is_available(self) -> bool:
         current_time = time.time()
         
-        if current_time < self._circuit_breaker["open_until"]:
-            if current_time > self._circuit_breaker["open_until"] - self._cb_half_open_window:
-                if self._probe_connection():
-                    self._log.info("CIRCUIT_BREAKER_HALF_OPEN_SUCCESS")
-                    return True
-            return False
+        with self._class_lock:
+            if current_time < self._shared_circuit_breaker["open_until"]:
+                if current_time > self._shared_circuit_breaker["open_until"] - self._cb_half_open_window:
+                    if self._probe_connection():
+                        self._log.info("CIRCUIT_BREAKER_HALF_OPEN_SUCCESS")
+                        return True
+                return False
         
         check_interval = self._get_check_interval()
         if current_time - self._last_check < check_interval:
@@ -139,22 +147,24 @@ class LLMCompressionStrategy(CompressionStrategy):
             pass
     
     def _record_failure(self, error: str):
-        """记录失败"""
-        self._circuit_breaker["failures"] += 1
-        self._circuit_breaker["last_failure"] = time.time()
-        
-        if self._circuit_breaker["failures"] >= self._circuit_breaker["threshold"]:
-            self._circuit_breaker["open_until"] = time.time() + self._circuit_breaker["reset_timeout"]
-            self._log.warning(
-                "CIRCUIT_BREAKER_OPENED",
-                failures=self._circuit_breaker["failures"],
-                reset_timeout=self._circuit_breaker["reset_timeout"]
-            )
+        """记录失败（全局熔断器）"""
+        with self._class_lock:
+            self._shared_circuit_breaker["failures"] += 1
+            self._shared_circuit_breaker["last_failure"] = time.time()
+            
+            if self._shared_circuit_breaker["failures"] >= self._shared_circuit_breaker["threshold"]:
+                self._shared_circuit_breaker["open_until"] = time.time() + self._shared_circuit_breaker["reset_timeout"]
+                self._log.warning(
+                    "CIRCUIT_BREAKER_OPENED",
+                    failures=self._shared_circuit_breaker["failures"],
+                    reset_timeout=self._shared_circuit_breaker["reset_timeout"]
+                )
     
     def _reset_circuit_breaker(self):
-        """重置熔断器"""
-        self._circuit_breaker["failures"] = 0
-        self._circuit_breaker["open_until"] = 0
+        """重置熔断器（全局）"""
+        with self._class_lock:
+            self._shared_circuit_breaker["failures"] = 0
+            self._shared_circuit_breaker["open_until"] = 0
     
     @property
     def name(self) -> str:
@@ -167,10 +177,10 @@ class LLMCompressionStrategy(CompressionStrategy):
         
         text_len = len(text)
         
-        if text_len > self.LONG_TEXT_THRESHOLD:
+        if text_len > self._long_text_threshold:
             return self._compress_long_text(text)
         
-        if text_len > self.CHUNK_TEXT_THRESHOLD:
+        if text_len > self._chunk_text_threshold:
             return self._compress_chunked_text(text)
         
         return self._compress_single_text(text)
@@ -201,7 +211,7 @@ class LLMCompressionStrategy(CompressionStrategy):
             current_len = 0
             
             for line in lines:
-                if current_len + len(line) > self.CHUNK_SIZE and current_chunk:
+                if current_len + len(line) > self._chunk_size and current_chunk:
                     chunks.append('\n'.join(current_chunk))
                     current_chunk = []
                     current_len = 0
@@ -222,7 +232,7 @@ class LLMCompressionStrategy(CompressionStrategy):
             
             merged = '\n'.join(compressed_chunks)
             
-            if len(merged) < len(text) * self.MAX_COMPRESSION_RATIO:
+            if len(merged) < len(text) * self._max_compression_ratio:
                 return self._compress_single_text(merged)
             
             return merged
@@ -292,15 +302,14 @@ class RuleBasedCompressionStrategy(CompressionStrategy):
     当 LLM 不可用时使用规则进行压缩
     
     常量说明：
-    - MAX_KEY_SENTENCES: 最大保留关键句数
     - TARGET_RATIO_BUFFER: 目标压缩比率缓冲值
     """
     
-    MAX_KEY_SENTENCES = 5
     TARGET_RATIO_BUFFER = 0.1
     
     def __init__(self, mem_config):
         self._mem_config = mem_config
+        self._max_key_sentences = mem_config.compression.max_key_sentences
     
     def compress(self, text: str) -> Optional[str]:
         parts = re.split(r'([。！？\n])', text)
@@ -329,7 +338,7 @@ class RuleBasedCompressionStrategy(CompressionStrategy):
         max_segment = self._mem_config.compression.max_segment_length
         
         if key_sentences:
-            compressed = ''.join(key_sentences[:self.MAX_KEY_SENTENCES])
+            compressed = ''.join(key_sentences[:self._max_key_sentences])
             if len(compressed) < len(text) * target_ratio:
                 return compressed
         

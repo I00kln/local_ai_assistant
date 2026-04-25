@@ -409,7 +409,11 @@ class MemoryArchiver:
     
     def start_auto_archive(self, interval_hours: int = 24):
         """
-        启动自动归档线程
+        启动自动归档（使用统一调度器）
+        
+        重构说明：
+        - 使用 BackgroundScheduler 替代独立线程
+        - 避免线程爆炸，统一管理后台任务
         
         Args:
             interval_hours: 归档间隔（小时）
@@ -418,7 +422,49 @@ class MemoryArchiver:
             return
         
         self._running = True
+        self._interval_hours = interval_hours
         
+        try:
+            from background_scheduler import get_background_scheduler, TaskType
+            
+            scheduler = get_background_scheduler()
+            
+            def archive_task():
+                if not self._running:
+                    return
+                try:
+                    from sqlite_store import get_sqlite_store
+                    from vector_store import get_vector_store
+                    
+                    sqlite = get_sqlite_store()
+                    vector = get_vector_store()
+                    
+                    self.archive_memories(sqlite, vector)
+                except Exception as e:
+                    print(f"[归档] 自动归档失败: {e}")
+            
+            scheduler.schedule_periodic(
+                task_id="auto_archive",
+                interval_seconds=interval_hours * 3600,
+                fn=archive_task,
+                task_type=TaskType.MAINTENANCE
+            )
+            
+            print(f"[归档] 自动归档已启动（使用 BackgroundScheduler），间隔 {interval_hours} 小时")
+            
+        except ImportError:
+            print("[归档] BackgroundScheduler 不可用，使用独立线程")
+            self._start_archive_thread(interval_hours)
+        
+        self._register_lifecycle()
+    
+    def _start_archive_thread(self, interval_hours: int):
+        """
+        启动独立归档线程（后备方案）
+        
+        Args:
+            interval_hours: 归档间隔（小时）
+        """
         def archive_loop():
             from sqlite_store import get_sqlite_store
             from vector_store import get_vector_store
@@ -429,7 +475,6 @@ class MemoryArchiver:
             while self._running:
                 try:
                     self.archive_memories(sqlite, vector)
-                    
                 except Exception as e:
                     print(f"[归档] 自动归档失败: {e}")
                 
@@ -440,9 +485,6 @@ class MemoryArchiver:
         
         self._thread = threading.Thread(target=archive_loop, daemon=True)
         self._thread.start()
-        print(f"[归档] 自动归档已启动，间隔 {interval_hours} 小时")
-        
-        self._register_lifecycle()
     
     def _register_lifecycle(self):
         """注册到生命周期管理器"""

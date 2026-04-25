@@ -5,7 +5,7 @@ from typing import Dict, List, Optional, Any, Callable
 from datetime import datetime
 from dataclasses import dataclass
 from enum import Enum
-from logger import get_logger
+from logger import get_logger, get_trace_id
 from memory_tags import MemoryTags
 
 
@@ -41,6 +41,13 @@ class TransactionRecord:
     data: Dict[str, Any]
     phase: TransactionPhase = TransactionPhase.INIT
     error_message: Optional[str] = None
+    sqlite_id: Optional[str] = None
+    vector_id: Optional[str] = None
+    affected_ids: List[str] = None
+    
+    def __post_init__(self):
+        if self.affected_ids is None:
+            self.affected_ids = []
 
 
 class TransactionCoordinator:
@@ -83,7 +90,10 @@ class TransactionCoordinator:
             created_time TEXT NOT NULL,
             updated_time TEXT NOT NULL,
             data TEXT,
-            error_message TEXT
+            error_message TEXT,
+            sqlite_id TEXT,
+            vector_id TEXT,
+            affected_ids TEXT
         )
     """
     
@@ -94,6 +104,18 @@ class TransactionCoordinator:
     
     TRANSACTION_PHASE_MIGRATION_SQL = """
         ALTER TABLE transactions ADD COLUMN phase TEXT NOT NULL DEFAULT 'init'
+    """
+    
+    TRANSACTION_VECTOR_ID_MIGRATION_SQL = """
+        ALTER TABLE transactions ADD COLUMN vector_id TEXT
+    """
+    
+    TRANSACTION_SQLITE_ID_MIGRATION_SQL = """
+        ALTER TABLE transactions ADD COLUMN sqlite_id TEXT
+    """
+    
+    TRANSACTION_AFFECTED_IDS_MIGRATION_SQL = """
+        ALTER TABLE transactions ADD COLUMN affected_ids TEXT
     """
     
     def __new__(cls):
@@ -142,6 +164,24 @@ class TransactionCoordinator:
                 except Exception:
                     pass
                 
+                try:
+                    cursor.execute(self.TRANSACTION_VECTOR_ID_MIGRATION_SQL)
+                    self._log.debug("TRANSACTION_TABLE_VECTOR_ID_MIGRATED")
+                except Exception:
+                    pass
+                
+                try:
+                    cursor.execute(self.TRANSACTION_SQLITE_ID_MIGRATION_SQL)
+                    self._log.debug("TRANSACTION_TABLE_SQLITE_ID_MIGRATED")
+                except Exception:
+                    pass
+                
+                try:
+                    cursor.execute(self.TRANSACTION_AFFECTED_IDS_MIGRATION_SQL)
+                    self._log.debug("TRANSACTION_TABLE_AFFECTED_IDS_MIGRATED")
+                except Exception:
+                    pass
+                
                 conn.commit()
                 self._tx_table_initialized = True
                 self._log.debug("TRANSACTION_TABLE_INITIALIZED")
@@ -167,8 +207,8 @@ class TransactionCoordinator:
                 cursor.execute("""
                     INSERT OR REPLACE INTO transactions 
                     (transaction_id, operation_type, state, phase, created_time, 
-                     updated_time, data, error_message)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                     updated_time, data, error_message, sqlite_id, vector_id, affected_ids)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
                     tx_record.transaction_id,
                     tx_record.operation_type,
@@ -177,7 +217,10 @@ class TransactionCoordinator:
                     tx_record.created_time.isoformat(),
                     tx_record.updated_time.isoformat(),
                     json.dumps(tx_record.data, ensure_ascii=False),
-                    tx_record.error_message
+                    tx_record.error_message,
+                    tx_record.sqlite_id,
+                    tx_record.vector_id,
+                    json.dumps(tx_record.affected_ids, ensure_ascii=False)
                 ))
                 conn.commit()
                 return True
@@ -426,6 +469,7 @@ class TransactionCoordinator:
                 "error": str (if failed)
             }
         """
+        trace_id = get_trace_id()
         tx_id = transaction_id or f"{operation_type}_{int(time.time() * 1000)}"
         
         tx_record = TransactionRecord(
@@ -435,12 +479,17 @@ class TransactionCoordinator:
             phase=TransactionPhase.INIT,
             created_time=datetime.now(),
             updated_time=datetime.now(),
-            data={"phase": "init", **data}
+            data={"phase": "init", "trace_id": trace_id, **data}
         )
         
         self._transactions[tx_id] = tx_record
         
         self._persist_transaction(tx_record)
+        
+        self._log.debug("TRANSACTION_STARTED",
+                       trace_id=trace_id,
+                       transaction_id=tx_id,
+                       operation_type=operation_type)
         
         try:
             tx_record.state = TransactionState.PREPARING
@@ -452,9 +501,16 @@ class TransactionCoordinator:
             prepare_result = prepare_fn(data)
             tx_record.data["prepare_result"] = prepare_result
             
+            if isinstance(prepare_result, dict):
+                tx_record.sqlite_id = prepare_result.get("sqlite_id") or prepare_result.get("id")
+            
             tx_record.phase = TransactionPhase.PREPARED
             tx_record.data["phase"] = "prepared"
             self._update_transaction_state(tx_id, TransactionState.PREPARING, TransactionPhase.PREPARED)
+            
+            self._log.debug("TRANSACTION_PREPARED",
+                           trace_id=trace_id,
+                           transaction_id=tx_id)
             
             tx_record.phase = TransactionPhase.COMMITTING
             tx_record.data["phase"] = "committing"
@@ -462,6 +518,18 @@ class TransactionCoordinator:
             
             commit_result = commit_fn(data)
             tx_record.data["commit_result"] = commit_result
+            
+            if isinstance(commit_result, dict):
+                tx_record.vector_id = commit_result.get("vector_id") or commit_result.get("id")
+            elif isinstance(commit_result, list) and commit_result:
+                first_result = commit_result[0]
+                if isinstance(first_result, str):
+                    tx_record.vector_id = first_result
+                elif isinstance(first_result, dict):
+                    tx_record.vector_id = first_result.get("id")
+            
+            if tx_record.sqlite_id or tx_record.vector_id:
+                self._persist_transaction(tx_record)
             
             tx_record.phase = TransactionPhase.COMMITTED
             tx_record.data["phase"] = "committed"
@@ -498,6 +566,8 @@ class TransactionCoordinator:
                 try:
                     tx_record.phase = TransactionPhase.ROLLING_BACK
                     tx_record.data["phase"] = "rolling_back"
+                    tx_record.data["sqlite_id"] = tx_record.sqlite_id
+                    tx_record.data["vector_id"] = tx_record.vector_id
                     self._update_transaction_state(tx_id, TransactionState.FAILED, TransactionPhase.ROLLING_BACK)
                     
                     rollback_fn(tx_record.data)
@@ -902,6 +972,119 @@ class TransactionCoordinator:
                     self._log.debug("DB_TRANSACTION_CLEANUP", count=deleted)
         except Exception as e:
             self._log.error("DB_TRANSACTION_CLEANUP_FAILED", error=str(e))
+    
+    def cleanup_orphan_vectors(self) -> Dict[str, int]:
+        """
+        清理孤儿向量数据（双向同步）
+        
+        设计原则：
+        - 对比 SQLite 和 ChromaDB 的 ID 全集
+        - 清理向量库中存在但数据库中不存在的孤儿向量
+        - 修复数据库中标记为已向量化但向量库中不存在的孤儿记录
+        - 记录清理统计信息
+        
+        Returns:
+            {
+                "cleaned_vectors": int,  # 清理的孤儿向量数
+                "fixed_records": int,    # 修复的孤儿记录数
+                "total_vector": int, 
+                "total_sqlite": int
+            }
+        """
+        if not self._sqlite_store or not self._vector_store:
+            return {"cleaned_vectors": 0, "fixed_records": 0, "error": "stores not available"}
+        
+        try:
+            sqlite_vectorized = {}
+            with self._sqlite_store._get_read_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT id, vector_id FROM memories WHERE is_vectorized = 1")
+                for row in cursor.fetchall():
+                    sqlite_vectorized[str(row[0])] = row[1]
+            
+            vector_ids = set()
+            try:
+                if self._vector_store.collection:
+                    all_vectors = self._vector_store.collection.get()
+                    vector_ids = set(all_vectors.get("ids", []))
+            except Exception as e:
+                self._log.error("ORPHAN_CLEANUP_VECTOR_FETCH_FAILED", error=str(e))
+                return {"cleaned_vectors": 0, "fixed_records": 0, "error": str(e)}
+            
+            sqlite_ids = set(sqlite_vectorized.keys())
+            
+            orphan_vector_ids = vector_ids - sqlite_ids
+            
+            cleaned_vectors = 0
+            if orphan_vector_ids:
+                try:
+                    self._vector_store.collection.delete(ids=list(orphan_vector_ids))
+                    cleaned_vectors = len(orphan_vector_ids)
+                    self._log.info("ORPHAN_VECTORS_CLEANED", 
+                                  count=cleaned_vectors,
+                                  total_vector=len(vector_ids),
+                                  total_sqlite=len(sqlite_ids))
+                except Exception as e:
+                    self._log.error("ORPHAN_VECTORS_DELETE_FAILED", 
+                                   count=len(orphan_vector_ids),
+                                   error=str(e))
+            
+            fixed_records = 0
+            for sqlite_id, vector_id in sqlite_vectorized.items():
+                if vector_id and vector_id not in vector_ids:
+                    try:
+                        self._sqlite_store.update_vector_status(sqlite_id, "", is_vectorized=0)
+                        fixed_records += 1
+                        self._log.debug("ORPHAN_RECORD_FIXED",
+                                       sqlite_id=sqlite_id,
+                                       missing_vector_id=vector_id)
+                    except Exception as e:
+                        self._log.error("ORPHAN_RECORD_FIX_FAILED",
+                                       sqlite_id=sqlite_id,
+                                       error=str(e))
+            
+            if fixed_records > 0:
+                self._log.info("ORPHAN_RECORDS_FIXED",
+                              count=fixed_records,
+                              message="SQLite 记录标记为已向量化但向量库中不存在，已重置为未向量化")
+            
+            return {
+                "cleaned_vectors": cleaned_vectors,
+                "fixed_records": fixed_records,
+                "total_vector": len(vector_ids),
+                "total_sqlite": len(sqlite_ids)
+            }
+            
+        except Exception as e:
+            self._log.error("ORPHAN_CLEANUP_FAILED", error=str(e))
+            return {"cleaned_vectors": 0, "fixed_records": 0, "error": str(e)}
+    
+    def schedule_orphan_cleanup(self, interval_hours: int = 24):
+        """
+        调度定期孤儿清理任务
+        
+        Args:
+            interval_hours: 清理间隔（小时）
+        """
+        try:
+            from background_scheduler import get_background_scheduler, TaskType
+            
+            scheduler = get_background_scheduler()
+            
+            def cleanup_task():
+                self.cleanup_orphan_vectors()
+            
+            scheduler.schedule_periodic(
+                task_id="orphan_cleanup",
+                interval_seconds=interval_hours * 3600,
+                fn=cleanup_task,
+                task_type=TaskType.MAINTENANCE
+            )
+            
+            self._log.info("ORPHAN_CLEANUP_SCHEDULED", interval_hours=interval_hours)
+            
+        except Exception as e:
+            self._log.error("ORPHAN_CLEANUP_SCHEDULE_FAILED", error=str(e))
 
 
 _transaction_coordinator: Optional[TransactionCoordinator] = None

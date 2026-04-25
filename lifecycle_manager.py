@@ -12,7 +12,8 @@
 """
 import threading
 import time
-from typing import Callable, Dict, List, Optional, Tuple
+import weakref
+from typing import Callable, Dict, List, Optional
 from dataclasses import dataclass, field
 from enum import Enum
 from logger import get_logger
@@ -83,10 +84,15 @@ class LifecycleManager:
         is_running: Callable[[], bool] = None,
         stop_fn: Callable = None,
         force_stop_fn: Callable = None,
-        thread: threading.Thread = None
+        thread: threading.Thread = None,
+        use_weakref: bool = True
     ):
         """
         注册服务清理函数
+        
+        设计原则：
+        - 使用 weakref.proxy 避免循环引用导致的内存泄露
+        - 闭包中捕获 self 会导致服务对象无法被 GC 释放
         
         Args:
             name: 服务名称
@@ -97,7 +103,18 @@ class LifecycleManager:
             stop_fn: 停止服务的函数（在 cleanup_fn 之前调用）
             force_stop_fn: 强制停止服务的函数（超时后调用）
             thread: 服务的主线程引用（用于强制中断）
+            use_weakref: 是否使用弱引用包装（默认 True）
         """
+        if use_weakref and callable(cleanup_fn):
+            try:
+                if hasattr(cleanup_fn, '__self__'):
+                    service_obj = cleanup_fn.__self__
+                    method_name = cleanup_fn.__name__
+                    weak_service = weakref.proxy(service_obj)
+                    cleanup_fn = getattr(weak_service, method_name)
+            except TypeError:
+                pass
+        
         self._services[name] = ServiceInfo(
             name=name,
             cleanup_fn=cleanup_fn,
@@ -165,6 +182,9 @@ class LifecycleManager:
             
             service_timeout = min(service.timeout, remaining)
             self._shutdown_service(service, service_timeout)
+        
+        self._services.clear()
+        self._shutdown_hooks.clear()
         
         total_time = time.time() - start_time
         self._log.info("SHUTDOWN_COMPLETE", duration=round(total_time, 2))

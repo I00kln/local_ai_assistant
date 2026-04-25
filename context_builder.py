@@ -342,6 +342,7 @@ class ContextBuilder:
         策略：
         1. ID 级硬去重：排除已存在于 L1 的记录
         2. 内容哈希去重：排除内容与 L1 对话相同的记录
+        3. 相似度去重：排除与 L1 对话语义相似度 > 0.85 的记录
         
         注意：时间窗口过滤在 _time_window_filter 中单独处理
         
@@ -359,6 +360,16 @@ class ContextBuilder:
         
         deduplicated = []
         
+        l1_texts = []
+        if conversation_history:
+            for conv in conversation_history:
+                user_text = conv.get("user", "")
+                assistant_text = conv.get("assistant", "")
+                if user_text:
+                    l1_texts.append(user_text)
+                if assistant_text:
+                    l1_texts.append(assistant_text)
+        
         for item in results:
             item_id = item.get("id") or item.get("record_id")
             if item_id and str(item_id) in self._recent_conversation_ids:
@@ -369,10 +380,46 @@ class ContextBuilder:
                 content_hash = hashlib.md5(text.encode('utf-8')).hexdigest()[:16]
                 if content_hash in self._l1_content_hashes:
                     continue
+                
+                if l1_texts and self._is_similar_to_l1(text, l1_texts):
+                    continue
             
             deduplicated.append(item)
         
         return deduplicated
+    
+    def _is_similar_to_l1(self, text: str, l1_texts: List[str], threshold: float = 0.85) -> bool:
+        """
+        检查文本是否与 L1 对话相似
+        
+        使用 Jaccard 相似度进行快速近似判断
+        
+        Args:
+            text: 待检查文本
+            l1_texts: L1 对话文本列表
+            threshold: 相似度阈值
+        
+        Returns:
+            是否相似
+        """
+        text_words = set(text.lower().split())
+        if not text_words:
+            return False
+        
+        for l1_text in l1_texts:
+            l1_words = set(l1_text.lower().split())
+            if not l1_words:
+                continue
+            
+            intersection = len(text_words & l1_words)
+            union = len(text_words | l1_words)
+            
+            if union > 0:
+                similarity = intersection / union
+                if similarity > threshold:
+                    return True
+        
+        return False
     
     def _time_window_filter(
         self, 
@@ -472,6 +519,29 @@ class ContextBuilder:
         """估算文本的 token 数量"""
         from token_utils import estimate_tokens
         return estimate_tokens(text)
+    
+    def _estimate_tokens_cached(self, text: str, metadata: dict = None) -> int:
+        """
+        估算文本的 token 数量（带缓存）
+        
+        设计原则：
+        - 优先使用 metadata 中缓存的 token_count
+        - 未缓存时计算并返回（不自动缓存，由调用方决定）
+        
+        Args:
+            text: 文本内容
+            metadata: 记忆元数据（可选）
+        
+        Returns:
+            token 数量
+        """
+        from memory_tags import MemoryTagHelper
+        
+        cached = MemoryTagHelper.get_token_count(metadata)
+        if cached is not None:
+            return cached
+        
+        return self._estimate_tokens(text)
     
     def _calculate_available_tokens(
         self, 

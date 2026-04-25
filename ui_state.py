@@ -5,6 +5,7 @@ from typing import Callable, Dict, Any, List
 from dataclasses import dataclass
 from datetime import datetime
 from contextlib import contextmanager
+import time
 from models import UIState
 from logger import get_logger
 
@@ -32,6 +33,75 @@ BACKGROUND_STATES = {
 }
 
 
+class ThrottleManager:
+    """
+    节流管理器
+    
+    设计原则：
+    - SRP: 仅负责 UI 更新节流
+    - 防止事件风暴导致界面卡死
+    
+    特性：
+    - 合并短时间内的多次更新请求
+    - 可配置节流间隔
+    - 支持强制刷新
+    """
+    
+    def __init__(self, interval_ms: int = 50):
+        """
+        初始化节流管理器
+        
+        Args:
+            interval_ms: 节流间隔（毫秒）
+        """
+        self._interval_ms = interval_ms
+        self._last_update_time = 0.0
+        self._pending_update = None
+        self._pending_args = None
+        self._scheduled = False
+    
+    def should_update(self) -> bool:
+        """
+        检查是否应该执行更新
+        
+        Returns:
+            是否应该立即执行更新
+        """
+        current_time = time.time() * 1000
+        elapsed = current_time - self._last_update_time
+        
+        if elapsed >= self._interval_ms:
+            self._last_update_time = current_time
+            return True
+        
+        return False
+    
+    def schedule_update(self, update_func: Callable, *args, **kwargs):
+        """
+        调度更新（带节流）
+        
+        Args:
+            update_func: 更新函数
+            *args, **kwargs: 更新函数参数
+        """
+        if self.should_update():
+            update_func(*args, **kwargs)
+            self._pending_update = None
+            self._pending_args = None
+        else:
+            self._pending_update = update_func
+            self._pending_args = (args, kwargs)
+    
+    def flush(self):
+        """强制执行待处理的更新"""
+        if self._pending_update:
+            args, kwargs = self._pending_args
+            self._pending_update(*args, **kwargs)
+            self._pending_update = None
+            self._pending_args = None
+            self._last_update_time = time.time() * 1000
+
+
 class UIStateManager:
     """
     UI状态管理器
@@ -42,11 +112,18 @@ class UIStateManager:
     - 后台任务状态显示
     - 状态历史记录
     - 异常自动恢复（上下文管理器）
+    - 防抖/节流机制防止事件风暴
+    - 超时强制回位机制
     
     线程安全：
     - 所有 UI 更新通过 window.after() 调度到主线程
     - 支持从任意线程安全调用
+    - 节流间隔默认 50ms，防止事件风暴
     """
+    
+    THROTTLE_INTERVAL_MS = 100
+    PROCESSING_TIMEOUT_SECONDS = 30.0
+    MAX_AFTER_CALLS_PER_SECOND = 10
     
     def __init__(self, status_label: tk.Label = None, memory_label: tk.Label = None, window: tk.Tk = None):
         self._log = get_logger()
@@ -63,23 +140,56 @@ class UIStateManager:
         self._memory_count = 0
         self._l2_count = 0
         self._l3_count = 0
+        
+        self._throttle = ThrottleManager(self.THROTTLE_INTERVAL_MS)
+        self._processing_start_time: Optional[float] = None
+        self._timeout_check_id: Optional[str] = None
+        self._after_call_times: List[float] = []
     
     def set_window(self, window: tk.Tk):
         """设置窗口引用（用于线程安全 UI 更新）"""
         self.window = window
     
+    def _can_schedule_after(self) -> bool:
+        """
+        检查是否可以调度新的 after 调用
+        
+        Returns:
+            是否允许调度
+        """
+        current_time = time.time()
+        one_second_ago = current_time - 1.0
+        
+        self._after_call_times = [t for t in self._after_call_times if t > one_second_ago]
+        
+        return len(self._after_call_times) < self.MAX_AFTER_CALLS_PER_SECOND
+    
     def _safe_ui_update(self, update_func: Callable):
         """
-        安全的 UI 更新
+        安全的 UI 更新（带节流）
         
         确保在主线程中执行 UI 操作
+        使用节流机制防止事件风暴
+        限制 window.after 调用频率为每秒 10 次
         
         Args:
             update_func: UI 更新函数
         """
         if self.window:
             try:
-                self.window.after(0, update_func)
+                if not self._can_schedule_after():
+                    self._log.warning(
+                        "UI_AFTER_RATE_LIMITED",
+                        message="window.after 调用频率超限，丢弃更新请求"
+                    )
+                    return
+                
+                self._after_call_times.append(time.time())
+                
+                def throttled_update():
+                    self._throttle.schedule_update(update_func)
+                
+                self.window.after(0, throttled_update)
             except tk.TclError:
                 pass
         else:
@@ -89,6 +199,64 @@ class UIStateManager:
     def current_state(self) -> UIState:
         """获取当前状态"""
         return self._current_state
+    
+    def _is_processing_state(self, state: UIState) -> bool:
+        """检查是否为处理中状态"""
+        return state in (
+            UIState.PROCESSING_LOCAL,
+            UIState.PROCESSING_CLOUD,
+            UIState.PROCESSING_HYBRID
+        )
+    
+    def _start_timeout_check(self):
+        """启动超时检测"""
+        self._cancel_timeout_check()
+        
+        if self.window and self._is_processing_state(self._current_state):
+            self._processing_start_time = time.time()
+            self._timeout_check_id = self.window.after(
+                int(self.PROCESSING_TIMEOUT_SECONDS * 1000),
+                self._on_processing_timeout
+            )
+    
+    def _cancel_timeout_check(self):
+        """取消超时检测"""
+        if self._timeout_check_id and self.window:
+            try:
+                self.window.after_cancel(self._timeout_check_id)
+            except tk.TclError:
+                pass
+        self._timeout_check_id = None
+        self._processing_start_time = None
+    
+    def _on_processing_timeout(self):
+        """
+        处理中状态超时回调
+        
+        设计原则：
+        - PROCESSING 状态超过 30 秒自动重置为 IDLE
+        - 记录错误日志便于排查
+        - 清空状态栈防止卡死
+        """
+        self._timeout_check_id = None
+        
+        if self._is_processing_state(self._current_state):
+            duration = time.time() - self._processing_start_time if self._processing_start_time else 0
+            self._log.error(
+                "UI_STATE_TIMEOUT",
+                state=self._current_state.value,
+                duration=round(duration, 1),
+                message="处理中状态超时，强制重置为 IDLE"
+            )
+            
+            self._state_stack.clear()
+            self._current_state = UIState.IDLE
+            self._processing_start_time = None
+            
+            status_text = self._get_status_text(UIState.IDLE, "操作超时，已重置")
+            self._update_status_label(status_text)
+            
+            self.add_status_message("操作超时，已自动重置状态", level="warning")
     
     def set_state(self, state: UIState, message: str = None):
         """
@@ -100,6 +268,11 @@ class UIStateManager:
         """
         old_state = self._current_state
         self._current_state = state
+        
+        if self._is_processing_state(state):
+            self._start_timeout_check()
+        else:
+            self._cancel_timeout_check()
         
         status_text = self._get_status_text(state, message)
         self._update_status_label(status_text)

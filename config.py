@@ -180,6 +180,11 @@ class CompressionConfig:
     max_segment_length: int = 2000
     fallback_enabled: bool = True
     key_patterns: str = r'\d+|[A-Z][a-z]+|设置|配置|修改|添加|删除|创建|因为|所以|如果|那么|但是'
+    long_text_threshold: int = 10000
+    chunk_text_threshold: int = 6000
+    chunk_size: int = 3000
+    max_compression_ratio: float = 0.7
+    max_key_sentences: int = 5
 
 
 @dataclass
@@ -272,6 +277,11 @@ class NonsenseFilterConfig:
     """废话过滤配置"""
     enabled: bool = True
     db_path: str = "nonsense_library.json"
+    length_threshold: int = 10
+    density_threshold: float = 0.15
+    similarity_threshold: float = 0.85
+    model_wait_max_iterations: int = 120
+    model_wait_interval: float = 1.0
 
 
 @dataclass
@@ -490,6 +500,11 @@ class Config:
         self.compression.fallback_enabled = os.environ.get("COMPRESSION_FALLBACK_ENABLED", "true").lower() == "true"
         self.compression.key_patterns = os.environ.get("COMPRESSION_KEY_PATTERNS", 
             r'\d+|[A-Z][a-z]+|设置|配置|修改|添加|删除|创建|因为|所以|如果|那么|但是')
+        self.compression.long_text_threshold = _safe_int(os.environ.get("COMPRESSION_LONG_TEXT_THRESHOLD", "10000"), 10000, "COMPRESSION_LONG_TEXT_THRESHOLD")
+        self.compression.chunk_text_threshold = _safe_int(os.environ.get("COMPRESSION_CHUNK_TEXT_THRESHOLD", "6000"), 6000, "COMPRESSION_CHUNK_TEXT_THRESHOLD")
+        self.compression.chunk_size = _safe_int(os.environ.get("COMPRESSION_CHUNK_SIZE", "3000"), 3000, "COMPRESSION_CHUNK_SIZE")
+        self.compression.max_compression_ratio = _safe_float(os.environ.get("COMPRESSION_MAX_RATIO", "0.7"), 0.7, "COMPRESSION_MAX_RATIO")
+        self.compression.max_key_sentences = _safe_int(os.environ.get("COMPRESSION_MAX_KEY_SENTENCES", "5"), 5, "COMPRESSION_MAX_KEY_SENTENCES")
     
     def _load_privacy_config(self):
         """加载隐私与安全配置"""
@@ -554,6 +569,11 @@ class Config:
         """加载废话过滤配置"""
         self.nonsense_filter.enabled = os.environ.get("NONSENSE_FILTER_ENABLED", "true").lower() == "true"
         self.nonsense_filter.db_path = os.environ.get("NONSENSE_DB_PATH", "nonsense_library.json")
+        self.nonsense_filter.length_threshold = _safe_int(os.environ.get("NONSENSE_LENGTH_THRESHOLD", "10"), 10, "NONSENSE_LENGTH_THRESHOLD")
+        self.nonsense_filter.density_threshold = _safe_float(os.environ.get("NONSENSE_DENSITY_THRESHOLD", "0.15"), 0.15, "NONSENSE_DENSITY_THRESHOLD")
+        self.nonsense_filter.similarity_threshold = _safe_float(os.environ.get("NONSENSE_SIMILARITY_THRESHOLD", "0.85"), 0.85, "NONSENSE_SIMILARITY_THRESHOLD")
+        self.nonsense_filter.model_wait_max_iterations = _safe_int(os.environ.get("NONSENSE_MODEL_WAIT_ITERATIONS", "120"), 120, "NONSENSE_MODEL_WAIT_ITERATIONS")
+        self.nonsense_filter.model_wait_interval = _safe_float(os.environ.get("NONSENSE_MODEL_WAIT_INTERVAL", "1.0"), 1.0, "NONSENSE_MODEL_WAIT_INTERVAL")
     
     def _load_high_density_config(self):
         """加载高密度内容配置"""

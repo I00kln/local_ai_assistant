@@ -47,6 +47,112 @@ class PoolStats:
     queue_high_watermark: int = 0
 
 
+@dataclass(order=True)
+class PrioritizedTask:
+    """带优先级的任务包装"""
+    priority: int
+    sequence: int
+    fn: Callable = field(compare=False)
+    args: tuple = field(compare=False)
+    kwargs: dict = field(compare=False)
+
+
+class ManagedTaskQueue:
+    """
+    自定义任务队列
+    
+    设计原则：
+    - SRP: 仅负责任务队列管理和淘汰策略
+    - 不依赖 ThreadPoolExecutor 内部实现
+    - 支持优先级和淘汰策略
+    
+    特性：
+    - 线程安全
+    - 支持丢弃最旧任务
+    - 支持队列大小监控
+    """
+    
+    def __init__(self, max_size: int = 100):
+        self._max_size = max_size
+        self._queue: queue.Queue = queue.Queue(maxsize=max_size)
+        self._sequence = 0
+        self._lock = threading.Lock()
+        self._high_watermark = 0
+    
+    def put(self, fn: Callable, args: tuple, kwargs: dict, block: bool = True, timeout: float = None) -> bool:
+        """
+        添加任务到队列
+        
+        Args:
+            fn: 执行函数
+            args: 位置参数
+            kwargs: 关键字参数
+            block: 是否阻塞
+            timeout: 超时时间
+        
+        Returns:
+            是否成功添加
+        """
+        with self._lock:
+            self._sequence += 1
+            task = (fn, args, kwargs)
+        
+        try:
+            self._queue.put(task, block=block, timeout=timeout)
+            self._update_high_watermark()
+            return True
+        except queue.Full:
+            return False
+    
+    def get(self, block: bool = True, timeout: float = None):
+        """
+        从队列获取任务
+        
+        Args:
+            block: 是否阻塞
+            timeout: 超时时间
+        
+        Returns:
+            (fn, args, kwargs) 或 None
+        """
+        try:
+            return self._queue.get(block=block, timeout=timeout)
+        except queue.Empty:
+            return None
+    
+    def drop_oldest(self) -> bool:
+        """
+        丢弃最旧的任务
+        
+        Returns:
+            是否成功丢弃
+        """
+        try:
+            self._queue.get_nowait()
+            return True
+        except queue.Empty:
+            return False
+    
+    def qsize(self) -> int:
+        """获取队列大小"""
+        return self._queue.qsize()
+    
+    def is_full(self) -> bool:
+        """检查队列是否已满"""
+        return self._queue.qsize() >= self._max_size
+    
+    def _update_high_watermark(self):
+        """更新高水位"""
+        current_size = self._queue.qsize()
+        if current_size > self._high_watermark:
+            self._high_watermark = current_size
+    
+    @property
+    def high_watermark(self) -> int:
+        """获取高水位"""
+        return self._high_watermark
+
+
 class ThreadPoolManager:
     """
     统一线程池管理器
@@ -106,6 +212,7 @@ class ThreadPoolManager:
         self._log = get_logger()
         self._pools: Dict[TaskType, ThreadPoolExecutor] = {}
         self._custom_config: Dict[TaskType, Dict[str, Any]] = {}
+        self._task_queues: Dict[TaskType, ManagedTaskQueue] = {}
         self._stats: Dict[TaskType, PoolStats] = {
             t: PoolStats() for t in TaskType
         }
@@ -118,6 +225,9 @@ class ThreadPoolManager:
             executor_config = {k: v for k, v in config.items() if k in EXECUTOR_PARAMS}
             self._pools[task_type] = ThreadPoolExecutor(**executor_config)
             self._custom_config[task_type] = {k: v for k, v in config.items() if k not in EXECUTOR_PARAMS}
+            
+            max_queue_size = config.get("max_queue_size", 100)
+            self._task_queues[task_type] = ManagedTaskQueue(max_size=max_queue_size)
         
         self._register_lifecycle()
         
@@ -175,16 +285,17 @@ class ThreadPoolManager:
             self._log.error("UNKNOWN_TASK_TYPE", task_type=str(task_type))
             return None
         
+        task_queue = self._task_queues.get(task_type)
         config = self._custom_config.get(task_type, {})
-        queue_size = self.get_queue_size(task_type)
+        queue_size = task_queue.qsize() if task_queue else 0
         max_queue_size = config.get("max_queue_size", 100)
         rejection_policy = config.get("rejection_policy", RejectionPolicy.REJECT)
         high_watermark_ratio = config.get("high_watermark_ratio", 0.8)
         
         with self._stats_lock:
             self._stats[task_type].queue_size = queue_size
-            if queue_size > self._stats[task_type].queue_high_watermark:
-                self._stats[task_type].queue_high_watermark = queue_size
+            if task_queue and task_queue.high_watermark > self._stats[task_type].queue_high_watermark:
+                self._stats[task_type].queue_high_watermark = task_queue.high_watermark
         
         if queue_size >= max_queue_size:
             if rejection_policy == RejectionPolicy.REJECT:
@@ -199,12 +310,12 @@ class ThreadPoolManager:
                 return None
             
             elif rejection_policy == RejectionPolicy.DROP_OLDEST:
-                self._drop_oldest_task(pool)
-                self._log.info(
-                    "TASK_DROPPED_OLDEST",
-                    task_type=task_type.name,
-                    queue_size=queue_size
-                )
+                if task_queue and task_queue.drop_oldest():
+                    self._log.info(
+                        "TASK_DROPPED_OLDEST",
+                        task_type=task_type.name,
+                        queue_size=queue_size
+                    )
             
             elif rejection_policy == RejectionPolicy.CALLER_RUNS:
                 self._log.info(
@@ -252,27 +363,19 @@ class ThreadPoolManager:
                 return None
             raise
     
-    def _drop_oldest_task(self, pool: ThreadPoolExecutor) -> bool:
+    def _drop_oldest_task(self, task_type: TaskType) -> bool:
         """
-        尝试丢弃最旧的任务
+        尝试丢弃最旧的任务（使用自定义队列）
         
         Args:
-            pool: 线程池实例
+            task_type: 任务类型
         
         Returns:
             是否成功丢弃
         """
-        try:
-            if hasattr(pool, '_work_queue'):
-                work_queue = pool._work_queue
-                if hasattr(work_queue, 'get_nowait'):
-                    try:
-                        work_queue.get_nowait()
-                        return True
-                    except queue.Empty:
-                        return False
-        except Exception:
-            pass
+        task_queue = self._task_queues.get(task_type)
+        if task_queue:
+            return task_queue.drop_oldest()
         return False
     
     def _wrap_task(self, task_type: TaskType, fn: Callable) -> Callable:
@@ -384,13 +487,10 @@ class ThreadPoolManager:
             return result
     
     def get_queue_size(self, task_type: TaskType) -> int:
-        """获取指定类型任务队列大小"""
-        pool = self._pools.get(task_type)
-        if pool and hasattr(pool, '_work_queue'):
-            try:
-                return pool._work_queue.qsize()
-            except Exception:
-                pass
+        """获取指定类型任务队列大小（使用自定义队列）"""
+        task_queue = self._task_queues.get(task_type)
+        if task_queue:
+            return task_queue.qsize()
         return 0
     
     def wait_for_completion(self, timeout: Optional[float] = None) -> bool:

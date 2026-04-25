@@ -4,10 +4,11 @@ import os
 import sqlite3
 import json
 import re
+import queue
 import threading
 import time
 from datetime import datetime, timedelta
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional, Tuple, Callable
 from dataclasses import dataclass
 from contextlib import contextmanager
 from config import config
@@ -17,12 +18,17 @@ from models import MemoryRecord
 
 def escape_fts5_query(query: str) -> str:
     """
-    转义 FTS5 查询字符串（增强版）
+    转义 FTS5 查询字符串（安全增强版）
     
     FTS5 对某些字符有特殊含义，需要进行转义：
     - 双引号需要转义
     - 特殊字符需要用双引号包裹整个查询
     - 纯符号输入返回空查询
+    - 纯布尔操作符输入返回空查询
+    
+    安全特性：
+    - 过滤 FTS5 保留字（AND, OR, NOT, NEAR, COLUMN）
+    - 防止语法注入导致查询崩溃
     
     Args:
         query: 原始查询字符串
@@ -36,7 +42,17 @@ def escape_fts5_query(query: str) -> str:
     if re.match(r'^[\s\W]+$', query):
         return '""'
     
-    escaped = query.replace('"', '""')
+    FTS5_RESERVED_WORDS = {'AND', 'OR', 'NOT', 'NEAR', 'COLUMN'}
+    
+    words = query.strip().split()
+    non_reserved_words = [w for w in words if w.upper() not in FTS5_RESERVED_WORDS]
+    
+    if not non_reserved_words:
+        return '""'
+    
+    cleaned_query = ' '.join(non_reserved_words)
+    
+    escaped = cleaned_query.replace('"', '""')
     
     if len(escaped) > 500:
         escaped = escaped[:500]
@@ -105,6 +121,7 @@ class SQLiteStore:
     BACKUP_INTERVAL = 3600
     MAX_BACKUP_VERSIONS = 3
     MAX_RETRY_ATTEMPTS = 2
+    WRITE_QUEUE_MAX_SIZE = 100
     
     def __init__(self, db_path: str = "memory.db", encryption_key: str = None):
         self.db_path = db_path
@@ -115,6 +132,10 @@ class SQLiteStore:
         self._integrity_checked = False
         self._last_connection_check: Dict[int, float] = {}
         self._last_backup_time: float = 0
+        
+        self._write_queue = queue.Queue(maxsize=self.WRITE_QUEUE_MAX_SIZE)
+        self._write_queue_running = False
+        self._write_queue_thread = None
         
         self._encryption_enabled = False
         self._encryption_key = None
@@ -145,6 +166,7 @@ class SQLiteStore:
             print("[安全] SQLite 加密已启用 (SQLCipher)")
         
         self._init_database()
+        self._start_write_queue_processor()
         
         self._register_lifecycle()
     
@@ -229,7 +251,7 @@ class SQLiteStore:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
         conn.execute("PRAGMA cache_size=-64000")
-        conn.execute("PRAGMA busy_timeout=30000")
+        conn.execute("PRAGMA busy_timeout=5000")
         
         return conn
     
@@ -322,6 +344,76 @@ class SQLiteStore:
         finally:
             self._write_lock.release()
     
+    def submit_write(self, fn: Callable, *args, **kwargs) -> queue.Queue:
+        """
+        提交写入操作到队列
+        
+        设计原则：
+        - 所有写操作通过队列串行化执行
+        - 避免多线程竞争 SQLITE_BUSY
+        - 返回结果队列供调用方获取结果
+        
+        Args:
+            fn: 写操作函数
+            *args: 位置参数
+            **kwargs: 关键字参数
+        
+        Returns:
+            结果队列，调用方通过 result_queue.get() 获取结果
+        """
+        result_queue = queue.Queue(maxsize=1)
+        
+        try:
+            self._write_queue.put((fn, args, kwargs, result_queue), block=False)
+        except queue.Full:
+            raise sqlite3.OperationalError(
+                "WRITE_QUEUE_FULL: 写入队列已满，请稍后重试"
+            )
+        
+        return result_queue
+    
+    def _start_write_queue_processor(self):
+        """启动写入队列处理线程"""
+        if self._write_queue_running:
+            return
+        
+        self._write_queue_running = True
+        
+        def process_writes():
+            while self._write_queue_running:
+                try:
+                    item = self._write_queue.get(timeout=1.0)
+                    if item is None:
+                        continue
+                    
+                    fn, args, kwargs, result_queue = item
+                    
+                    try:
+                        with self._get_write_connection() as conn:
+                            result = fn(conn, *args, **kwargs)
+                        result_queue.put(("success", result))
+                    except Exception as e:
+                        result_queue.put(("error", e))
+                        
+                except queue.Empty:
+                    continue
+                except Exception as e:
+                    print(f"[SQLite] 写入队列处理错误: {e}")
+        
+        self._write_queue_thread = threading.Thread(
+            target=process_writes,
+            name="SQLiteWriteQueue",
+            daemon=True
+        )
+        self._write_queue_thread.start()
+    
+    def _stop_write_queue_processor(self):
+        """停止写入队列处理线程"""
+        self._write_queue_running = False
+        if self._write_queue_thread:
+            self._write_queue_thread.join(timeout=2.0)
+            self._write_queue_thread = None
+    
     def _retry_on_connection_error(self, func, *args, **kwargs):
         """
         连接错误自动重试装饰器
@@ -409,13 +501,12 @@ class SQLiteStore:
     
     def _try_recover_from_backup(self) -> bool:
         """
-        尝试从备份恢复数据库
+        尝试从备份恢复数据库（使用 SQLite 原生 API）
         
         Returns:
             True: 恢复成功
             False: 无备份或恢复失败
         """
-        import shutil
         import os
         
         backup_path = self.db_path + self.BACKUP_SUFFIX
@@ -426,11 +517,12 @@ class SQLiteStore:
         
         try:
             if os.path.exists(self.db_path):
+                import shutil
                 corrupt_backup = self.db_path + ".corrupt"
                 shutil.move(self.db_path, corrupt_backup)
                 print(f"[备份] 损坏数据库已保存为: {corrupt_backup}")
             
-            shutil.copy(backup_path, self.db_path)
+            self._sqlite_restore_from(backup_path)
             print(f"[恢复] 从备份恢复成功: {backup_path}")
             return True
             
@@ -450,11 +542,14 @@ class SQLiteStore:
         - 保留最近3个版本的备份
         - 备份文件命名：memory.db.backup.1, memory.db.backup.2, memory.db.backup.3
         
+        安全特性：
+        - 使用 SQLite 原生 backup API，确保 WAL 模式下数据一致性
+        - 避免直接文件拷贝导致备份损坏
+        
         防重复机制：
         - 首次调用时检查现有备份文件时间戳
         - 如果备份文件存在且未过期，跳过备份
         """
-        import shutil
         import os
         
         current_time = time.time()
@@ -485,6 +580,7 @@ class SQLiteStore:
             if os.path.exists(oldest_backup):
                 os.remove(oldest_backup)
             
+            import shutil
             for i in range(self.MAX_BACKUP_VERSIONS - 1, 0, -1):
                 old_backup = os.path.join(backup_dir, f"{base_name}.backup.{i}")
                 new_backup = os.path.join(backup_dir, f"{base_name}.backup.{i + 1}")
@@ -492,16 +588,55 @@ class SQLiteStore:
                     shutil.move(old_backup, new_backup)
             
             latest_backup = os.path.join(backup_dir, f"{base_name}.backup.1")
-            shutil.copy2(self.db_path, latest_backup)
+            self._sqlite_backup_to(latest_backup)
             
             main_backup = self.db_path + self.BACKUP_SUFFIX
-            shutil.copy2(self.db_path, main_backup)
+            self._sqlite_backup_to(main_backup)
             
             self._last_backup_time = current_time
             print(f"[备份] 数据库备份完成: {latest_backup}")
             
         except Exception as e:
             print(f"[警告] 创建备份失败: {e}")
+    
+    def _sqlite_backup_to(self, target_path: str) -> bool:
+        """
+        使用 SQLite 原生 backup API 创建一致性备份
+        
+        设计原则：
+        - SRP: 仅负责 SQLite 原生备份
+        - WAL 安全: 备份前执行 checkpoint，确保 WAL 内容写入主库
+        - 并发安全: 在备份期间允许继续读写
+        
+        Args:
+            target_path: 目标备份文件路径
+        
+        Returns:
+            是否成功
+        """
+        import sqlite3
+        
+        try:
+            def progress(status, remaining, total):
+                pass
+            
+            with sqlite3.connect(self.db_path) as source_conn:
+                try:
+                    source_conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                except Exception as checkpoint_error:
+                    self._log.warning("BACKUP_CHECKPOINT_FAILED", 
+                                     error=str(checkpoint_error))
+                
+                with sqlite3.connect(target_path) as target_conn:
+                    source_conn.backup(target_conn, pages=100, progress=progress)
+            
+            return True
+        except Exception as e:
+            self._log.error("SQLITE_BACKUP_FAILED", 
+                           source=self.db_path, 
+                           target=target_path, 
+                           error=str(e))
+            return False
     
     def _try_recover_from_backup_versions(self) -> bool:
         """
@@ -530,7 +665,7 @@ class SQLiteStore:
                     shutil.move(self.db_path, corrupt_backup)
                     print(f"[备份] 损坏数据库已保存为: {corrupt_backup}")
                 
-                shutil.copy2(backup_path, self.db_path)
+                self._sqlite_restore_from(backup_path)
                 
                 if self._check_integrity():
                     print(f"[恢复] 从备份版本 {version} 恢复成功")
@@ -542,6 +677,35 @@ class SQLiteStore:
                 print(f"[错误] 从备份版本 {version} 恢复失败: {e}")
         
         return False
+    
+    def _sqlite_restore_from(self, source_path: str) -> bool:
+        """
+        使用 SQLite 原生 backup API 从备份恢复
+        
+        设计原则：
+        - SRP: 仅负责从备份恢复
+        - WAL 安全: 确保恢复后的数据库状态一致
+        
+        Args:
+            source_path: 源备份文件路径
+        
+        Returns:
+            是否成功
+        """
+        import sqlite3
+        
+        try:
+            with sqlite3.connect(source_path) as source_conn:
+                with sqlite3.connect(self.db_path) as target_conn:
+                    source_conn.backup(target_conn, pages=100)
+            
+            return True
+        except Exception as e:
+            self._log.error("SQLITE_RESTORE_FAILED",
+                           source=source_path,
+                           target=self.db_path,
+                           error=str(e))
+            return False
     
     SCHEMA_VERSION = 1
     
@@ -729,12 +893,21 @@ class SQLiteStore:
         Schema 版本 2: 会话持久化与重要标记
         
         新增：
-        - memories 表增加 is_important, session_id, content_hash 字段
+        - memories 表增加 is_important, is_protected, session_id, content_hash 字段
         - sessions 表用于会话持久化
         - 相关索引
+        
+        性能优化：
+        - is_important, is_protected 独立列替代 JSON LIKE 查询
+        - 避免全表扫描，支持索引查询
         """
         try:
             cursor.execute("ALTER TABLE memories ADD COLUMN is_important INTEGER DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass
+        
+        try:
+            cursor.execute("ALTER TABLE memories ADD COLUMN is_protected INTEGER DEFAULT 0")
         except sqlite3.OperationalError:
             pass
         
@@ -749,8 +922,18 @@ class SQLiteStore:
             pass
         
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_is_important ON memories(is_important)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_is_protected ON memories(is_protected)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_session_id_memories ON memories(session_id)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_content_hash ON memories(content_hash)")
+        
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_decay_optimized 
+            ON memories(is_archived, is_important, is_protected, created_time, weight)
+        """)
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_forget_optimized 
+            ON memories(is_archived, is_important, is_protected, weight, is_vectorized)
+        """)
         
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS sessions (
@@ -769,6 +952,69 @@ class SQLiteStore:
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_sessions_session_id ON sessions(session_id)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_sessions_status ON sessions(status)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_sessions_updated ON sessions(updated_time DESC)")
+        
+        self._migrate_metadata_flags(cursor)
+    
+    def _migrate_metadata_flags(self, cursor):
+        """
+        迁移 metadata 中的 is_important 和 is_protected 标签到独立列
+        
+        批量处理策略：
+        - 每批 1000 条记录
+        - 使用 JSON 函数提取标签值（SQLite 3.38+）
+        - 兼容旧版本 SQLite 使用字符串匹配
+        """
+        try:
+            cursor.execute("SELECT COUNT(*) FROM memories WHERE is_important = 0 AND is_protected = 0 AND metadata IS NOT NULL")
+            total_count = cursor.fetchone()[0]
+            
+            if total_count == 0:
+                return
+            
+            print(f"[迁移] 开始同步 {total_count} 条记录的标签字段...")
+            
+            batch_size = 1000
+            migrated = 0
+            
+            while True:
+                cursor.execute("""
+                    SELECT id, metadata FROM memories 
+                    WHERE is_important = 0 AND is_protected = 0 AND metadata IS NOT NULL
+                    LIMIT ?
+                """, (batch_size,))
+                
+                rows = cursor.fetchall()
+                if not rows:
+                    break
+                
+                for row in rows:
+                    record_id = row[0]
+                    metadata_str = row[1]
+                    
+                    try:
+                        metadata = json.loads(metadata_str) if metadata_str else {}
+                    except json.JSONDecodeError:
+                        continue
+                    
+                    is_important = 1 if metadata.get(MemoryTags.IMPORTANT, False) else 0
+                    is_protected = 1 if metadata.get(MemoryTags.PROTECTED, False) else 0
+                    
+                    if is_important or is_protected:
+                        cursor.execute("""
+                            UPDATE memories 
+                            SET is_important = ?, is_protected = ?
+                            WHERE id = ?
+                        """, (is_important, is_protected, record_id))
+                    
+                    migrated += 1
+                
+                if len(rows) < batch_size:
+                    break
+            
+            print(f"[迁移] 完成：同步了 {migrated} 条记录的标签字段")
+            
+        except Exception as e:
+            print(f"[警告] 标签字段迁移失败: {e}")
     
     def _rebuild_database(self):
         """
@@ -845,13 +1091,25 @@ class SQLiteStore:
     
     def add(self, record: MemoryRecord) -> int:
         """添加记忆记录"""
+        from memory_tags import MemoryTagHelper
+        from token_utils import estimate_tokens
+        
+        metadata = record.metadata or {}
+        is_important = 1 if metadata.get(MemoryTags.IMPORTANT, False) else 0
+        is_protected = 1 if metadata.get(MemoryTags.PROTECTED, False) else 0
+        
+        if MemoryTagHelper.get_token_count(metadata) is None:
+            token_count = estimate_tokens(record.text)
+            metadata = MemoryTagHelper.set_token_count(metadata, token_count)
+        
         with self._get_write_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("""
                 INSERT INTO memories 
                 (text, compressed_text, source, weight, access_count, 
-                 last_access_time, created_time, metadata, vector_id, is_vectorized)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 last_access_time, created_time, metadata, vector_id, is_vectorized,
+                 is_important, is_protected)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 record.text,
                 record.compressed_text,
@@ -860,9 +1118,11 @@ class SQLiteStore:
                 record.access_count,
                 record.last_access_time,
                 record.created_time,
-                json.dumps(record.metadata, ensure_ascii=False),
+                json.dumps(metadata, ensure_ascii=False),
                 record.vector_id,
-                record.is_vectorized
+                record.is_vectorized,
+                is_important,
+                is_protected
             ))
             conn.commit()
             
@@ -872,6 +1132,9 @@ class SQLiteStore:
     
     def add_batch(self, records: List[MemoryRecord]) -> List[int]:
         """批量添加记忆（优化版：使用 executemany）"""
+        from memory_tags import MemoryTagHelper
+        from token_utils import estimate_tokens
+        
         if not records:
             return []
         
@@ -881,24 +1144,37 @@ class SQLiteStore:
             cursor.execute("SELECT MAX(id) FROM memories")
             max_id_before = cursor.fetchone()[0] or 0
             
-            data = [(
-                record.text,
-                record.compressed_text,
-                record.source,
-                record.weight,
-                record.access_count,
-                record.last_access_time,
-                record.created_time,
-                json.dumps(record.metadata, ensure_ascii=False),
-                record.vector_id,
-                record.is_vectorized
-            ) for record in records]
+            data = []
+            for record in records:
+                metadata = record.metadata or {}
+                is_important = 1 if metadata.get(MemoryTags.IMPORTANT, False) else 0
+                is_protected = 1 if metadata.get(MemoryTags.PROTECTED, False) else 0
+                
+                if MemoryTagHelper.get_token_count(metadata) is None:
+                    token_count = estimate_tokens(record.text)
+                    metadata = MemoryTagHelper.set_token_count(metadata, token_count)
+                
+                data.append((
+                    record.text,
+                    record.compressed_text,
+                    record.source,
+                    record.weight,
+                    record.access_count,
+                    record.last_access_time,
+                    record.created_time,
+                    json.dumps(metadata, ensure_ascii=False),
+                    record.vector_id,
+                    record.is_vectorized,
+                    is_important,
+                    is_protected
+                ))
             
             cursor.executemany("""
                 INSERT INTO memories 
                 (text, compressed_text, source, weight, access_count, 
-                 last_access_time, created_time, metadata, vector_id, is_vectorized)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 last_access_time, created_time, metadata, vector_id, is_vectorized,
+                 is_important, is_protected)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, data)
             
             conn.commit()
@@ -933,6 +1209,7 @@ class SQLiteStore:
         增强功能：
         - 自动重试连接错误
         - 捕获 ProgrammingError 并恢复
+        - 捕获 FTS5 语法错误并安全降级
         - 返回 BM25 分数（归一化到 0-1）
         - 自动转义 FTS5 特殊字符
         """
@@ -942,23 +1219,32 @@ class SQLiteStore:
             conn = self._get_read_connection()
             cursor = conn.cursor()
             
-            cursor.execute("""
-                SELECT m.*, bm25(memories_fts) as bm25_score
-                FROM memories m
-                JOIN memories_fts fts ON m.id = fts.rowid
-                WHERE memories_fts MATCH ?
-                AND m.weight >= ?
-                AND m.is_archived = 0
-                ORDER BY bm25_score ASC
-                LIMIT ?
-            """, (safe_query, min_weight, limit))
-            
-            results = []
-            for row in cursor.fetchall():
-                record = self._row_to_record(row)
-                results.append(record)
-            
-            return results
+            try:
+                cursor.execute("""
+                    SELECT m.*, bm25(memories_fts) as bm25_score
+                    FROM memories m
+                    JOIN memories_fts fts ON m.id = fts.rowid
+                    WHERE memories_fts MATCH ?
+                    AND m.weight >= ?
+                    AND m.is_archived = 0
+                    ORDER BY bm25_score ASC
+                    LIMIT ?
+                """, (safe_query, min_weight, limit))
+                
+                results = []
+                for row in cursor.fetchall():
+                    record = self._row_to_record(row)
+                    results.append(record)
+                
+                return results
+            except sqlite3.OperationalError as e:
+                if "fts5" in str(e).lower() or "syntax" in str(e).lower():
+                    self._log.warning("FTS5_SYNTAX_ERROR", 
+                                     query=query[:50], 
+                                     safe_query=safe_query[:50],
+                                     error=str(e))
+                    return []
+                raise
         
         return self._retry_on_connection_error(_do_search)
     
@@ -1225,7 +1511,8 @@ class SQLiteStore:
                         WHERE created_time < ?
                         AND is_archived = 0
                         AND weight > ?
-                        AND (metadata IS NULL OR metadata NOT LIKE '%"important"%')
+                        AND is_important = 0
+                        AND is_protected = 0
                         LIMIT ?
                     )
                 """, (self._weight_decay_rate, threshold_time, 
@@ -1245,7 +1532,8 @@ class SQLiteStore:
                     AND is_vectorized = 1
                     AND vector_id IS NOT NULL
                     AND vector_id != ''
-                    AND (metadata IS NULL OR metadata NOT LIKE '%"important"%')
+                    AND is_important = 0
+                    AND is_protected = 0
                     LIMIT ?
                 """, (self._min_weight_threshold, batch_size))
                 
@@ -2052,6 +2340,8 @@ class SQLiteStore:
         
         用于会话结束或测试清理
         """
+        self._stop_write_queue_processor()
+        
         if hasattr(self._local, 'read_conn') and self._local.read_conn is not None:
             try:
                 self._local.read_conn.close()

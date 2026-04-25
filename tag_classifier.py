@@ -11,11 +11,14 @@
 - 独立模块，不修改现有核心逻辑
 - 异步处理，不阻塞主流程
 - 分层策略：规则 → LLM → 用户修正
+- 持久化队列：崩溃恢复后可继续处理
 """
 
 import re
+import sqlite3
 import threading
 import queue
+import os
 from datetime import datetime
 from typing import Dict, List, Optional, Any, Callable
 from dataclasses import dataclass, field, asdict
@@ -448,6 +451,127 @@ class LLMTagger:
         self._worker_thread: Optional[threading.Thread] = None
         self._llm_client = None
         self._log = self._get_logger()
+        
+        self._pending_db_path = self._get_pending_db_path()
+        self._init_pending_db()
+    
+    def _get_pending_db_path(self) -> str:
+        """获取持久化队列数据库路径"""
+        try:
+            from config import config as app_config
+            base_dir = getattr(app_config, 'data_dir', '.')
+            return os.path.join(base_dir, 'pending_tags.db')
+        except Exception:
+            return 'pending_tags.db'
+    
+    def _init_pending_db(self):
+        """初始化持久化队列数据库"""
+        try:
+            with sqlite3.connect(self._pending_db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS pending_tags (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        memory_id TEXT NOT NULL,
+                        memory_text TEXT NOT NULL,
+                        created_time TEXT NOT NULL,
+                        status TEXT DEFAULT 'pending',
+                        retry_count INTEGER DEFAULT 0
+                    )
+                """)
+                cursor.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_pending_tags_status 
+                    ON pending_tags(status, created_time)
+                """)
+                conn.commit()
+        except Exception as e:
+            self._log.error("PENDING_DB_INIT_FAILED", error=str(e))
+    
+    def _persist_pending_tag(self, memory_id: str, memory_text: str) -> bool:
+        """
+        持久化待处理标签任务
+        
+        Args:
+            memory_id: 记忆 ID
+            memory_text: 记忆文本
+        
+        Returns:
+            是否成功持久化
+        """
+        try:
+            with sqlite3.connect(self._pending_db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    INSERT OR REPLACE INTO pending_tags 
+                    (memory_id, memory_text, created_time, status)
+                    VALUES (?, ?, ?, 'pending')
+                """, (memory_id, memory_text, datetime.now().isoformat()))
+                conn.commit()
+                return True
+        except Exception as e:
+            self._log.error("PERSIST_PENDING_TAG_FAILED", 
+                           memory_id=memory_id, error=str(e))
+            return False
+    
+    def _mark_tag_completed(self, memory_id: str):
+        """标记标签任务已完成"""
+        try:
+            with sqlite3.connect(self._pending_db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    UPDATE pending_tags SET status = 'completed' 
+                    WHERE memory_id = ?
+                """, (memory_id,))
+                conn.commit()
+        except Exception:
+            pass
+    
+    def _increment_retry_count(self, memory_id: str):
+        """增加重试计数"""
+        try:
+            with sqlite3.connect(self._pending_db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    UPDATE pending_tags 
+                    SET retry_count = retry_count + 1 
+                    WHERE memory_id = ?
+                """, (memory_id,))
+                conn.commit()
+        except Exception:
+            pass
+    
+    def _recover_pending_tags(self):
+        """
+        恢复未完成的标签任务
+        
+        在启动时调用，将未处理的任务重新加入队列
+        """
+        try:
+            with sqlite3.connect(self._pending_db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    SELECT memory_id, memory_text FROM pending_tags 
+                    WHERE status = 'pending' AND retry_count < 3
+                    ORDER BY created_time ASC
+                    LIMIT 50
+                """)
+                
+                rows = cursor.fetchall()
+                for memory_id, memory_text in rows:
+                    try:
+                        self._task_queue.put({
+                            "memory_id": memory_id,
+                            "memory_text": memory_text,
+                            "recovered": True
+                        }, block=False)
+                    except queue.Full:
+                        break
+                
+                if rows:
+                    self._log.info("PENDING_TAGS_RECOVERED", count=len(rows))
+                    
+        except Exception as e:
+            self._log.error("RECOVER_PENDING_TAGS_FAILED", error=str(e))
     
     def set_sqlite_store(self, sqlite_store):
         """
@@ -490,11 +614,12 @@ class LLMTagger:
             return SimpleLog()
     
     def start(self):
-        """启动异步处理线程"""
+        """启动异步处理线程（含恢复未完成任务）"""
         if self._running:
             return
         
         self._running = True
+        self._recover_pending_tags()
         self._worker_thread = threading.Thread(target=self._worker, daemon=True)
         self._worker_thread.start()
         self._log.info("LLM_TAGGER_STARTED")
@@ -568,6 +693,8 @@ class LLMTagger:
                 if callback:
                     callback(memory_id, tag)
                 
+                self._mark_tag_completed(memory_id)
+                
                 self._log.info(
                     "LLM_TAG_COMPLETED",
                     memory_id=memory_id,
@@ -575,6 +702,7 @@ class LLMTagger:
                 )
         except Exception as e:
             self._log.error("LLM_TAG_FAILED", memory_id=memory_id, error=str(e))
+            self._increment_retry_count(memory_id)
     
     def _classify_with_llm(self, text: str) -> Optional[MemoryTag]:
         """使用 LLM 进行分类"""
@@ -724,7 +852,11 @@ class LLMTagger:
         use_atomic_update: bool = True
     ):
         """
-        提交异步标记任务
+        提交异步标记任务（含持久化）
+        
+        重构说明：
+        - 先持久化到 SQLite，确保崩溃恢复
+        - 再提交到内存队列
         
         Args:
             memory_id: 记忆ID
@@ -736,6 +868,8 @@ class LLMTagger:
             return
         
         if self.config.async_llm_tagging:
+            self._persist_pending_tag(memory_id, memory_text)
+            
             task = {
                 "memory_id": memory_id,
                 "memory_text": memory_text,

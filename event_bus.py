@@ -23,6 +23,17 @@ class EventType(Enum):
     CRITICAL_SERVICE_DOWN = "critical_service_down"
 
 
+class HandlerType(Enum):
+    """
+    处理器类型
+    
+    SYNC: 同步执行，用于轻量操作（如状态更新）
+    ASYNC: 异步执行，用于耗时操作（如 Webhook、日志写入）
+    """
+    SYNC = "sync"
+    ASYNC = "async"
+
+
 @dataclass
 class Event:
     """事件数据"""
@@ -42,6 +53,7 @@ class SubscriberInfo:
     error_count: int = 0
     is_weak_ref: bool = True
     handler_name: str = ""
+    handler_type: HandlerType = HandlerType.SYNC
 
 
 EventHandler = Callable[[Event], None]
@@ -187,7 +199,8 @@ class EventBus:
         else:
             return ref if callable(ref) else None
     
-    def subscribe(self, event_type: EventType, handler: EventHandler, source: str = "unknown"):
+    def subscribe(self, event_type: EventType, handler: EventHandler, source: str = "unknown", 
+                  handler_type: HandlerType = HandlerType.SYNC):
         """
         订阅事件
         
@@ -195,6 +208,9 @@ class EventBus:
             event_type: 事件类型
             handler: 事件处理函数
             source: 订阅者来源（用于追踪）
+            handler_type: 处理器类型（SYNC/ASYNC）
+                - SYNC: 同步执行，适用于轻量操作
+                - ASYNC: 异步执行，适用于耗时操作（Webhook、复杂日志等）
         """
         with self._subscribers_lock:
             if event_type not in self._subscribers:
@@ -212,7 +228,8 @@ class EventBus:
                 source=source,
                 subscribed_at=datetime.now(),
                 is_weak_ref=is_weak_ref,
-                handler_name=handler_name
+                handler_name=handler_name,
+                handler_type=handler_type
             )
             self._subscribers[event_type].append(info)
             
@@ -220,7 +237,8 @@ class EventBus:
                            event_type=event_type.value, 
                            handler=handler_name,
                            source=source,
-                           is_weak_ref=is_weak_ref)
+                           is_weak_ref=is_weak_ref,
+                           handler_type=handler_type.value)
     
     def unsubscribe(self, event_type: EventType, handler: EventHandler):
         """
@@ -263,6 +281,10 @@ class EventBus:
         """
         发布事件
         
+        设计原则：
+        - SYNC 处理器：同步执行，保证顺序
+        - ASYNC 处理器：提交到线程池执行，不阻塞发布者
+        
         Args:
             event_type: 事件类型
             data: 事件数据
@@ -275,16 +297,21 @@ class EventBus:
             source=source
         )
         
-        handlers = []
+        sync_handlers = []
+        async_handlers = []
+        
         with self._subscribers_lock:
             self._cleanup_dead_subscribers(event_type)
             
             for info in self._subscribers.get(event_type, []):
                 handler = self._get_handler(info.handler_ref, info.is_weak_ref)
                 if handler:
-                    handlers.append((handler, info))
+                    if info.handler_type == HandlerType.SYNC:
+                        sync_handlers.append((handler, info))
+                    else:
+                        async_handlers.append((handler, info))
         
-        for handler, info in handlers:
+        for handler, info in sync_handlers:
             try:
                 handler(event)
                 info.call_count += 1
@@ -296,10 +323,41 @@ class EventBus:
                                source=info.source,
                                error=str(e))
         
+        for handler, info in async_handlers:
+            try:
+                from thread_pool_manager import submit_io_task
+                submit_io_task(self._execute_async_handler, handler, event, info)
+            except Exception as e:
+                self._log.error("ASYNC_HANDLER_SUBMIT_FAILED",
+                               event_type=event_type.value,
+                               handler=info.handler_name,
+                               error=str(e))
+        
         self._log.debug("EVENT_PUBLISHED",
                        event_type=event_type.value,
                        source=source,
-                       subscriber_count=len(handlers))
+                       sync_count=len(sync_handlers),
+                       async_count=len(async_handlers))
+    
+    def _execute_async_handler(self, handler: EventHandler, event: Event, info: SubscriberInfo):
+        """
+        执行异步处理器
+        
+        Args:
+            handler: 事件处理器
+            event: 事件对象
+            info: 订阅者信息
+        """
+        try:
+            handler(event)
+            info.call_count += 1
+        except Exception as e:
+            info.error_count += 1
+            self._log.error("ASYNC_EVENT_HANDLER_ERROR",
+                           event_type=event.event_type.value,
+                           handler=info.handler_name,
+                           source=info.source,
+                           error=str(e))
     
     def publish_async(self, event_type: EventType, data: Dict[str, Any], source: str = "unknown"):
         """

@@ -1,8 +1,9 @@
-# vector_store.py
-# L2 向量存储层 - ChromaDB 实现
 import os
+import errno
 import json
 import time
+import uuid
+import hashlib
 import threading
 import shutil
 from typing import List, Dict, Any, Optional, Tuple
@@ -281,24 +282,59 @@ class VectorStore:
         return False
     
     @staticmethod
+    def _generate_content_hash(text: str) -> str:
+        """
+        生成内容哈希（用于去重）
+        
+        使用文本哈希生成唯一标识，
+        用于检测相同或相似内容的重复记录。
+        
+        Args:
+            text: 文本内容
+        
+        Returns:
+            格式为 16 位 16 进制字符串的内容哈希
+        """
+        normalized_text = text.strip().lower()
+        return hashlib.sha256(normalized_text.encode('utf-8')).hexdigest()[:16]
+    
+    @staticmethod
+    def _generate_memory_id(text: str = None) -> Tuple[str, str]:
+        """
+        生成记忆 ID（业务 ID + 内容哈希）
+        
+        设计原则：
+        - 业务 ID (UUID): 主键，确保全局唯一
+        - 内容哈希: 用于去重检测，而非主键
+        
+        优势：
+        - 微小文本变化不会导致完全不同的 ID
+        - 可以通过内容哈希检测相似内容
+        - 支持幂等写入和去重
+        
+        Args:
+            text: 文本内容（可选，用于生成内容哈希）
+        
+        Returns:
+            (business_id, content_hash) 元组
+        """
+        business_id = str(uuid.uuid4())
+        content_hash = VectorStore._generate_content_hash(text) if text else ""
+        return business_id, content_hash
+    
+    @staticmethod
     def _generate_deterministic_id(text: str) -> str:
         """
-        生成确定性 ID
+        生成确定性 ID（向后兼容方法）
         
-        使用文本哈希生成唯一且可预测的 ID，
-        确保相同文本多次写入只产生一个向量文档。
+        保留此方法用于向后兼容，但建议使用 _generate_memory_id
         
         Args:
             text: 文本内容
         
         Returns:
             格式为 "mem_{hash[:32]}" 的确定性 ID
-            
-        Note:
-            使用 32 位 16 进制字符（128 bit），根据生日悖论，
-            在百万级记录时碰撞概率极低。
         """
-        import hashlib
         text_hash = hashlib.sha256(text.encode('utf-8')).hexdigest()
         return f"mem_{text_hash[:32]}"
     
@@ -434,9 +470,14 @@ class VectorStore:
                 all_ids.extend(batch_ids)
                 
             except OSError as e:
-                error_msg = str(e).lower()
-                if "no space left" in error_msg or "disk full" in error_msg or "enospc" in error_msg:
-                    print(f"[严重] ChromaDB 磁盘满，降级到 SQLite 存储")
+                is_disk_full = (
+                    e.errno == errno.ENOSPC or
+                    "no space left" in str(e).lower() or
+                    "disk full" in str(e).lower()
+                )
+                
+                if is_disk_full:
+                    print(f"[严重] ChromaDB 磁盘满 (errno={e.errno})，降级到 SQLite 存储")
                     
                     if sqlite_store:
                         try:
