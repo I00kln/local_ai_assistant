@@ -1,0 +1,171 @@
+# ===========================
+# 编译与构建产物
+# ===========================
+# Rust
+target/
+debug/
+release/
+*.rlib
+*.rmeta
+
+# C / C++
+[Dd]ebug/
+[Rr]elease/
+build/
+out/
+*.exe
+*.dll
+*.so
+*.dylib
+*.obj
+*.o
+*.a
+*.lib
+*.exp
+*.pdb
+
+# Java / Kotlin
+target/
+*.class
+*.jar
+*.war
+
+# Go
+*.exe
+*.test
+*.out
+
+# ===========================
+# 第三方依赖
+# ===========================
+# Node.js / 前端
+node_modules/
+dist/
+.cache/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Python
+venv/
+env/
+.env
+.venv
+__pycache__/
+*.py[cod]
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+
+# ===========================
+# IDE 与编辑器配置
+# ===========================
+# VS Code
+.vscode/
+*.code-workspace
+
+# JetBrains 全家桶 (IntelliJ / CLion / PyCharm / RustRover)
+.idea/
+*.iml
+*.iws
+*.ipr
+out/
+
+# Visual Studio
+.vs/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+
+# Sublime Text
+*.sublime-project
+*.sublime-workspace
+
+# Vim / Neovim
+*.swp
+*.swo
+*~
+.netrwhist
+
+# ===========================
+# 操作系统文件
+# ===========================
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+*.cab
+*.msi
+*.msm
+*.msp
+
+# Linux
+*~
+.directory
+.Trash-*
+
+# ===========================
+# 敏感与配置文件
+# ===========================
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+*.crt
+secrets/
+config/local.yaml
+
+# ===========================
+# 日志与临时文件
+# ===========================
+*.log
+*.tmp
+*.temp
+*.swp
+*.bak
+*.backup
+.cache/
+
+# ===========================
+# 其他
+# ===========================
+# 压缩包
+*.zip
+*.tar.gz
+*.tgz
+*.rar
+*.7z
+
+# 数据库文件
+*.db
+*.sqlite
+*.sqlite3
+*.db-wal
+*.db-shm
+
+models/
+*.index
+*.npy
+chroma_db/
+logs/
+archive/
+*.backup
+*.db.backup.*
+.pytest_cache/
+
+
