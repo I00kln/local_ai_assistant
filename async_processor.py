@@ -68,7 +68,7 @@ class AsyncMemoryProcessor:
         self.batch_buffer: List[Dict] = []
         self.batch_size = self._mem_config.async_processor.batch_size
         
-        self._wal_path = "memory_buffer.wal"
+        self._wal_path = os.path.join(config.data_dir, "memory_buffer.wal")
         self._wal_lock = threading.Lock()
         
         self._last_dedup_time = time.time()

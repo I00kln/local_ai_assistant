@@ -335,6 +335,8 @@ class Config:
         self.high_density = HighDensityConfig()
         self.context = ContextConfig()
         
+        self.data_dir: str = "."
+        
         # 本地压缩模式使用的提示词（仅压缩检索记忆，不包含用户原文）
         self.system_prompt: str = """你是一个记忆压缩助手。
 
@@ -375,6 +377,7 @@ class Config:
         except ImportError:
             pass
         
+        self._load_data_dir_config()
         self._load_local_config()
         self._load_cloud_config()
         self._load_async_config()
@@ -390,6 +393,15 @@ class Config:
         self._load_high_density_config()
         self._load_context_config()
         self._validate_critical_paths()
+    
+    def _load_data_dir_config(self):
+        """加载数据目录配置"""
+        self.data_dir = os.environ.get("DATA_DIR", ".")
+        if self.data_dir != "." and not os.path.exists(self.data_dir):
+            try:
+                os.makedirs(self.data_dir, exist_ok=True)
+            except Exception:
+                self.data_dir = "."
     
     def _validate_critical_paths(self):
         """预校验关键路径的写入权限"""
